@@ -81,9 +81,12 @@ pub struct RemoteMultimodalEngine {
     /// Optional long-term experience memory for learning from past sessions.
     /// When set, the engine recalls relevant past strategies before automation
     /// and stores successful outcomes after completion.
+    ///
+    /// A [`ExperienceMemoryHandle`](super::long_term_memory::ExperienceMemoryHandle)
+    /// is itself a cheap `Clone` over a channel into the thread that owns the
+    /// memory, so no `Arc` or lock is needed here.
     #[cfg(feature = "memvid")]
-    pub experience_memory:
-        Option<std::sync::Arc<tokio::sync::RwLock<super::long_term_memory::ExperienceMemory>>>,
+    pub experience_memory: Option<super::long_term_memory::ExperienceMemoryHandle>,
     /// Use Chrome's built-in LanguageModel API (Gemini Nano) for inference.
     ///
     /// When `true`, uses `page.evaluate()` + `LanguageModel.create()` instead of
@@ -105,6 +108,13 @@ pub struct RemoteMultimodalEngine {
     /// Optional pre-built HTTP client (e.g. with proxy configuration).
     /// When `None`, uses the default static client.
     pub client: Option<Client>,
+    /// Optional embedded scripting engine (pure-Rust Python + JS).
+    ///
+    /// When set, the LLM-driven action dispatcher honors the `RunPython` and
+    /// `RunJavaScript` actions by routing them through the worker pool. When
+    /// `None`, those actions return an "engine unavailable" error.
+    #[cfg(feature = "scripting")]
+    pub script_engine: Option<crate::scripting::ScriptEngine>,
 }
 
 impl RemoteMultimodalEngine {
@@ -137,7 +147,17 @@ impl RemoteMultimodalEngine {
             model_router: None,
             model_pool: Vec::new(),
             client: None,
+            #[cfg(feature = "scripting")]
+            script_engine: None,
         }
+    }
+
+    /// Attach an embedded scripting engine. When set, the dispatcher routes
+    /// `RunPython` and `RunJavaScript` actions through its worker pool.
+    #[cfg(feature = "scripting")]
+    pub fn with_script_engine(mut self, engine: Option<crate::scripting::ScriptEngine>) -> Self {
+        self.script_engine = engine;
+        self
     }
 
     /// Set/clear the API key (Bearer token).
@@ -206,9 +226,7 @@ impl RemoteMultimodalEngine {
     #[cfg(feature = "memvid")]
     pub fn with_experience_memory(
         &mut self,
-        memory: Option<
-            std::sync::Arc<tokio::sync::RwLock<super::long_term_memory::ExperienceMemory>>,
-        >,
+        memory: Option<super::long_term_memory::ExperienceMemoryHandle>,
     ) -> &mut Self {
         self.experience_memory = memory;
         self
@@ -332,6 +350,8 @@ impl RemoteMultimodalEngine {
             model_router: self.model_router.clone(),
             model_pool: self.model_pool.clone(),
             client: self.client.clone(),
+            #[cfg(feature = "scripting")]
+            script_engine: self.script_engine.clone(),
         }
     }
 

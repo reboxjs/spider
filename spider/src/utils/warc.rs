@@ -16,7 +16,7 @@ mod inner {
     use crate::page::Page;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::sync::{broadcast, mpsc};
 
     /// CRLF constant.
@@ -24,6 +24,34 @@ mod inner {
 
     /// Default buffer size for the WARC file writer (256 KB).
     const BUF_SIZE: usize = 256 * 1024;
+
+    /// Default soft ceiling on serialized-but-unwritten WARC bytes (64 MiB).
+    const DEFAULT_QUEUE_SOFT_LIMIT: usize = 64 * 1024 * 1024;
+
+    lazy_static::lazy_static! {
+        /// Soft ceiling on bytes queued for the WARC file writer, via
+        /// `SPIDER_WARC_QUEUE_BYTES`. A crawl can serialize records far faster than a
+        /// disk drains them, and the channel itself is unbounded, so without this the
+        /// backlog is bounded only by RAM. `0` disables the backpressure entirely
+        /// (the historical behaviour). A malformed value falls back to the default
+        /// rather than panicking.
+        static ref QUEUE_SOFT_LIMIT: usize = std::env::var("SPIDER_WARC_QUEUE_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_QUEUE_SOFT_LIMIT);
+    }
+
+    /// A unit of work for the background file writer.
+    ///
+    /// Private: `WarcWriter::create`'s public signature is unchanged, so adding the
+    /// flush variant is not a breaking change.
+    enum WarcOp {
+        /// Pre-serialized record bytes to append.
+        Bytes(Vec<u8>),
+        /// Flush the `BufWriter` and acknowledge, so callers get a deterministic
+        /// durability point and can observe I/O errors.
+        Flush(tokio::sync::oneshot::Sender<io::Result<()>>),
+    }
 
     /// Configuration for WARC output.
     #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +206,43 @@ mod inner {
         buf
     }
 
+    /// Guess a reasonable Content-Type from the first few bytes of a response body.
+    /// Used when the captured headers don't contain one so WARC replay tools
+    /// still know how to render the resource.
+    fn guess_content_type(body: &[u8]) -> &'static str {
+        let trimmed = {
+            let mut i = 0;
+            while i < body.len()
+                && (body[i] == b' ' || body[i] == b'\t' || body[i] == b'\r' || body[i] == b'\n')
+            {
+                i += 1;
+            }
+            &body[i..]
+        };
+        if trimmed.is_empty() {
+            return "application/octet-stream";
+        }
+        match trimmed[0] {
+            b'<' => "text/html; charset=utf-8",
+            b'{' | b'[' => "application/json; charset=utf-8",
+            _ => {
+                if trimmed.len() >= 4 && &trimmed[..4] == b"\x89PNG" {
+                    "image/png"
+                } else if trimmed.len() >= 3 && &trimmed[..3] == b"\xff\xd8\xff" {
+                    "image/jpeg"
+                } else if trimmed.len() >= 4 && &trimmed[..4] == b"GIF8" {
+                    "image/gif"
+                } else if trimmed.len() >= 4 && &trimmed[..4] == b"%PDF" {
+                    "application/pdf"
+                } else if trimmed.is_ascii() {
+                    "text/plain; charset=utf-8"
+                } else {
+                    "application/octet-stream"
+                }
+            }
+        }
+    }
+
     /// Serialize a WARC `response` record from a `Page` into a self-contained byte buffer.
     /// Returns `None` if the page has an empty URL.
     pub fn serialize_page(page: &Page) -> Option<Vec<u8>> {
@@ -200,13 +265,40 @@ mod inner {
             );
         }
 
+        // Track whether Content-Type / Content-Length are present in the captured
+        // response headers. WARC replay tools (replayweb.page, pywb) require
+        // Content-Type in the HTTP payload to know how to serve the resource.
+        let mut has_content_type = false;
+        let mut has_content_length = false;
+
         if let Some(ref headers) = page.headers {
             for (name, value) in headers.iter() {
-                payload.extend_from_slice(name.as_str().as_bytes());
+                let n = name.as_str();
+                if n.eq_ignore_ascii_case("content-type") {
+                    has_content_type = true;
+                } else if n.eq_ignore_ascii_case("content-length") {
+                    has_content_length = true;
+                }
+                payload.extend_from_slice(n.as_bytes());
                 payload.extend_from_slice(b": ");
                 payload.extend_from_slice(value.as_bytes());
                 payload.extend_from_slice(CRLF);
             }
+        }
+
+        // Synthesize a Content-Type when the captured headers don't have one so
+        // replay tools can serve the resource. Guess from the body's first byte.
+        if !has_content_type {
+            let ct = guess_content_type(body);
+            payload.extend_from_slice(b"Content-Type: ");
+            payload.extend_from_slice(ct.as_bytes());
+            payload.extend_from_slice(CRLF);
+        }
+
+        // Ensure Content-Length reflects the actual body length for the replay
+        // engine even when upstream headers omitted it (e.g. chunked encoding).
+        if !has_content_length {
+            let _ = write!(payload, "Content-Length: {}\r\n", body.len());
         }
 
         payload.extend_from_slice(CRLF);
@@ -247,9 +339,15 @@ mod inner {
     /// Safe to clone and share across tasks.
     #[derive(Clone)]
     pub struct WarcWriter {
-        tx: mpsc::UnboundedSender<Vec<u8>>,
+        tx: mpsc::UnboundedSender<WarcOp>,
         record_count: std::sync::Arc<AtomicU64>,
         path: std::sync::Arc<PathBuf>,
+        /// Bytes serialized but not yet written to disk. Drives the backpressure in
+        /// [`spawn_warc_writer`].
+        queued_bytes: std::sync::Arc<AtomicUsize>,
+        /// Signalled by the writer task after each record lands, so a producer
+        /// waiting on the soft limit wakes as soon as the backlog drains.
+        drained: std::sync::Arc<tokio::sync::Notify>,
     }
 
     impl WarcWriter {
@@ -270,24 +368,27 @@ mod inner {
             }
 
             let file = std::fs::File::create(&path)?;
-            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, rx) = mpsc::unbounded_channel::<WarcOp>();
             let record_count = std::sync::Arc::new(AtomicU64::new(0));
+            let queued_bytes = std::sync::Arc::new(AtomicUsize::new(0));
+            let drained = std::sync::Arc::new(tokio::sync::Notify::new());
 
             let writer = Self {
                 tx,
                 record_count: record_count.clone(),
                 path: std::sync::Arc::new(path),
+                queued_bytes: queued_bytes.clone(),
+                drained: drained.clone(),
             };
 
             // Send warcinfo as first record if requested.
             if config.write_warcinfo {
                 let buf = serialize_warcinfo(&config.software);
-                let _ = writer.tx.send(buf);
-                writer.record_count.fetch_add(1, Ordering::Relaxed);
+                writer.enqueue(buf);
             }
 
             // Spawn the single file-writer task on a blocking thread.
-            let handle = Self::spawn_writer_task(file, rx);
+            let handle = Self::spawn_writer_task(file, rx, queued_bytes, drained);
 
             Ok((writer, handle))
         }
@@ -295,29 +396,116 @@ mod inner {
         /// Spawn the background task that drains the channel and writes to disk.
         fn spawn_writer_task(
             file: std::fs::File,
-            mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+            mut rx: mpsc::UnboundedReceiver<WarcOp>,
+            queued_bytes: std::sync::Arc<AtomicUsize>,
+            drained: std::sync::Arc<tokio::sync::Notify>,
         ) -> tokio::task::JoinHandle<io::Result<()>> {
             tokio::task::spawn_blocking(move || {
                 let mut w = io::BufWriter::with_capacity(BUF_SIZE, file);
                 // Use blocking recv via a small runtime-free loop.
-                while let Some(buf) = rx.blocking_recv() {
-                    w.write_all(&buf)?;
+                while let Some(op) = rx.blocking_recv() {
+                    match op {
+                        WarcOp::Bytes(buf) => {
+                            let len = buf.len();
+                            let res = w.write_all(&buf);
+
+                            // Release the backlog accounting before propagating any
+                            // error, so a producer parked on the soft limit can never
+                            // be stranded by a failed write. `saturating_sub` keeps
+                            // this sound even if the counters ever disagree.
+                            let _ = queued_bytes.fetch_update(
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                                |queued| Some(queued.saturating_sub(len)),
+                            );
+                            drained.notify_waiters();
+
+                            res?;
+                        }
+                        WarcOp::Flush(ack) => match w.flush() {
+                            Ok(()) => {
+                                let _ = ack.send(Ok(()));
+                            }
+                            Err(e) => {
+                                // `io::Error` isn't `Clone`, so rebuild an equivalent
+                                // one for the caller and still fail the task.
+                                let _ = ack.send(Err(io::Error::new(e.kind(), e.to_string())));
+                                return Err(e);
+                            }
+                        },
+                    }
                 }
                 w.flush()?;
                 Ok(())
             })
         }
 
+        /// Queue pre-serialized bytes and account for them in the backlog.
+        fn enqueue(&self, buf: Vec<u8>) {
+            let len = buf.len();
+
+            // Account before sending: the writer task may drain the record before this
+            // thread resumes, and an under-count would be observable as a stuck
+            // producer, whereas a transient over-count only delays one send.
+            self.queued_bytes.fetch_add(len, Ordering::AcqRel);
+
+            if self.tx.send(WarcOp::Bytes(buf)).is_ok() {
+                self.record_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Receiver gone — undo the accounting so waiters don't park forever.
+                let _ =
+                    self.queued_bytes
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |queued| {
+                            Some(queued.saturating_sub(len))
+                        });
+                self.drained.notify_waiters();
+            }
+        }
+
         /// Write a WARC `response` record from a crawled `Page`.
         ///
         /// Serializes the record on the caller's thread and sends the bytes
         /// through the channel — fully lock-free.
+        ///
+        /// This call never blocks and applies no backpressure; the queue is bounded
+        /// only for the in-crate bridge in [`spawn_warc_writer`]. External callers
+        /// driving this directly at high rate should watch [`Self::queued_bytes`].
         pub fn write_page(&self, page: &Page) {
             if let Some(buf) = serialize_page(page) {
-                if self.tx.send(buf).is_ok() {
-                    self.record_count.fetch_add(1, Ordering::Relaxed);
-                }
+                self.enqueue(buf);
             }
+        }
+
+        /// Bytes serialized but not yet written to disk.
+        pub fn queued_bytes(&self) -> usize {
+            self.queued_bytes.load(Ordering::Acquire)
+        }
+
+        /// Flush everything queued so far to disk and report the result.
+        ///
+        /// Without this the only flush happens when the last `WarcWriter` clone drops,
+        /// so a long-lived or reused `Website` could leave up to `BUF_SIZE` of records
+        /// unreadable on disk indefinitely, and I/O errors from the writer task were
+        /// discarded entirely.
+        ///
+        /// Returns an error if the writer exited before acknowledging the flush;
+        /// a closed channel can indicate a failed disk write.
+        pub async fn flush(&self) -> io::Result<()> {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            if self.tx.send(WarcOp::Flush(ack_tx)).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "WARC writer stopped before flush",
+                ));
+            }
+
+            ack_rx.await.unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "WARC writer stopped during flush",
+                ))
+            })
         }
 
         /// Number of records written so far.
@@ -336,11 +524,19 @@ mod inner {
     ///
     /// Returns a `JoinHandle` that resolves when the broadcast channel closes.
     /// The handle returns the total number of records written.
+    ///
+    /// Applies backpressure: if the writer falls more than `SPIDER_WARC_QUEUE_BYTES`
+    /// behind, this task waits for the backlog to halve before pulling more pages,
+    /// rather than letting the unbounded channel grow to the size of the crawl. No
+    /// records are dropped — the broadcast ring upstream is what sheds under lag.
     pub fn spawn_warc_writer(
         writer: WarcWriter,
         mut rx: broadcast::Receiver<Page>,
     ) -> tokio::task::JoinHandle<u64> {
         tokio::task::spawn(async move {
+            let soft_limit = *QUEUE_SOFT_LIMIT;
+            let resume_at = soft_limit / 2;
+
             loop {
                 match rx.recv().await {
                     Ok(page) => {
@@ -348,6 +544,28 @@ mod inner {
                             continue;
                         }
                         writer.write_page(&page);
+
+                        if soft_limit > 0 && writer.queued_bytes() > soft_limit {
+                            // Wait for the writer to drain to the low-water mark.
+                            //
+                            // The timeout is load-bearing, not belt-and-braces:
+                            // `notify_waiters` only wakes tasks already parked, so a
+                            // notification landing between the check and the await
+                            // would otherwise be missed and park this task forever.
+                            // Re-checking on a short timer makes that unmissable, so
+                            // this loop cannot deadlock even if the writer task dies.
+                            while writer.queued_bytes() > resume_at {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(50),
+                                    writer.drained.notified(),
+                                )
+                                .await;
+
+                                if writer.tx.is_closed() {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -365,6 +583,44 @@ mod inner {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn flush_reports_a_dead_writer() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            drop(rx);
+            let writer = WarcWriter {
+                tx,
+                record_count: std::sync::Arc::new(AtomicU64::new(0)),
+                path: std::sync::Arc::new(PathBuf::new()),
+                queued_bytes: std::sync::Arc::new(AtomicUsize::new(0)),
+                drained: std::sync::Arc::new(tokio::sync::Notify::new()),
+            };
+            assert_eq!(
+                writer.flush().await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+
+        #[tokio::test]
+        async fn flush_reports_dropped_acknowledgement() {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let writer = WarcWriter {
+                tx,
+                record_count: std::sync::Arc::new(AtomicU64::new(0)),
+                path: std::sync::Arc::new(PathBuf::new()),
+                queued_bytes: std::sync::Arc::new(AtomicUsize::new(0)),
+                drained: std::sync::Arc::new(tokio::sync::Notify::new()),
+            };
+            let consumer = tokio::spawn(async move {
+                drop(rx.recv().await);
+            });
+            assert_eq!(
+                writer.flush().await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            consumer.await.unwrap();
+        }
+
         use reqwest::StatusCode;
 
         /// Helper to create a minimal Page for testing.
@@ -374,6 +630,113 @@ mod inner {
             page.status_code = StatusCode::from_u16(status).unwrap_or_default();
             page.html = Some(bytes::Bytes::from(body.to_owned()));
             page
+        }
+
+        /// A record must be readable on disk after an explicit `flush()`, *without*
+        /// dropping the writer. Before `flush` existed the only flush happened when
+        /// the last clone dropped, so a long-lived `Website` could leave up to
+        /// `BUF_SIZE` of records unreadable on disk indefinitely.
+        #[tokio::test]
+        async fn flush_makes_records_readable_without_dropping_the_writer() {
+            let dir = std::env::temp_dir().join(format!("spider_warc_flush_{}", generate_uuid()));
+            let path = dir.join("out.warc");
+
+            let config = WarcConfig {
+                path: path.to_string_lossy().into_owned(),
+                write_warcinfo: false,
+                software: "spider-test".into(),
+            };
+
+            let (writer, _handle) = WarcWriter::create(&config).expect("writer creates");
+
+            writer.write_page(&make_test_page(
+                "https://example.com",
+                200,
+                "<html>flushed</html>",
+            ));
+
+            writer.flush().await.expect("flush succeeds");
+
+            // Deliberately still holding `writer` — nothing has been dropped.
+            let on_disk = std::fs::read(&path).expect("warc file readable");
+            let content = String::from_utf8_lossy(&on_disk);
+
+            assert!(
+                content.contains("WARC-Target-URI: https://example.com"),
+                "record should be on disk after flush, got {} bytes",
+                on_disk.len()
+            );
+            assert!(content.contains("flushed"), "payload should be on disk");
+
+            drop(writer);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The backlog accounting must return to zero once the writer drains, `flush`
+        /// must be idempotent, and dropping every writer clone must let the task
+        /// finish with all records on disk.
+        #[tokio::test]
+        async fn queued_bytes_drains_and_flush_is_idempotent() {
+            let dir = std::env::temp_dir().join(format!("spider_warc_drain_{}", generate_uuid()));
+            let path = dir.join("out.warc");
+
+            let config = WarcConfig {
+                path: path.to_string_lossy().into_owned(),
+                write_warcinfo: true,
+                software: "spider-test".into(),
+            };
+
+            let (writer, handle) = WarcWriter::create(&config).expect("writer creates");
+
+            for i in 0..64 {
+                writer.write_page(&make_test_page(
+                    &format!("https://example.com/{i}"),
+                    200,
+                    "<html>body</html>",
+                ));
+            }
+
+            writer.flush().await.expect("flush succeeds");
+
+            assert_eq!(
+                writer.queued_bytes(),
+                0,
+                "backlog accounting must return to zero once drained"
+            );
+            assert_eq!(
+                writer.record_count(),
+                65,
+                "64 pages plus the warcinfo record"
+            );
+
+            // A second flush with nothing queued must still complete promptly.
+            let again =
+                tokio::time::timeout(std::time::Duration::from_secs(5), writer.flush()).await;
+            assert!(
+                matches!(again, Ok(Ok(()))),
+                "flush must be idempotent and must not hang, got {again:?}"
+            );
+
+            // Dropping every clone closes the channel, so the writer task drains,
+            // flushes and exits. The task ends only once *all* senders are gone —
+            // holding any clone across this await would block it forever.
+            drop(writer);
+            let joined = tokio::time::timeout(std::time::Duration::from_secs(30), handle).await;
+
+            match joined {
+                Ok(Ok(Ok(()))) => {}
+                other => panic!("writer task should finish cleanly, got {other:?}"),
+            }
+
+            let on_disk = std::fs::read(&path).expect("warc file readable");
+            let content = String::from_utf8_lossy(&on_disk);
+            assert_eq!(
+                content.matches("WARC-Type: response").count(),
+                64,
+                "every response record should be on disk"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
@@ -716,6 +1079,61 @@ mod inner {
             assert!(content.contains("WARC-Type: warcinfo"));
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn response_payload_has_content_type_when_headers_missing() {
+            let page = make_test_page("https://example.com", 200, "<html>Hi</html>");
+            let buf = serialize_page(&page).unwrap();
+            let content = String::from_utf8_lossy(&buf);
+            assert!(
+                content.contains("Content-Type: text/html; charset=utf-8\r\n"),
+                "synthesized Content-Type missing: {content}"
+            );
+            assert!(content.contains("Content-Length: 15\r\n"));
+        }
+
+        #[test]
+        fn response_payload_skips_synthesis_when_content_type_present() {
+            let mut page = make_test_page("https://example.com", 200, "<html>Hi</html>");
+            let mut hdr_map = reqwest::header::HeaderMap::new();
+            hdr_map.insert("content-type", "text/plain; charset=utf-8".parse().unwrap());
+            page.headers = Some(hdr_map);
+
+            let buf = serialize_page(&page).unwrap();
+            let content = String::from_utf8_lossy(&buf);
+            // Only the real one should appear (case preserved as sent).
+            let ct_count = content
+                .matches("content-type: text/plain; charset=utf-8")
+                .count();
+            assert_eq!(ct_count, 1);
+            assert!(!content.contains("Content-Type: text/html"));
+        }
+
+        #[test]
+        fn guess_content_type_variants() {
+            assert_eq!(guess_content_type(b"<html>"), "text/html; charset=utf-8");
+            assert_eq!(
+                guess_content_type(b"  <!doctype html>"),
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(
+                guess_content_type(b"{\"a\":1}"),
+                "application/json; charset=utf-8"
+            );
+            assert_eq!(
+                guess_content_type(b"[1,2]"),
+                "application/json; charset=utf-8"
+            );
+            assert_eq!(
+                guess_content_type(b"plain text"),
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(guess_content_type(b""), "application/octet-stream");
+            assert_eq!(guess_content_type(b"\x89PNG\r\n\x1a\n"), "image/png");
+            assert_eq!(guess_content_type(b"\xff\xd8\xff\xe0"), "image/jpeg");
+            assert_eq!(guess_content_type(b"GIF89a"), "image/gif");
+            assert_eq!(guess_content_type(b"%PDF-1.4"), "application/pdf");
         }
 
         #[tokio::test]

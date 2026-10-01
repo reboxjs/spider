@@ -13,6 +13,16 @@ use crate::tools::{
     SpiderCloudToolConfig,
 };
 use std::sync::Arc;
+
+/// Check if an API key is a placeholder or empty.
+fn is_placeholder_api_key(key: &str) -> bool {
+    let trimmed = key.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("YOUR_API_KEY")
+        || trimmed.eq_ignore_ascii_case("YOUR-API-KEY")
+        || trimmed.eq_ignore_ascii_case("API_KEY")
+        || trimmed.eq_ignore_ascii_case("API-KEY")
+}
 use tokio::sync::Semaphore;
 
 #[cfg(feature = "search")]
@@ -70,7 +80,7 @@ pub struct Agent {
     #[cfg(feature = "fs")]
     temp_storage: Option<TempStorage>,
 
-    /// Session memory (lock-free via DashMap).
+    /// Session memory backed by DashMap.
     memory: AgentMemory,
 
     /// Concurrency semaphore for LLM calls.
@@ -113,17 +123,14 @@ impl Agent {
         query: &str,
         options: SearchOptions,
     ) -> AgentResult<SearchResults> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_search_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let provider = self
             .search_provider
             .as_ref()
             .ok_or(AgentError::NotConfigured("search provider"))?;
 
-        self.usage.increment_search_calls();
+        self.usage
+            .reserve_search_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         provider
             .search(query, &options, &self.client)
@@ -141,14 +148,6 @@ impl Agent {
 
     /// Send a completion request with full options.
     pub async fn complete(&self, messages: Vec<Message>) -> AgentResult<CompletionResponse> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_llm_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-        if let Some(limit) = self.usage.check_token_limits(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let llm = self
             .llm
             .as_ref()
@@ -160,13 +159,19 @@ impl Agent {
             .await
             .map_err(|_| AgentError::Llm("Failed to acquire semaphore".to_string()))?;
 
+        if let Some(limit) = self.usage.check_token_limits(&self.config.limits) {
+            return Err(AgentError::LimitExceeded(limit));
+        }
+
         let options = CompletionOptions {
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             json_mode: self.config.json_mode,
         };
 
-        self.usage.increment_llm_calls();
+        self.usage
+            .reserve_llm_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         let response = llm.complete(messages, &options, &self.client).await?;
 
@@ -228,12 +233,9 @@ impl Agent {
 
     /// Fetch a URL and return the HTML content.
     pub async fn fetch(&self, url: &str) -> AgentResult<FetchResult> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_fetch_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
-        self.usage.increment_fetch_calls();
+        self.usage
+            .reserve_fetch_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         let response = self.client.get(url).send().await?;
 
@@ -386,17 +388,17 @@ impl Agent {
 
     // ==================== Memory Methods ====================
 
-    /// Get a value from memory (lock-free).
+    /// Get a value from memory.
     pub fn memory_get(&self, key: &str) -> Option<serde_json::Value> {
         self.memory.get(key)
     }
 
-    /// Set a value in memory (lock-free).
+    /// Set a value in memory.
     pub fn memory_set(&self, key: &str, value: serde_json::Value) {
         self.memory.set(key, value);
     }
 
-    /// Clear all memory (lock-free).
+    /// Clear all memory.
     pub fn memory_clear(&self) {
         self.memory.clear();
     }
@@ -459,13 +461,9 @@ impl Agent {
         query: Option<&[(&str, &str)]>,
         body: Option<&str>,
     ) -> AgentResult<CustomToolResult> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_custom_tool_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
-        // Track the call
-        self.usage.increment_custom_tool_calls(name);
+        self.usage
+            .reserve_custom_tool_call(name, &self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         // Execute the tool
         self.custom_tools
@@ -519,17 +517,14 @@ impl Agent {
     /// Navigate to a URL using the browser.
     #[cfg(feature = "chrome")]
     pub async fn navigate(&self, url: &str) -> AgentResult<()> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let browser = self
             .browser
             .as_ref()
             .ok_or(AgentError::NotConfigured("browser"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         browser
             .navigate(url)
@@ -540,17 +535,14 @@ impl Agent {
     /// Get HTML from the current browser page.
     #[cfg(feature = "chrome")]
     pub async fn browser_html(&self) -> AgentResult<String> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let browser = self
             .browser
             .as_ref()
             .ok_or(AgentError::NotConfigured("browser"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         browser
             .html()
@@ -561,17 +553,14 @@ impl Agent {
     /// Take a screenshot of the current browser page.
     #[cfg(feature = "chrome")]
     pub async fn screenshot(&self) -> AgentResult<Vec<u8>> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let browser = self
             .browser
             .as_ref()
             .ok_or(AgentError::NotConfigured("browser"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         browser
             .screenshot()
@@ -580,19 +569,21 @@ impl Agent {
     }
 
     /// Open a new page/tab in the browser.
+    ///
+    /// The returned [`BrowserContext`] **owns** the new tab: the CDP target is
+    /// closed once the last clone of that context drops. Code that keeps only
+    /// `ctx.page().clone()` and drops the context will find its tab closed —
+    /// call [`BrowserContext::defuse_page`] to let the page outlive the context.
     #[cfg(feature = "chrome")]
     pub async fn new_page(&self) -> AgentResult<crate::browser::BrowserContext> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let browser = self
             .browser
             .as_ref()
             .ok_or(AgentError::NotConfigured("browser"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         browser
             .clone_page()
@@ -601,25 +592,57 @@ impl Agent {
     }
 
     /// Open a new page and navigate to URL.
+    ///
+    /// The bare page handle carries no ownership, so the tab is only released
+    /// when the agent's browser context drops. Prefer
+    /// [`Agent::new_page_with_url_owned`], which scopes the tab to the returned
+    /// context.
     #[cfg(feature = "chrome")]
+    #[deprecated(
+        since = "2.52.14",
+        note = "leaks the CDP tab until the agent's browser context drops; use new_page_with_url_owned()"
+    )]
     pub async fn new_page_with_url(
         &self,
         url: &str,
     ) -> AgentResult<std::sync::Arc<crate::browser::Page>> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let browser = self
             .browser
             .as_ref()
             .ok_or(AgentError::NotConfigured("browser"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
+        #[allow(deprecated)]
         browser
             .new_page_with_url(url)
+            .await
+            .map_err(|e| AgentError::Browser(e.to_string()))
+    }
+
+    /// Open a new page at `url` and return it as an owning context.
+    ///
+    /// The tab is closed when the last clone of the returned
+    /// [`BrowserContext`] drops. Leak-free replacement for
+    /// [`Agent::new_page_with_url`].
+    #[cfg(feature = "chrome")]
+    pub async fn new_page_with_url_owned(
+        &self,
+        url: &str,
+    ) -> AgentResult<crate::browser::BrowserContext> {
+        let browser = self
+            .browser
+            .as_ref()
+            .ok_or(AgentError::NotConfigured("browser"))?;
+
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
+
+        browser
+            .new_page_with_url_owned(url)
             .await
             .map_err(|e| AgentError::Browser(e.to_string()))
     }
@@ -627,17 +650,14 @@ impl Agent {
     /// Click an element in the browser.
     #[cfg(feature = "chrome")]
     pub async fn click(&self, selector: &str) -> AgentResult<()> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let browser = self
             .browser
             .as_ref()
             .ok_or(AgentError::NotConfigured("browser"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         browser
             .click(selector)
@@ -648,17 +668,14 @@ impl Agent {
     /// Type text into an element in the browser.
     #[cfg(feature = "chrome")]
     pub async fn type_text(&self, selector: &str, text: &str) -> AgentResult<()> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let browser = self
             .browser
             .as_ref()
             .ok_or(AgentError::NotConfigured("browser"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         browser
             .type_text(selector, text)
@@ -684,17 +701,14 @@ impl Agent {
     /// Navigate using WebDriver.
     #[cfg(feature = "webdriver")]
     pub async fn webdriver_navigate(&self, url: &str) -> AgentResult<()> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let driver = self
             .webdriver
             .as_ref()
             .ok_or(AgentError::NotConfigured("webdriver"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         driver
             .navigate(url)
@@ -705,17 +719,14 @@ impl Agent {
     /// Get HTML from WebDriver.
     #[cfg(feature = "webdriver")]
     pub async fn webdriver_html(&self) -> AgentResult<String> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let driver = self
             .webdriver
             .as_ref()
             .ok_or(AgentError::NotConfigured("webdriver"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         driver
             .html()
@@ -726,17 +737,14 @@ impl Agent {
     /// Take a screenshot using WebDriver.
     #[cfg(feature = "webdriver")]
     pub async fn webdriver_screenshot(&self) -> AgentResult<Vec<u8>> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let driver = self
             .webdriver
             .as_ref()
             .ok_or(AgentError::NotConfigured("webdriver"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         driver
             .screenshot()
@@ -747,17 +755,14 @@ impl Agent {
     /// Click an element using WebDriver.
     #[cfg(feature = "webdriver")]
     pub async fn webdriver_click(&self, selector: &str) -> AgentResult<()> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let driver = self
             .webdriver
             .as_ref()
             .ok_or(AgentError::NotConfigured("webdriver"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         driver
             .click(selector)
@@ -768,17 +773,14 @@ impl Agent {
     /// Type text into an element using WebDriver.
     #[cfg(feature = "webdriver")]
     pub async fn webdriver_type_text(&self, selector: &str, text: &str) -> AgentResult<()> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let driver = self
             .webdriver
             .as_ref()
             .ok_or(AgentError::NotConfigured("webdriver"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         driver
             .type_text(selector, text)
@@ -797,17 +799,14 @@ impl Agent {
     /// Open a new tab using WebDriver.
     #[cfg(feature = "webdriver")]
     pub async fn webdriver_new_tab(&self) -> AgentResult<crate::webdriver::WindowHandle> {
-        // Check limits before proceeding
-        if let Some(limit) = self.usage.check_webbrowser_limit(&self.config.limits) {
-            return Err(AgentError::LimitExceeded(limit));
-        }
-
         let driver = self
             .webdriver
             .as_ref()
             .ok_or(AgentError::NotConfigured("webdriver"))?;
 
-        self.usage.increment_webbrowser_calls();
+        self.usage
+            .reserve_webbrowser_call(&self.config.limits)
+            .map_err(AgentError::LimitExceeded)?;
 
         driver
             .new_tab()
@@ -900,9 +899,14 @@ impl Agent {
         if html.len() <= self.config.html_max_bytes {
             html
         } else {
-            // Find a safe break point
-            let truncated = &html[..self.config.html_max_bytes];
-            // Try to break at a tag boundary
+            // Walk back to the nearest UTF-8 char boundary so slicing a page
+            // whose multibyte char straddles `html_max_bytes` cannot panic.
+            let mut end = self.config.html_max_bytes;
+            while end > 0 && !html.is_char_boundary(end) {
+                end -= 1;
+            }
+            let truncated = &html[..end];
+            // Try to break at a tag boundary ('<' is ASCII, always a boundary)
             if let Some(pos) = truncated.rfind('<') {
                 &truncated[..pos]
             } else {
@@ -948,9 +952,13 @@ impl Agent {
         // Try to find JSON object in content
         if let Some(start) = content.find('{') {
             if let Some(end) = content.rfind('}') {
-                let json_str = &content[start..=end];
-                if let Ok(json) = serde_json::from_str(json_str) {
-                    return Ok(json);
+                // Guard against `}`-before-`{` (e.g. "} text {"): `start > end`
+                // would make `content[start..=end]` panic.
+                if start <= end {
+                    let json_str = &content[start..=end];
+                    if let Ok(json) = serde_json::from_str(json_str) {
+                        return Ok(json);
+                    }
                 }
             }
         }
@@ -961,36 +969,87 @@ impl Agent {
     }
 }
 
+/// Tags that [`remove_tags`] can strip, in a fixed lookup order.
+const STRIPPABLE_TAGS: [&str; 8] = [
+    "script", "style", "noscript", "svg", "canvas", "video", "audio", "iframe",
+];
+
+/// Build a single-pattern, ASCII case-insensitive matcher.
+fn tag_matcher(pattern: &str) -> aho_corasick::AhoCorasick {
+    aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build([pattern])
+        .expect("valid pattern")
+}
+
+/// Pre-built `<tag` / `</tag>` matchers for every strippable tag.
+///
+/// Matching case-insensitively on the original bytes replaces the full-document
+/// `to_ascii_lowercase()` allocation each tag pass previously required.
+static TAG_MATCHERS: std::sync::LazyLock<
+    [(&str, aho_corasick::AhoCorasick, aho_corasick::AhoCorasick); STRIPPABLE_TAGS.len()],
+> = std::sync::LazyLock::new(|| {
+    STRIPPABLE_TAGS.map(|tag| {
+        (
+            tag,
+            tag_matcher(&format!("<{tag}")),
+            tag_matcher(&format!("</{tag}>")),
+        )
+    })
+});
+
 /// Remove specified HTML tags (and their content) from HTML.
 ///
 /// Single-pass per tag — avoids O(n²) from repeated `find()` + concatenation.
+/// Tags absent from the document cost one scan and no rebuild.
 fn remove_tags(html: &str, tags: &[&str]) -> String {
-    let mut result = html.to_string();
+    let mut result = std::borrow::Cow::Borrowed(html);
     for tag in tags {
-        let open = format!("<{}", tag);
-        let close = format!("</{}>", tag);
-        let mut out = String::with_capacity(result.len());
-        let lower = result.to_lowercase();
+        // Case-insensitive matchers make offsets valid on the original bytes
+        // directly (per-tag `to_ascii_lowercase()` copies desync on nothing
+        // and are pure allocation overhead). Tag names are ASCII, so ASCII
+        // case-insensitivity is equivalent to the lowercased-haystack search.
+        let prebuilt = TAG_MATCHERS.iter().find(|(t, _, _)| t == tag);
+        let adhoc;
+        let (open, close) = match prebuilt {
+            Some((_, open, close)) => (open, close),
+            None => {
+                adhoc = (
+                    tag_matcher(&format!("<{tag}")),
+                    tag_matcher(&format!("</{tag}>")),
+                );
+                (&adhoc.0, &adhoc.1)
+            }
+        };
+
+        let cur: &str = &result;
+        // Tag not present — skip the rebuild entirely.
+        let Some(first) = open.find(cur) else {
+            continue;
+        };
+
+        let mut out = String::with_capacity(cur.len());
         let mut pos = 0;
-        while pos < result.len() {
-            if let Some(rel_start) = lower[pos..].find(&open) {
-                let start = pos + rel_start;
-                out.push_str(&result[pos..start]);
-                if let Some(rel_end) = lower[start..].find(&close) {
-                    pos = start + rel_end + close.len();
+        let mut next_start = Some(first.start());
+        while pos < cur.len() {
+            if let Some(start) = next_start {
+                out.push_str(&cur[pos..start]);
+                if let Some(c) = close.find(&cur[start..]) {
+                    pos = start + c.end();
                 } else {
                     // No closing tag — keep remaining text as-is
-                    out.push_str(&result[start..]);
-                    pos = result.len();
+                    out.push_str(&cur[start..]);
+                    pos = cur.len();
                 }
+                next_start = open.find(&cur[pos..]).map(|m| pos + m.start());
             } else {
-                out.push_str(&result[pos..]);
+                out.push_str(&cur[pos..]);
                 break;
             }
         }
-        result = out;
+        result = std::borrow::Cow::Owned(out);
     }
-    result
+    result.into_owned()
 }
 
 /// Result from fetching a URL.
@@ -1150,7 +1209,12 @@ impl AgentBuilder {
     /// `/unblocker`.
     /// AI routes remain disabled unless enabled in `with_spider_cloud_config`.
     pub fn with_spider_cloud(mut self, api_key: impl Into<String>) -> Self {
-        self.spider_cloud = Some(SpiderCloudToolConfig::new(api_key));
+        let key = api_key.into();
+        if is_placeholder_api_key(&key) {
+            log::warn!("Spider Cloud API key looks like a placeholder — skipping. Get a real key at https://spider.cloud");
+            return self;
+        }
+        self.spider_cloud = Some(SpiderCloudToolConfig::new(key));
         self
     }
 
@@ -1167,7 +1231,12 @@ impl AgentBuilder {
     /// Connects to a remote browser instance at `wss://browser.spider.cloud/v1/browser`
     /// via CDP. Registers navigate, html, screenshot, evaluate, click, fill, and wait tools.
     pub fn with_spider_browser(mut self, api_key: impl Into<String>) -> Self {
-        self.spider_browser = Some(SpiderBrowserToolConfig::new(api_key));
+        let key = api_key.into();
+        if is_placeholder_api_key(&key) {
+            log::warn!("Spider Browser Cloud API key looks like a placeholder — skipping. Get a real key at https://spider.cloud");
+            return self;
+        }
+        self.spider_browser = Some(SpiderBrowserToolConfig::new(key));
         self
     }
 
@@ -1319,6 +1388,12 @@ impl AgentBuilder {
 
     /// Build the agent.
     pub fn build(self) -> AgentResult<Agent> {
+        if self.config.max_concurrent_llm_calls == 0
+            || self.config.max_concurrent_llm_calls > Semaphore::MAX_PERMITS
+        {
+            return Err(AgentError::InvalidField("max_concurrent_llm_calls"));
+        }
+
         let client = if let Some(client) = self.client {
             client
         } else {
@@ -1385,6 +1460,104 @@ impl Default for AgentBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubLlm;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for StubLlm {
+        async fn complete(
+            &self,
+            _messages: Vec<Message>,
+            _options: &CompletionOptions,
+            _client: &reqwest::Client,
+        ) -> AgentResult<CompletionResponse> {
+            tokio::task::yield_now().await;
+            Ok(CompletionResponse {
+                content: "ok".into(),
+                usage: crate::llm::TokenUsage::default(),
+            })
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "stub"
+        }
+        fn is_configured(&self) -> bool {
+            true
+        }
+    }
+
+    fn limited_agent(limits: crate::config::UsageLimits) -> Agent {
+        let mut builder = Agent::builder().with_config(
+            AgentConfig::new()
+                .with_max_concurrent_llm_calls(1)
+                .with_limits(limits),
+        );
+        builder.llm = Some(Box::new(StubLlm));
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn invalid_concurrency_returns_error_instead_of_hanging_or_panicking() {
+        for n in [0, Semaphore::MAX_PERMITS + 1] {
+            assert!(matches!(
+                Agent::builder().with_max_concurrent_llm_calls(n).build(),
+                Err(AgentError::InvalidField("max_concurrent_llm_calls"))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_completions_respect_call_limit() {
+        let agent = limited_agent(crate::config::UsageLimits::new().with_max_llm_calls(1));
+        let permit = agent.llm_semaphore.acquire().await.unwrap();
+        let first = agent.complete(vec![]);
+        let second = agent.complete(vec![]);
+        tokio::pin!(first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(permit);
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.is_ok());
+        assert!(matches!(
+            second,
+            Err(AgentError::LimitExceeded(
+                crate::config::LimitType::LlmCalls { .. }
+            ))
+        ));
+        assert_eq!(agent.usage().llm_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_completion_rechecks_tokens_after_admission() {
+        let agent = limited_agent(crate::config::UsageLimits::new().with_max_total_tokens(1));
+        let permit = agent.llm_semaphore.acquire().await.unwrap();
+        let completion = agent.complete(vec![]);
+        tokio::pin!(completion);
+        assert!(futures::poll!(&mut completion).is_pending());
+        agent.usage.add_tokens(1, 0);
+        drop(permit);
+        assert!(matches!(
+            completion.await,
+            Err(AgentError::LimitExceeded(
+                crate::config::LimitType::TotalTokens { .. }
+            ))
+        ));
+        assert_eq!(agent.usage().llm_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_consume_a_call() {
+        let agent = limited_agent(crate::config::UsageLimits::new().with_max_llm_calls(1));
+        let permit = agent.llm_semaphore.acquire().await.unwrap();
+        {
+            let completion = agent.complete(vec![]);
+            tokio::pin!(completion);
+            assert!(futures::poll!(&mut completion).is_pending());
+        }
+        drop(permit);
+        assert!(agent.complete(vec![]).await.is_ok());
+        assert_eq!(agent.usage().llm_calls, 1);
+    }
 
     #[test]
     fn test_builder_registers_spider_cloud_default_routes() {
@@ -1576,5 +1749,80 @@ mod tests {
         // Both sets of tools registered.
         assert!(agent.has_custom_tool("spider_cloud_crawl"));
         assert!(agent.has_custom_tool("spider_browser_navigate"));
+    }
+
+    /// Verbatim copy of the pre-Aho-Corasick `remove_tags` — the byte-identity
+    /// oracle for the optimized implementation.
+    fn remove_tags_reference(html: &str, tags: &[&str]) -> String {
+        let mut result = html.to_string();
+        for tag in tags {
+            let open = format!("<{}", tag);
+            let close = format!("</{}>", tag);
+            let mut out = String::with_capacity(result.len());
+            let lower = result.to_ascii_lowercase();
+            let mut pos = 0;
+            while pos < result.len() {
+                if let Some(rel_start) = lower[pos..].find(&open) {
+                    let start = pos + rel_start;
+                    out.push_str(&result[pos..start]);
+                    if let Some(rel_end) = lower[start..].find(&close) {
+                        pos = start + rel_end + close.len();
+                    } else {
+                        out.push_str(&result[start..]);
+                        pos = result.len();
+                    }
+                } else {
+                    out.push_str(&result[pos..]);
+                    break;
+                }
+            }
+            result = out;
+        }
+        result
+    }
+
+    #[test]
+    fn remove_tags_matches_reference_byte_for_byte() {
+        let inputs = [
+            "",
+            "plain text with no tags at all",
+            "<p>keep</p><script>drop()</script><p>keep2</p>",
+            "<SCRIPT src=x>UP</SCRIPT><Style>.a{}</Style><p>ok</p>",
+            "<script>no close tag here",
+            "<div><script>a</script><style>b</style><noscript>c</noscript></div>",
+            "<svg><circle/></svg><canvas></canvas><video src=v></video><audio></audio>",
+            "<iframe src=f></iframe>tail",
+            "<script>first</script>mid<script>second</script>",
+            "<scriptx>prefix-match removes to close</script><p>after</p>",
+            "text<style>s1<script>nested</script>s2</style>done",
+            "unicode é–中<script>x</script>文ü tail",
+            "<script>unterminated<style>both</style>",
+            "</script>orphan close<p>x</p>",
+        ];
+        let tag_sets: [&[&str]; 3] = [
+            &["script"],
+            &["script", "style", "noscript"],
+            &[
+                "script", "style", "noscript", "svg", "canvas", "video", "audio", "iframe",
+            ],
+        ];
+        for html in inputs {
+            for tags in tag_sets {
+                assert_eq!(
+                    remove_tags(html, tags),
+                    remove_tags_reference(html, tags),
+                    "divergence for {html:?} with tags {tags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remove_tags_handles_unknown_tag_fallback() {
+        // Not in STRIPPABLE_TAGS — exercises the ad-hoc matcher path.
+        assert_eq!(
+            remove_tags("<marquee>old</marquee><p>x</p>", &["marquee"]),
+            remove_tags_reference("<marquee>old</marquee><p>x</p>", &["marquee"])
+        );
     }
 }

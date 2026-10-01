@@ -1,6 +1,6 @@
 [package]
 name = "spider_worker"
-version = "2.48.8"
+version = "2.53.9"
 authors = ["j-mendez <jeff@spider.cloud>"]
 description = "The fastest web crawler as a worker or proxy."
 repository = "https://github.com/spider-rs/spider"
@@ -9,6 +9,7 @@ keywords = ["crawler", "spider", "spider_cli"]
 categories = ["web-programming"]
 license = "MIT"
 documentation = "https://docs.rs/spider"
+homepage = "https://spider.cloud/crates"
 include = ["src/*", "LICENSE", "README.md"]
 edition = "2021"
 resolver = "2"
@@ -26,7 +27,7 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
 [dependencies.spider]
-version = "2"
+version = "2.53.9"
 path = "../spider"
 features = ["serde", "flexbuffers"]
 

@@ -1,7 +1,7 @@
 # Examples
 
 First `git clone https://github.com/spider-rs/spider.git` and `cd spider`. Use the release flag for the best performance `--release` when running the examples below.
-It is recommended to use the [headless-browser](https://github.com/spider-rs/headless-browser) project for web crawling and scraping via a headless Docker container or by launching your own local [chrome-headless-shell](https://developer.chrome.com/blog/chrome-headless-shell) when using the chrome examples.
+For the chrome examples, run the [headless-browser](https://github.com/spider-rs/headless-browser) project as a headless Docker container, or launch your own local [chrome-headless-shell](https://developer.chrome.com/blog/chrome-headless-shell).
 
 ## Basic
 
@@ -25,7 +25,7 @@ Enable log output [Debug](./debug.rs).
 
 - `cargo run --example debug`
 
-Scrape the webpage with and gather html [Scrape](./scrape.rs).
+Scrape the webpage and gather html [Scrape](./scrape.rs).
 
 - `cargo run --example scrape`
 
@@ -79,11 +79,11 @@ Use different encodings for the page. [Encoding](./encoding.rs).
 
 Use advanced configuration re-use. [Advanced Configuration](./advanced_configuration.rs).
 
-- `cargo run --example cache_chrome_hybrid --features="spider/sync spider/chrome spider/cache_chrome_hybrid"`
+- `cargo run --example advanced_configuration`
 
 Use chrome hybrid caching. [Chrome Cache Hybrid](./cache_chrome_hybrid.rs).
 
-- `cargo run --example advanced_configuration`
+- `cargo run --example cache_chrome_hybrid --features="spider/sync spider/chrome spider/cache_chrome_hybrid"`
 
 End-to-end remote cache warm + skip-browser return path using `HYBRID_CACHE_ENDPOINT` (index_cache_server / hybrid_cache_server). [Remote Cache Skip Browser](./cache_remote_skip_browser.rs).
 

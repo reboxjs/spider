@@ -12,14 +12,38 @@ use crate::features::chrome_common::RequestInterceptConfiguration;
 use crate::features::disk::DatabaseHandler;
 use crate::packages::robotparser::parser::RobotFileParser;
 use crate::page::{
-    AntiBotTech, Page, PageLinkBuildSettings, CHROME_UNKNOWN_STATUS_ERROR, UNKNOWN_STATUS_ERROR,
+    AntiBotTech, Page, PageLinkBuildSettings, ADDRESS_UNREACHABLE_ERROR,
+    CHROME_UNKNOWN_STATUS_ERROR, DNS_RESOLVE_ERROR, UNKNOWN_STATUS_ERROR,
 };
 use crate::utils::abs::{convert_abs_url, parse_absolute_url};
 use crate::utils::interner::ListBucket;
 use crate::utils::{
-    crawl_duration_expired, emit_log, emit_log_shutdown, get_path_from_url, get_semaphore,
-    networking_capable, prepare_url, setup_website_selectors, spawn_set, AllowedDomainTypes,
+    crawl_duration_expired, detect_apache_forbidden, emit_log, emit_log_shutdown,
+    get_path_from_url, get_semaphore, networking_capable, prepare_url, setup_website_selectors,
+    spawn_set, AllowedDomainTypes,
 };
+
+/// Cancels the control task when its owning operation completes or is dropped.
+/// An abort handle keeps public setup return types unchanged and never blocks in Drop.
+struct ControlHandlerGuard(Option<tokio::task::AbortHandle>);
+
+impl ControlHandlerGuard {
+    fn new(handle: &tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle.abort_handle()))
+    }
+
+    fn disarm(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for ControlHandlerGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
 
 /// Run a future with an optional hard wall-clock timeout.
 /// When `timeout` is `None`, the future runs without any timer overhead.
@@ -66,19 +90,26 @@ pub use http_global_cache::CACACHE_MANAGER;
 /// The max backoff duration in seconds.
 const BACKOFF_MAX_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
-/// Minimum retry count for Chrome requests. Chrome/CDP is inherently less
-/// reliable than plain HTTP (tab crashes, WebSocket flakes, navigation
-/// timeouts) so we always retry at least this many times even when the user
-/// left `config.retry` at 0.
-#[cfg(all(feature = "chrome", not(feature = "decentralized")))]
-const CHROME_MIN_RETRY: u8 = 2;
-
 /// Chrome page fetch with retry. Creates a tab, navigates, retries on failure.
 /// Returns `Option<Page>` — `None` if tab creation fails.
 /// Used by the hedge feature to race a primary fetch against a hedge fetch on a second tab.
+///
+/// Every tab is wrapped in a [`TabCloseGuard`] so that if this future is
+/// cancelled by `tokio::select!` (the losing side of a hedge race), the
+/// orphaned Chrome tab is closed instead of leaking.
 #[cfg(all(feature = "hedge", feature = "chrome", not(feature = "decentralized")))]
 macro_rules! chrome_page_fetch {
-    ($shared:expr, $target_url:expr) => {{
+    ($shared:expr, $target_url:expr, $full_resources:expr, $return_page_links:expr, $skip_links:expr) => {{
+        chrome_page_fetch!(
+            $shared,
+            $target_url,
+            None::<&std::sync::Arc<dyn crate::retry_strategy::RetryStrategy>>,
+            $full_resources,
+            $return_page_links,
+            $skip_links
+        )
+    }};
+    ($shared:expr, $target_url:expr, $strategy:expr, $full_resources:expr, $return_page_links:expr, $skip_links:expr) => {{
         match crate::features::chrome::attempt_navigation(
             "about:blank",
             &$shared.5,
@@ -89,6 +120,12 @@ macro_rules! chrome_page_fetch {
         .await
         {
             Ok(hedge_tab) => {
+                // Guard closes the *currently-active* tab if this future is
+                // cancelled mid-flight. `mut` so the retry loop can swap in a
+                // fresh tab (and dispose the prior one) without ever letting
+                // the active tab go unprotected — see `TabCloseGuard::swap`.
+                let mut _tab_guard = crate::features::chrome::TabCloseGuard::new(hedge_tab.clone());
+
                 let (_, intercept_handle) = tokio::join!(
                     crate::features::chrome::setup_chrome_events(&hedge_tab, &$shared.6),
                     crate::features::chrome::setup_chrome_interception_base(
@@ -100,36 +137,102 @@ macro_rules! chrome_page_fetch {
                     )
                 );
 
-                let mut page = Page::new(
+                // Pre-allocate the link set + optional page-link set so the
+                // streaming extractor can borrow them across the chunk pump.
+                // Capacity hint comes from the cross-page EMA.
+                let mut links: hashbrown::HashSet<CaseInsensitiveString> =
+                    hashbrown::HashSet::with_capacity(crate::page::link_set_capacity());
+                let mut links_pages: Option<hashbrown::HashSet<CaseInsensitiveString>> =
+                    if $return_page_links {
+                        Some(Default::default())
+                    } else {
+                        None
+                    };
+
+                let (mut page, mut extract_succeeded) = Page::new_streaming(
                     $target_url,
                     &$shared.0,
                     &hedge_tab,
-                    &$shared.6.wait_for,
-                    &$shared.6.screenshot,
                     false,
-                    &$shared.6.openai_config,
-                    &$shared.6.execution_scripts,
-                    &$shared.6.automation_scripts,
-                    &$shared.6.viewport,
-                    &$shared.6.request_timeout,
-                    &$shared.6.track_events,
                     $shared.6.referer.clone(),
                     $shared.6.max_page_bytes,
                     $shared.6.get_cache_options(),
-                    &$shared.6.cache_policy,
-                    &$shared.6.remote_multimodal,
+                    $shared.6.cache_namespace_str(),
+                    &$shared
+                        .6
+                        .chrome_fetch_params()
+                        .with_browser_dead(&$shared.11)
+                        .with_chrome_endpoint($shared.12.as_deref()),
+                    &$shared.1,
+                    &$shared.3,
+                    &mut links,
+                    &mut links_pages,
+                    $full_resources,
+                    $skip_links,
+                    // Recursive crawl never runs the SSG manifest discovery —
+                    // that's reserved for the initial-page entry point
+                    // (`crawl_establish`).  Same as today's `chrome_page_fetch!`
+                    // → `chrome_page_post_process!` flow which calls
+                    // `page.links()` (no SSG) instead of `page.links_ssg()`.
+                    false,
                 )
                 .await;
 
-                let mut retry_count = $shared.6.retry.max(CHROME_MIN_RETRY);
+                let _retry_strategy_ref: Option<
+                    &std::sync::Arc<dyn crate::retry_strategy::RetryStrategy>,
+                > = $strategy.as_ref().map(|s| {
+                    let s: &std::sync::Arc<dyn crate::retry_strategy::RetryStrategy> = s;
+                    s
+                });
+
+                let mut retry_count: u32 = match _retry_strategy_ref {
+                    Some(s) => s.max_retries(),
+                    None => $shared.6.retry as u32,
+                };
                 let mut attempt: u32 = 0;
+                page.proxy_configured = $shared.6.proxies.is_some();
                 while page.needs_retry() && retry_count > 0 {
                     retry_count -= 1;
+                    attempt += 1;
+
+                    // Consult the retry strategy if set.
+                    let (_directive_backoff, _directive_profile_key) = match _retry_strategy_ref {
+                        Some(s) => {
+                            let outcome = crate::retry_strategy::AttemptOutcome {
+                                attempt,
+                                status_code: page.status_code,
+                                should_retry: page.should_retry,
+                                content_truncated: page.content_truncated,
+                                waf_check: page.waf_check,
+                                anti_bot_tech: &page.anti_bot_tech,
+                                proxy_configured: page.proxy_configured,
+                                url: $target_url,
+                                profile_key: page.profile_key.as_deref(),
+                                html_length: page.size(),
+                                bytes_transferred: page.bytes_transferred,
+                                #[cfg(not(feature = "page_error_status_details"))]
+                                error_status: page.error_status.as_deref(),
+                                #[cfg(feature = "page_error_status_details")]
+                                error_status: None,
+                                final_redirect_destination: page
+                                    .final_redirect_destination
+                                    .as_deref(),
+                            };
+                            let directive = s.on_retry(&outcome);
+                            if !directive.should_retry {
+                                break;
+                            }
+                            (directive.backoff, directive.profile_key)
+                        }
+                        None => (None, None),
+                    };
+
                     // Exponential backoff with jitter between retries.
                     let status_delay = page.get_timeout().unwrap_or_default();
-                    let backoff = crate::utils::backoff::backoff_delay(attempt, 200, 15_000);
+                    let backoff = _directive_backoff.unwrap_or_else(|| {
+                        crate::utils::backoff::backoff_delay(attempt - 1, 200, 15_000)
+                    });
                     tokio::time::sleep(status_delay.max(backoff)).await;
-                    attempt += 1;
 
                     // Fresh tab for retry — avoids reusing a corrupted tab.
                     if let Ok(retry_tab) = crate::features::chrome::attempt_navigation(
@@ -141,6 +244,10 @@ macro_rules! chrome_page_fetch {
                     )
                     .await
                     {
+                        // Guard for the retry tab — closed on cancellation or scope exit.
+                        let _retry_guard =
+                            crate::features::chrome::TabCloseGuard::new(retry_tab.clone());
+
                         let _ = tokio::join!(
                             crate::features::chrome::setup_chrome_events(&retry_tab, &$shared.6),
                             crate::features::chrome::setup_chrome_interception_base(
@@ -152,36 +259,78 @@ macro_rules! chrome_page_fetch {
                             )
                         );
 
-                        if let Err(_elapsed) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
-                            let p = Page::new(
+                        // Reset extracted state from the prior attempt — only
+                        // the final attempt's links should reach the caller.
+                        links.clear();
+                        if let Some(ref mut lp) = links_pages {
+                            lp.clear();
+                        }
+
+                        // Run the retry fetch under a backoff timeout. The
+                        // assignment to `page` happens *outside* the timeout —
+                        // so on `Err` the future is cancelled before `page` is
+                        // touched and `_retry_guard`'s Drop disposes
+                        // `retry_tab` safely. On `Ok` we commit the swap below,
+                        // moving `retry_tab` into the outer `_tab_guard` so
+                        // cancellation safety follows the tab whose clone is
+                        // now on `page.chrome_page`.
+                        match tokio::time::timeout(
+                            BACKOFF_MAX_DURATION,
+                            Page::new_streaming(
                                 $target_url,
                                 &$shared.0,
                                 &retry_tab,
-                                &$shared.6.wait_for,
-                                &$shared.6.screenshot,
                                 false,
-                                &$shared.6.openai_config,
-                                &$shared.6.execution_scripts,
-                                &$shared.6.automation_scripts,
-                                &$shared.6.viewport,
-                                &$shared.6.request_timeout,
-                                &$shared.6.track_events,
                                 $shared.6.referer.clone(),
                                 $shared.6.max_page_bytes,
                                 $shared.6.get_cache_options(),
-                                &$shared.6.cache_policy,
-                                &$shared.6.remote_multimodal,
-                            )
-                            .await;
-                            page = p;
-                        })
+                                $shared.6.cache_namespace_str(),
+                                &$shared
+                                    .6
+                                    .chrome_fetch_params()
+                                    .with_browser_dead(&$shared.11)
+                                    .with_chrome_endpoint($shared.12.as_deref()),
+                                &$shared.1,
+                                &$shared.3,
+                                &mut links,
+                                &mut links_pages,
+                                $full_resources,
+                                $skip_links,
+                                false,
+                            ),
+                        )
                         .await
                         {
-                            log::info!(
-                                "{} chrome retry backoff timeout exceeded {}",
-                                $target_url,
-                                _elapsed
-                            );
+                            Ok((p, succ)) => {
+                                page = p;
+                                extract_succeeded = succ;
+                            }
+                            Err(_elapsed) => {
+                                log::info!(
+                                    "{} chrome retry backoff timeout exceeded {}",
+                                    $target_url,
+                                    _elapsed
+                                );
+                                page.should_retry = false;
+                                break;
+                            }
+                        }
+
+                        // Stamp the profile key from the strategy directive.
+                        if let Some(ref pk) = _directive_profile_key {
+                            page.profile_key = Some(pk.clone());
+                        }
+
+                        // `page.chrome_page` now holds a clone of `retry_tab`
+                        // (when `chrome_store_page` is enabled). Move `retry_tab`
+                        // into the outer guard so the tab the subscriber owns is
+                        // the one being protected from now on. The prior tab
+                        // (the initial `hedge_tab` or a superseded retry) is no
+                        // longer referenced anywhere — close it now to free
+                        // chrome resources.
+                        _retry_guard.defuse();
+                        if let Some(prior) = _tab_guard.swap(retry_tab.clone()) {
+                            let _ = prior.close().await;
                         }
                     } else {
                         log::warn!(
@@ -189,6 +338,154 @@ macro_rules! chrome_page_fetch {
                             $target_url,
                             attempt
                         );
+                    }
+                }
+
+                // ── In-request gateway re-acquire (retry the acquisition) ──
+                //
+                // The loop above re-renders on a fresh *tab* of the same browser.
+                // If that browser is dead — e.g. the first-byte watchdog saw a
+                // gateway acquisition timeout and flipped `browser_dead` — those
+                // tab retries can't recover it. Open a fresh connection
+                // (`HedgeBrowser`) to re-run the acquisition and re-render on it.
+                // NOTE: the endpoint may resolve to a gateway ingress rather than
+                // a specific backend, so this is a fresh acquisition, not a pinned
+                // reconnect; it still helps when acquisition failures are roughly
+                // independent per attempt. Bounded budget, independent of
+                // `config.retry`; gives up if it keeps failing (no infinite loop).
+                //
+                // A jittered delay precedes each attempt so concurrent requests
+                // that all observe the same gateway saturation don't re-acquire in
+                // lockstep (thundering herd). Opt out at runtime with
+                // `SPIDER_CHROME_REACQUIRE=0`.
+                //
+                // Skipped under `chrome_store_page`: there the subscriber keeps
+                // the live tab past this scope, so a reconnected browser can't be
+                // disposed at scope exit without Page-level lifetime plumbing.
+                if !cfg!(feature = "chrome_store_page")
+                    && $shared
+                        .6
+                        .enhancements
+                        .enabled(crate::configuration::CrawlEnhancement::GatewayReacquire)
+                {
+                    let mut reacquire_budget: u32 = 2;
+                    let mut reacquire_attempt: u32 = 0;
+                    while reacquire_budget > 0
+                        && $shared.11.load(std::sync::atomic::Ordering::Acquire)
+                        && (page.needs_retry() || page.is_empty())
+                    {
+                        reacquire_budget -= 1;
+                        log::warn!(
+                            "[chrome-reacquire] {} browser dead — gateway re-acquire (budget left {})",
+                            $target_url,
+                            reacquire_budget
+                        );
+                        // Decorrelate concurrent re-acquisitions with full jitter
+                        // so a saturated gateway isn't hit in lockstep.
+                        let reacquire_jitter =
+                            crate::utils::backoff::backoff_delay(reacquire_attempt, 250, 5_000);
+                        reacquire_attempt += 1;
+                        if !reacquire_jitter.is_zero() {
+                            tokio::time::sleep(reacquire_jitter).await;
+                        }
+                        // Fresh acquisition via the gateway (HedgeBrowser).
+                        // `None` => re-acquire failed; give up rather than loop.
+                        match crate::features::chrome::HedgeBrowser::connect(&$shared.5, &$shared.6)
+                            .await
+                        {
+                            Some(fresh) => {
+                                let peer_url = fresh.connected_url.clone();
+                                match crate::features::chrome::attempt_navigation(
+                                    "about:blank",
+                                    &fresh.browser,
+                                    &$shared.6.request_timeout,
+                                    &$shared.8,
+                                    &$shared.6.viewport,
+                                )
+                                .await
+                                {
+                                    Ok(fresh_tab) => {
+                                        let _fresh_tab_guard =
+                                            crate::features::chrome::TabCloseGuard::new(
+                                                fresh_tab.clone(),
+                                            );
+                                        let _ = tokio::join!(
+                                            crate::features::chrome::setup_chrome_events(
+                                                &fresh_tab,
+                                                &$shared.6
+                                            ),
+                                            crate::features::chrome::setup_chrome_interception_base(
+                                                &fresh_tab,
+                                                $shared.6.chrome_intercept.enabled,
+                                                &$shared.6.auth_challenge_response,
+                                                $shared.6.chrome_intercept.block_visuals,
+                                                &$shared.7,
+                                            )
+                                        );
+
+                                        // Only the final attempt's links reach the caller.
+                                        links.clear();
+                                        if let Some(ref mut lp) = links_pages {
+                                            lp.clear();
+                                        }
+
+                                        let (p, succ) = Page::new_streaming(
+                                            $target_url,
+                                            &$shared.0,
+                                            &fresh_tab,
+                                            false,
+                                            $shared.6.referer.clone(),
+                                            $shared.6.max_page_bytes,
+                                            $shared.6.get_cache_options(),
+                                            $shared.6.cache_namespace_str(),
+                                            // Watch the fresh connection's own
+                                            // death flag + its endpoint.
+                                            &$shared
+                                                .6
+                                                .chrome_fetch_params()
+                                                .with_browser_dead(&fresh.browser_dead)
+                                                .with_chrome_endpoint(peer_url.as_deref()),
+                                            &$shared.1,
+                                            &$shared.3,
+                                            &mut links,
+                                            &mut links_pages,
+                                            $full_resources,
+                                            $skip_links,
+                                            false,
+                                        )
+                                        .await;
+                                        page = p;
+                                        extract_succeeded = succ;
+                                        // _fresh_tab_guard drops here → tab closed.
+                                    }
+                                    Err(_) => {
+                                        log::warn!(
+                                            "[chrome-reacquire] {} gateway re-acquire: fresh tab failed",
+                                            $target_url
+                                        );
+                                    }
+                                }
+
+                                // Dispose the physical reconnect (context + WS).
+                                fresh.close().await;
+
+                                if !page.needs_retry() && !page.is_empty() {
+                                    log::info!(
+                                        "[chrome-reacquire] {} recovered via gateway re-acquire ({})",
+                                        $target_url,
+                                        peer_url.as_deref().unwrap_or("?")
+                                    );
+                                    break;
+                                }
+                            }
+                            None => {
+                                log::warn!(
+                                    "[chrome-reacquire] {} gateway re-acquire failed — giving up",
+                                    $target_url
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -202,20 +499,175 @@ macro_rules! chrome_page_fetch {
                     }
                 }
 
-                Some(page)
+                // Final tab disposition. With `chrome_store_page` enabled the
+                // subscriber owns the live tab via `Page::chrome_page` and is
+                // expected to call `Page::close_page()` when done — leave the
+                // guard disarmed so the tab stays open. Without the feature,
+                // close the tab now (legacy behavior). Either way, drop into
+                // the guard via `into_inner()` so cancellation safety is
+                // preserved up to this line.
+                if cfg!(feature = "chrome_store_page") {
+                    _tab_guard.defuse();
+                } else if let Some(active) = _tab_guard.into_inner() {
+                    let _ = active.close().await;
+                }
+
+                Some((page, links, links_pages, extract_succeeded))
             }
-            _ => None,
+            _ => {
+                // Tab creation failed (browser hang, dead WS, CDP error).
+                // Emit a synthetic timeout Page so subscribers always see
+                // every URL that was attempted instead of a silent drop.
+                // request_timeout is meant to cancel waits — it should not
+                // swallow the subscriber notification.
+                if $shared.2.is_some() {
+                    let mut resp = crate::utils::PageResponse::default();
+                    resp.status_code = reqwest::StatusCode::GATEWAY_TIMEOUT;
+                    let mut synthetic = crate::page::build($target_url, resp);
+                    synthetic.should_retry = false;
+                    channel_send_page(&$shared.2, synthetic, &$shared.4).await;
+                }
+                None
+            }
+        }
+    }};
+}
+
+/// Chrome page fetch on an arbitrary browser connection. Used by the hedge
+/// feature to fire a duplicate request on a second WebSocket connection.
+/// Falls back to the primary browser if the hedge browser is `None`.
+///
+/// Tab is wrapped in a [`TabCloseGuard`] for cancellation safety.
+///
+/// `$hedge` is the `&HedgeBrowser` whose `browser_dead` + `connected_url`
+/// the first-byte watchdog uses — so a hedge timeout marks the *hedge's*
+/// URL bad on the failover (not the primary's) and signals the hedge's
+/// own death flag (not the primary's).
+#[cfg(all(feature = "hedge", feature = "chrome", not(feature = "decentralized")))]
+macro_rules! chrome_page_fetch_on {
+    ($shared:expr, $target_url:expr, $hedge:expr,
+     $full_resources:expr, $return_page_links:expr, $skip_links:expr) => {{
+        match crate::features::chrome::attempt_navigation(
+            "about:blank",
+            &$hedge.browser,
+            &$shared.6.request_timeout,
+            &$hedge.context_id,
+            &$shared.6.viewport,
+        )
+        .await
+        {
+            Ok(hedge_tab) => {
+                let _tab_guard = crate::features::chrome::TabCloseGuard::new(hedge_tab.clone());
+
+                let (_, intercept_handle) = tokio::join!(
+                    crate::features::chrome::setup_chrome_events(&hedge_tab, &$shared.6),
+                    crate::features::chrome::setup_chrome_interception_base(
+                        &hedge_tab,
+                        $shared.6.chrome_intercept.enabled,
+                        &$shared.6.auth_challenge_response,
+                        $shared.6.chrome_intercept.block_visuals,
+                        &$shared.7,
+                    )
+                );
+
+                let mut links: hashbrown::HashSet<CaseInsensitiveString> =
+                    hashbrown::HashSet::with_capacity(crate::page::link_set_capacity());
+                let mut links_pages: Option<hashbrown::HashSet<CaseInsensitiveString>> =
+                    if $return_page_links {
+                        Some(Default::default())
+                    } else {
+                        None
+                    };
+
+                let (page, extract_succeeded) = Page::new_streaming(
+                    $target_url,
+                    &$shared.0,
+                    &hedge_tab,
+                    false,
+                    $shared.6.referer.clone(),
+                    $shared.6.max_page_bytes,
+                    $shared.6.get_cache_options(),
+                    $shared.6.cache_namespace_str(),
+                    &$shared
+                        .6
+                        .chrome_fetch_params()
+                        .with_browser_dead(&$hedge.browser_dead)
+                        .with_chrome_endpoint($hedge.connected_url.as_deref()),
+                    &$shared.1,
+                    &$shared.3,
+                    &mut links,
+                    &mut links_pages,
+                    $full_resources,
+                    $skip_links,
+                    false,
+                )
+                .await;
+
+                // Single attempt — no retries on the hedge path. The primary
+                // path retries independently; adding retries here would hold
+                // the hedge browser connection open longer than necessary.
+                if let Some(h) = intercept_handle {
+                    let abort_handle = h.abort_handle();
+                    if let Err(elapsed) =
+                        tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await
+                    {
+                        log::warn!("[hedge-chrome] handler timeout exceeded {}", elapsed);
+                        abort_handle.abort();
+                    }
+                }
+
+                // Final tab disposition. Mirrors the non-hedge macro: when
+                // `chrome_store_page` is enabled, the subscriber owns the live
+                // tab via `Page::chrome_page` and is expected to call
+                // `Page::close_page()` when done — leave the guard disarmed so
+                // the tab stays open. Without the feature, close it explicitly
+                // (legacy behavior).
+                if cfg!(feature = "chrome_store_page") {
+                    _tab_guard.defuse();
+                } else {
+                    _tab_guard.defuse();
+                    let _ = hedge_tab.close().await;
+                }
+
+                Some((page, links, links_pages, extract_succeeded))
+            }
+            _ => {
+                // Hedge tab creation failed — still notify subscribers so
+                // every attempted URL produces a Page event. The primary
+                // path independently may have sent its own Page; broadcast
+                // delivers both to subscribers, matching the normal race.
+                if $shared.2.is_some() {
+                    let mut resp = crate::utils::PageResponse::default();
+                    resp.status_code = reqwest::StatusCode::GATEWAY_TIMEOUT;
+                    let mut synthetic = crate::page::build($target_url, resp);
+                    synthetic.should_retry = false;
+                    channel_send_page(&$shared.2, synthetic, &$shared.4).await;
+                }
+                None
+            }
         }
     }};
 }
 
 /// Inline post-processing for Chrome page fetch results (link extraction, normalization, channel send).
 /// Used by both hedge and non-hedge Chrome crawl paths.
+///
+/// `$pre_links` / `$pre_links_pages` / `$extract_succeeded` carry the
+/// streaming-extracted state from `chrome_page_fetch!`. When
+/// `$extract_succeeded` is true, the precomputed link set is used as-is
+/// and no second lol_html pass runs. When false (mid-stream rewriter
+/// error or the chrome path bypassed streaming), the legacy
+/// `page.links()` / `page.links_full()` walk runs over the assembled
+/// body, preserving today's behavior bit-for-bit.
 #[cfg(all(feature = "chrome", not(feature = "decentralized")))]
 macro_rules! chrome_page_post_process {
-    ($page:expr, $shared:expr, $add_external:expr, $full_resources:expr,
+    ($page:expr, $pre_links:expr, $pre_links_pages:expr, $extract_succeeded:expr,
+     $shared:expr, $add_external:expr, $full_resources:expr,
      $return_page_links:expr, $on_should_crawl_callback:expr, $permit:expr) => {{
         let mut page = $page;
+        let pre_links = $pre_links;
+        let pre_links_pages = $pre_links_pages;
+        let extract_succeeded: bool = $extract_succeeded;
 
         if $add_external {
             page.set_external($shared.3.clone());
@@ -223,13 +675,27 @@ macro_rules! chrome_page_post_process {
         let prev_domain = page.base.take();
         page.set_url_parsed_direct();
         let page_base = page.base.take().map(Box::new);
-        if $return_page_links {
-            page.page_links = Some(Default::default());
-        }
-        let links = if $full_resources {
-            page.links_full(&$shared.1, &page_base).await
+        let links = if extract_succeeded {
+            // Streaming pass already populated everything we need. Move
+            // the `return_page_links` set onto the Page so consumers see
+            // it via `page.page_links`, mirroring the legacy
+            // post-process branch (`page.page_links = Some(Default)` +
+            // implicit population by `links_stream_base`).
+            if $return_page_links {
+                page.page_links = pre_links_pages.map(Box::new);
+            }
+            pre_links
         } else {
-            page.links(&$shared.1, &page_base).await
+            // Streaming hit a mid-stream error — fall back to the
+            // legacy second-pass walk so behavior matches prior releases.
+            if $return_page_links {
+                page.page_links = Some(Default::default());
+            }
+            if $full_resources {
+                page.links_full(&$shared.1, &page_base).await
+            } else {
+                page.links(&$shared.1, &page_base).await
+            }
         };
         page.base = prev_domain;
         if $shared.6.normalize {
@@ -239,20 +705,27 @@ macro_rules! chrome_page_post_process {
         if let Some(ref cb) = $on_should_crawl_callback {
             if !cb.call(&page) {
                 page.blocked_crawl = true;
-                channel_send_page(&$shared.2, page, &$shared.4);
+                channel_send_page(&$shared.2, page, &$shared.4).await;
                 drop($permit);
                 return Default::default();
             }
         }
         let signature = page.signature;
-        channel_send_page(&$shared.2, page, &$shared.4);
+        channel_send_page(&$shared.2, page, &$shared.4).await;
         (links, signature)
     }};
     // Variant with parallel backends support.
-    ($page:expr, $shared:expr, $add_external:expr, $full_resources:expr,
+    ($page:expr, $pre_links:expr, $pre_links_pages:expr, $extract_succeeded:expr,
+     $shared:expr, $add_external:expr, $full_resources:expr,
      $return_page_links:expr, $on_should_crawl_callback:expr, $permit:expr,
      $pb_backend_set:expr, $pb_config_ref:expr, $pb_tracker_ref:expr) => {{
         let mut page = $page;
+        let pre_links = $pre_links;
+        let pre_links_pages = $pre_links_pages;
+        // `mut` may be unused under non-`parallel_backends` builds because
+        // only the parallel-backends winner replacement reassigns it.
+        #[allow(unused_mut)]
+        let mut extract_succeeded: bool = $extract_succeeded;
 
         // ── Parallel backends: binary content-type early-out (Chrome path) ──
         #[cfg(feature = "parallel_backends")]
@@ -267,6 +740,7 @@ macro_rules! chrome_page_post_process {
                                     if let Some(ref mut s) = $pb_backend_set {
                                         s.abort_all();
                                     }
+                                    $pb_backend_set = None;
                                     _cancel_backends = true;
                                     log::debug!("[parallel_backends] cancelled backends for binary content-type (chrome): {}", ct_str);
                                 }
@@ -280,6 +754,16 @@ macro_rules! chrome_page_post_process {
         #[cfg(feature = "parallel_backends")]
         if let Some(ref mut pb_set) = $pb_backend_set {
             if let (Some(ref pb_cfg), Some(ref pb_trk)) = (&$pb_config_ref, &$pb_tracker_ref) {
+                // Permanent destination-side failure (525 DNS, 526 unreachable,
+                // 310 redirect cap): every backend would hit the same condition,
+                // so abort siblings immediately instead of burning the grace
+                // window. See `crate::page::is_permanent_target_failure`.
+                if crate::page::is_permanent_target_failure(page.status_code) {
+                    pb_set.abort_all();
+                    pb_trk.record_race(0);
+                    pb_trk.record_success(0);
+                    pb_trk.record_win(0);
+                } else {
                 let primary_score = page.quality_score();
                 pb_trk.record_race(0);
                 pb_trk.record_success(0);
@@ -294,22 +778,31 @@ macro_rules! chrome_page_post_process {
                             biased;
                             res = pb_set.join_next() => {
                                 match res {
-                                    Some(Ok(Some(resp))) => {
-                                        pb_trk.record_race(resp.backend_index);
-                                        pb_trk.record_duration(resp.backend_index, resp.duration);
-                                        pb_trk.record_success(resp.backend_index);
-                                        if resp.quality_score > primary_score {
-                                            let better = match &best_alt {
-                                                Some(b) => resp.quality_score > b.quality_score,
-                                                None => true,
-                                            };
-                                            if better { best_alt = Some(resp); }
-                                        }
-                                        if best_alt.as_ref().map_or(false, |b| b.quality_score >= pb_cfg.fast_accept_threshold) {
-                                            break;
+                                    Some(Ok(br)) => {
+                                        let idx = br.backend_index;
+                                        match br.response {
+                                            Some(resp) => {
+                                                pb_trk.record_race(idx);
+                                                pb_trk.record_duration(idx, resp.duration);
+                                                pb_trk.record_success(idx);
+                                                if resp.quality_score > primary_score {
+                                                    let better = match &best_alt {
+                                                        Some(b) => resp.quality_score > b.quality_score,
+                                                        None => true,
+                                                    };
+                                                    if better { best_alt = Some(resp); }
+                                                }
+                                                if best_alt.as_ref().is_some_and(|b| b.quality_score >= pb_cfg.fast_accept_threshold) {
+                                                    break;
+                                                }
+                                            }
+                                            None => {
+                                                pb_trk.record_race(idx);
+                                                pb_trk.record_error(idx);
+                                            }
                                         }
                                     }
-                                    Some(Ok(None)) | Some(Err(_)) => {}
+                                    Some(Err(_)) => {}
                                     None => break,
                                 }
                             }
@@ -320,6 +813,12 @@ macro_rules! chrome_page_post_process {
                     if let Some(winner) = best_alt {
                         pb_trk.record_win(winner.backend_index);
                         page = winner.page;
+                        // Streaming-extracted links applied to the
+                        // primary's body — if a parallel backend wins,
+                        // the body changes and we must re-extract via
+                        // the legacy second-pass walk to stay byte-
+                        // identical with prior releases.
+                        extract_succeeded = false;
                     } else {
                         pb_trk.record_win(0);
                     }
@@ -327,7 +826,15 @@ macro_rules! chrome_page_post_process {
                     pb_set.abort_all();
                     pb_trk.record_win(0);
                 }
+                }
             }
+        }
+        // Drop the JoinSet immediately so any completed-but-unread backend
+        // responses (carrying full Page data) are freed before downstream
+        // processing (multimodal extraction, channel send, etc.).
+        #[cfg(feature = "parallel_backends")]
+        {
+            $pb_backend_set = None;
         }
 
         if $add_external {
@@ -336,13 +843,20 @@ macro_rules! chrome_page_post_process {
         let prev_domain = page.base.take();
         page.set_url_parsed_direct();
         let page_base = page.base.take().map(Box::new);
-        if $return_page_links {
-            page.page_links = Some(Default::default());
-        }
-        let links = if $full_resources {
-            page.links_full(&$shared.1, &page_base).await
+        let links = if extract_succeeded {
+            if $return_page_links {
+                page.page_links = pre_links_pages.map(Box::new);
+            }
+            pre_links
         } else {
-            page.links(&$shared.1, &page_base).await
+            if $return_page_links {
+                page.page_links = Some(Default::default());
+            }
+            if $full_resources {
+                page.links_full(&$shared.1, &page_base).await
+            } else {
+                page.links(&$shared.1, &page_base).await
+            }
         };
         page.base = prev_domain;
         if $shared.6.normalize {
@@ -352,13 +866,13 @@ macro_rules! chrome_page_post_process {
         if let Some(ref cb) = $on_should_crawl_callback {
             if !cb.call(&page) {
                 page.blocked_crawl = true;
-                channel_send_page(&$shared.2, page, &$shared.4);
+                channel_send_page(&$shared.2, page, &$shared.4).await;
                 drop($permit);
                 return Default::default();
             }
         }
         let signature = page.signature;
-        channel_send_page(&$shared.2, page, &$shared.4);
+        channel_send_page(&$shared.2, page, &$shared.4).await;
         (links, signature)
     }};
 }
@@ -392,15 +906,43 @@ static JS_SAFE_CHALLENGE_PATTERNS: &[&str] = &[
 
 /// check if the page is a javascript challenge
 pub fn is_safe_javascript_challenge(page: &Page) -> bool {
-    let page = page.get_html_bytes_u8();
+    const MAX_BYTES: usize = 10_000;
 
-    let page_size = page.len();
+    let page_size = page.size();
 
-    if page_size == 0 || page_size > 10_000 {
+    if page_size == 0 || page_size > MAX_BYTES || !page.is_valid_utf8 {
         return false;
     }
 
-    AC_JS_CHALLENGE.find(page).is_some()
+    if page.is_binary_spool_aware() {
+        return false;
+    }
+
+    let bytes = page.get_html_bytes_u8();
+    if !bytes.is_empty() {
+        return AC_JS_CHALLENGE.find(bytes).is_some();
+    }
+
+    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+    {
+        use std::io::{BufRead, BufReader};
+
+        const SCAN_BYTES: usize = 4096;
+
+        if let Some(path) = page.get_html_spool_path() {
+            if let Ok(file) = std::fs::File::open(path) {
+                let cap = page_size.min(SCAN_BYTES).max(1);
+                let mut reader = BufReader::with_capacity(cap, file);
+                if let Ok(chunk) = reader.fill_buf() {
+                    if !chunk.is_empty() {
+                        return AC_JS_CHALLENGE.find(chunk).is_some();
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(all(
@@ -441,6 +983,47 @@ pub fn set_interface(client: ClientBuilder, _interface: &str) -> ClientBuilder {
     client
 }
 
+/// Bind connections only on the specified network interface (wreq backend).
+///
+/// Owned `String` is passed because wreq's `ClientBuilder::interface` bound is
+/// `Into<Cow<'static, str>>` — a non-static `&str` does not satisfy it.
+#[cfg(all(
+    feature = "wreq",
+    not(feature = "cache_request"),
+    any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    )
+))]
+pub fn set_interface_wreq(client: ClientBuilder, network_interface: &str) -> ClientBuilder {
+    client.interface(network_interface.to_string())
+}
+
+/// No-op shim for platforms where wreq's `interface` is unavailable.
+#[cfg(all(
+    feature = "wreq",
+    not(feature = "cache_request"),
+    not(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))
+))]
+pub fn set_interface_wreq(client: ClientBuilder, _interface: &str) -> ClientBuilder {
+    client
+}
+
 lazy_static! {
     static ref AC_JS_CHALLENGE: aho_corasick::AhoCorasick =  aho_corasick::AhoCorasick::new(JS_SAFE_CHALLENGE_PATTERNS).expect("safe challenges");
     /// The default Semaphore limits.
@@ -468,6 +1051,100 @@ lazy_static! {
         }
     };
     static ref WILD_CARD_PATH: CaseInsensitiveString = CaseInsensitiveString::from("*");
+    /// The max extra links to buffer in memory between crawl iterations.
+    pub(crate) static ref EXTRA_LINKS_MEMORY_LIMIT: usize = {
+        const DEFAULT_LIMIT: usize = 25_000;
+        match std::env::var("EXTRA_LINKS_MEMORY_LIMIT") {
+            Ok(limit) => limit.parse::<usize>().unwrap_or(DEFAULT_LIMIT),
+            _ => DEFAULT_LIMIT
+        }
+    };
+    /// The max pages to retain in [`Website::get_pages`].
+    ///
+    /// `0` — the default — keeps the historical unbounded behavior so the
+    /// default build is byte-identical. A malformed value also falls back to
+    /// the default rather than panicking.
+    pub(crate) static ref PAGES_MEMORY_LIMIT: usize = {
+        const DEFAULT_LIMIT: usize = 0;
+        match std::env::var("SPIDER_MAX_RETAINED_PAGES") {
+            Ok(limit) => limit.parse::<usize>().unwrap_or(DEFAULT_LIMIT),
+            _ => DEFAULT_LIMIT
+        }
+    };
+}
+
+/// Count of pages dropped because [`PAGES_MEMORY_LIMIT`] was reached.
+///
+/// Process-wide (concurrent [`Website`] instances share it) and drained by
+/// [`report_dropped_pages`] at crawl completion so the total is logged once per
+/// crawl instead of once per dropped page. Untouched while the cap is `0`.
+static PAGES_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Push a page into a retained page buffer, honoring [`PAGES_MEMORY_LIMIT`].
+///
+/// The `0 == unlimited` default is checked first so the default build pays a
+/// single `usize` compare and then behaves exactly like `pages.push(page)`.
+#[inline]
+fn push_page_capped(pages: &mut Vec<Page>, page: Page) {
+    let limit = *PAGES_MEMORY_LIMIT;
+
+    if limit == 0 || pages.len() < limit {
+        pages.push(page);
+    } else {
+        PAGES_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Extend a retained page buffer, honoring [`PAGES_MEMORY_LIMIT`].
+///
+/// Mirrors [`push_page_capped`] for the bulk path; the unlimited default
+/// forwards straight to `Vec::extend`.
+#[cfg(feature = "sitemap")]
+#[inline]
+fn extend_pages_capped(pages: &mut Vec<Page>, incoming: Vec<Page>) {
+    let limit = *PAGES_MEMORY_LIMIT;
+
+    if limit == 0 {
+        pages.extend(incoming);
+        return;
+    }
+
+    // `saturating_sub` keeps the headroom math from underflowing when the
+    // buffer is already at (or past) the cap.
+    let room = limit.saturating_sub(pages.len());
+
+    if room >= incoming.len() {
+        pages.extend(incoming);
+    } else {
+        let dropped = incoming.len().saturating_sub(room);
+        pages.extend(incoming.into_iter().take(room));
+        PAGES_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+    }
+}
+
+/// Log and reset the retained-page drop counter.
+///
+/// Called once per crawl from [`Website::set_crawl_status`]. Returns
+/// immediately when the cap is disabled so the default build never logs.
+fn report_dropped_pages() {
+    let limit = *PAGES_MEMORY_LIMIT;
+
+    if limit == 0 {
+        return;
+    }
+
+    let dropped = PAGES_DROPPED.swap(0, Ordering::Relaxed);
+
+    if dropped > 0 {
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            "SPIDER_MAX_RETAINED_PAGES ({limit}) reached - dropped {dropped} retained page(s)"
+        );
+        #[cfg(not(feature = "tracing"))]
+        log::warn!(
+            "SPIDER_MAX_RETAINED_PAGES ({limit}) reached - dropped {dropped} retained page(s)"
+        );
+    }
 }
 
 #[cfg(not(feature = "decentralized"))]
@@ -486,6 +1163,34 @@ lazy_static! {
 
         Semaphore::const_new(base_limit)
     };
+}
+
+#[cfg(feature = "sitemap")]
+lazy_static! {
+    /// When set, sitemap URLs are charged against the crawl budget so a large or
+    /// adversarial sitemap-index tree can't fetch unboundedly. Default off = the
+    /// historical budgetless sitemap traversal (byte-identical). Read once.
+    static ref SITEMAP_RESPECT_BUDGET: bool =
+        std::env::var("SPIDER_SITEMAP_RESPECT_BUDGET")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+}
+
+#[cfg(all(
+    feature = "balance",
+    not(feature = "decentralized"),
+    any(feature = "chrome", feature = "spider_cloud")
+))]
+lazy_static! {
+    /// When set, retained scrape pages also drop their screenshot / content-map
+    /// bytes under memory pressure. Unlike HTML these cannot be spooled+restored
+    /// transparently (public fields, no accessor hook), so this is a lossy
+    /// last-resort valve for the retained copy — subscribers already received the
+    /// full page before it was retained. Default off = byte-identical. Read once.
+    static ref SHED_MEDIA_UNDER_PRESSURE: bool =
+        std::env::var("SPIDER_SHED_MEDIA_UNDER_PRESSURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 }
 
 #[cfg(feature = "decentralized")]
@@ -514,6 +1219,19 @@ lazy_static! {
         let sem_limit = calc_limits(3);
         Semaphore::const_new(sem_limit * WORKERS.len())
     };
+}
+
+/// Permit holder for the decentralized crawl loop. Allows the same call site
+/// to acquire from either the process-wide `SEM` (`Borrowed`, default path)
+/// or a per-`Website` override semaphore (`Owned`). When no override is set
+/// this resolves to `Borrowed(SEM.acquire().await)` — byte-identical to
+/// pre-2.51.x behavior. Inner fields are intentionally unread RAII wrappers
+/// whose `Drop` releases the slot back to the semaphore.
+#[cfg(feature = "decentralized")]
+#[allow(dead_code)]
+enum WebsiteWorkerPermit {
+    Borrowed(tokio::sync::SemaphorePermit<'static>),
+    Owned(tokio::sync::OwnedSemaphorePermit),
 }
 
 // const INVALID_URL: &str = "The domain should be a valid URL, refer to <https://www.w3.org/TR/2011/WD-html5-20110525/urls.html#valid-url>.";
@@ -596,6 +1314,9 @@ pub type OnLinkFindCallback = Arc<
         + Send
         + Sync,
 >;
+
+/// Callback fired when a link is blocked by robots.txt.
+pub type OnLinkBlockedCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Callback closure that determines if a link should be crawled or not.
 pub trait OnShouldCrawlClosure: Fn(&Page) -> bool + Send + Sync + 'static {}
@@ -686,6 +1407,56 @@ pub struct Website {
     pub on_link_find_callback: Option<OnLinkFindCallback>,
     /// The callback to use if a page should be ignored. Return false to ensure that the discovered links are not crawled.
     pub on_should_crawl_callback: Option<OnShouldCrawlCallback>,
+    /// Callback fired when a link is blocked by robots.txt.
+    pub on_link_blocked_callback: Option<OnLinkBlockedCallback>,
+    /// Custom retry strategy that controls retry behavior per attempt.
+    /// When set, this takes precedence over the simple `Configuration::retry` counter.
+    pub retry_strategy: Option<crate::retry_strategy::SharedRetryStrategy>,
+    /// Optional user-supplied transport that replaces spider's built-in
+    /// per-URL fetch. When set, every URL that passes the
+    /// [`is_allowed`](Self::is_allowed) gate is fetched through this
+    /// hook instead of spider's reqwest client. All other crawl
+    /// machinery (tracking, depth, allow/deny, robots, link extraction,
+    /// subscription channels) keeps running unchanged.
+    ///
+    /// Today the hook fires in the HTTP crawl path only
+    /// ([`crawl`](Self::crawl) / [`crawl_raw`](Self::crawl_raw));
+    /// chrome / webdriver / smart variants continue to drive their own
+    /// browser-backed fetches.
+    ///
+    /// Default `None` means today's behavior verbatim — every existing
+    /// fetch site still runs spider's reqwest path.
+    pub remote_fetcher: Option<crate::fetcher::SharedRemoteFetcher>,
+    /// Optional in-process HTTP fetch engine. Unlike [`Self::remote_fetcher`]
+    /// (which replaces the whole crawl loop), this replaces only the inner
+    /// body-fetch step on the HTTP crawl paths, so spider's retry / cache /
+    /// watchdog / hedge machinery still wraps the engine call. Opt-in via
+    /// [`Self::with_fetch_engine`]; consulted per URL through
+    /// [`crate::fetch_engine::HttpFetchEngine::should_fetch`]. Default `None`
+    /// keeps every fetch site on spider's reqwest path.
+    pub fetch_engine: Option<crate::fetch_engine::SharedHttpFetchEngine>,
+    /// Optional per-request proxy routing strategy.
+    ///
+    /// When set together with [`crate::configuration::Configuration::proxies_by_kind`],
+    /// callers can route specific requests through a kind-specific
+    /// proxy list via [`Self::secondary_http_client_for`]. Default
+    /// `None` keeps every existing call site identical to today — no
+    /// behavior change.
+    pub proxy_strategy: Option<crate::proxy_strategy::SharedProxyStrategy>,
+    /// Lazy, refcount-dropped secondary HTTP client used when a
+    /// [`crate::proxy_strategy::ProxyStrategy`] routes a request to
+    /// [`crate::configuration::ProxyKind::MediaAsset`].
+    ///
+    /// Built on first need from
+    /// `configuration.proxies_by_kind[&ProxyKind::MediaAsset]`; dropped
+    /// automatically when no in-flight request still holds a clone.
+    /// Other kinds (`Default` and `Custom`) are not auto-wired in this
+    /// version — consumers route them manually if needed.
+    ///
+    /// Wrapped in `Arc` so cloned [`Website`]s share the same lazy
+    /// cache (matches how [`Self::retry_strategy`] is shared). Default
+    /// is one tiny allocation for the empty `LazyArc`.
+    secondary_media_client: std::sync::Arc<crate::utils::lazy_arc::LazyArc<Client>>,
     /// Set the crawl ID to track. This allows explicit targeting for shutdown, pause, and etc.
     pub crawl_id: Box<String>,
     #[cfg(feature = "extra_information")]
@@ -733,6 +1504,11 @@ pub struct Website {
     client: Option<Client>,
     /// Round-robin client rotator for proxy rotation. Built when 2+ proxies are configured.
     client_rotator: Option<Arc<ClientRotator>>,
+    /// Background proxy-DNS refresh task abort handle.
+    /// Shared via Arc so the Website stays Clone-able; the guard aborts the task
+    /// once the last clone drops it (see [`ProxyDnsAbortGuard`]).
+    #[cfg(feature = "dns_cache")]
+    proxy_dns_abort: Option<Arc<ProxyDnsAbortGuard>>,
     /// The disk handler to use.
     #[cfg(feature = "disk")]
     sqlite: Option<Box<DatabaseHandler>>,
@@ -770,6 +1546,28 @@ pub struct Website {
     #[cfg(feature = "parallel_backends")]
     /// Semaphore limiting concurrent backend sessions to prevent memory spikes.
     pb_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Lazily-created per-website spool directory.
+    ///
+    /// Only allocated on the first spool (file write / stream-to-disk).
+    /// Holding the `Arc` guarantees the underlying `tempfile::TempDir`
+    /// stays alive for the lifetime of this `Website` and any `Page`s
+    /// the crawl produced — when both drop, the entire directory plus
+    /// every file it contains is removed in a single
+    /// `std::fs::remove_dir_all` call.
+    #[cfg(feature = "balance")]
+    spool_dir: std::sync::OnceLock<Arc<crate::utils::html_spool::WebsiteSpoolDir>>,
+    /// Optional externally-owned semaphore that gates worker concurrency
+    /// for this crawl. When set, [`Website::setup_semaphore`] returns
+    /// this `Arc` instead of building a fresh `Semaphore` from
+    /// `configuration.concurrency_limit` / `DEFAULT_PERMITS` — letting
+    /// an admission controller (typically wrapping a
+    /// [`crate::utils::adaptive_concurrency::AdaptiveSemaphore`]) resize
+    /// the crawler's effective concurrency mid-flight without rebuilding
+    /// the `Website`. Runtime-only handle: not serialized, not
+    /// configuration state. Defaults to `None`, preserving the static
+    /// `setup_semaphore` path byte-for-byte for callers that don't opt
+    /// in.
+    adaptive_concurrency_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl fmt::Debug for Website {
@@ -826,7 +1624,49 @@ impl fmt::Debug for Website {
     }
 }
 
+/// Owns the background proxy-DNS refresh task and aborts it on drop.
+///
+/// [`tokio::task::AbortHandle`] does not abort when dropped, so a `Website` that
+/// used proxies + `dns_cache` leaked its looping refresh task until process exit.
+/// The guard lives inside the `Arc` rather than `Website` implementing `Drop`
+/// directly: `Website` is `Clone` and is built with `..Default::default()` struct
+/// update syntax, which the compiler forbids on a type that implements `Drop`.
+/// Putting the `Drop` here also gives exactly the semantics we want for free —
+/// `Arc` runs it only when the last clone releases the handle, so dropping one
+/// clone can never abort a refresh task another owner is still crawling with.
+#[cfg(feature = "dns_cache")]
+#[derive(Debug)]
+pub(crate) struct ProxyDnsAbortGuard(tokio::task::AbortHandle);
+
+#[cfg(feature = "dns_cache")]
+impl ProxyDnsAbortGuard {
+    /// Abort the refresh task now, without waiting for the guard to drop.
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(feature = "dns_cache")]
+impl Drop for ProxyDnsAbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl Website {
+    /// Lazily create (or return the already-initialized) per-website spool
+    /// directory.  First call allocates the [`tempfile::TempDir`];
+    /// subsequent calls are a single atomic load + `Arc` clone, no locks.
+    /// Creation failures fall back to the shared global dir via
+    /// [`WebsiteSpoolDir::new_or_shared`] so the call is infallible.
+    #[cfg(feature = "balance")]
+    #[inline]
+    pub(crate) fn ensure_spool_dir(&self) -> Arc<crate::utils::html_spool::WebsiteSpoolDir> {
+        self.spool_dir
+            .get_or_init(|| Arc::new(crate::utils::html_spool::WebsiteSpoolDir::new_or_shared()))
+            .clone()
+    }
+
     /// Initialize the Website with a starting link to crawl and check the firewall base.
     fn _new(url: &str, check_firewall: bool) -> Self {
         let url = url.trim();
@@ -1063,9 +1903,12 @@ impl Website {
     }
 
     /// Insert a new URL if it doesn't exist. This does nothing with `disk` flag enabled.
+    ///
+    /// Accepts a reference to avoid cloning at the call site. The URL is only
+    /// cloned internally when it is actually new and needs to be stored.
     #[cfg(feature = "disk")]
-    pub async fn insert_link(&mut self, new_url: CaseInsensitiveString) {
-        let mem_load = crate::utils::detect_system::get_global_memory_state().await;
+    pub async fn insert_link(&mut self, new_url: &CaseInsensitiveString) {
+        let mem_load = crate::utils::detect_system::get_global_memory_state_sync();
         let beyond_memory_limits = self.links_visited.len() >= *LINKS_VISITED_MEMORY_LIMIT;
         let seed_check = mem_load == 2 || mem_load == 1 || beyond_memory_limits;
 
@@ -1083,28 +1926,91 @@ impl Website {
         }
 
         if mem_load == 2 || beyond_memory_limits || self.shared_disk_enabled() {
-            self.insert_url_disk(&new_url).await
+            self.insert_url_disk(new_url).await
         } else if mem_load == 1 {
             if self.links_visited.len() <= 100 {
-                self.links_visited.insert(new_url);
+                if !self.links_visited.contains(new_url) {
+                    self.links_visited.insert(new_url.clone());
+                }
             } else {
-                self.insert_url_disk(&new_url).await
+                self.insert_url_disk(new_url).await
             }
-        } else {
-            self.links_visited.insert(new_url);
+        } else if !self.links_visited.contains(new_url) {
+            self.links_visited.insert(new_url.clone());
         }
     }
 
     /// Insert a new URL if it doesn't exist. This does nothing with `disk` flag enabled.
+    ///
+    /// Accepts a reference to avoid cloning at the call site. The URL is only
+    /// cloned internally when it is actually new and needs to be stored.
     #[cfg(not(feature = "disk"))]
-    pub async fn insert_link(&mut self, link: CaseInsensitiveString) {
-        self.links_visited.insert(link);
+    pub async fn insert_link(&mut self, link: &CaseInsensitiveString) {
+        if !self.links_visited.contains(link) {
+            self.links_visited.insert(link.clone());
+        }
+    }
+
+    /// Insert a URL that is already known to be absent from the visited set.
+    ///
+    /// Identical to [`Self::insert_link`] minus the `contains` guard. The
+    /// admission path already probes `links_visited` via
+    /// [`Self::is_allowed_budgetless`] and `links_visited` lives behind
+    /// `&mut self` on the driver task — spawned tasks only hand links back
+    /// through `set.join_next()` in that same loop — so nothing can insert
+    /// between the two calls and the second probe is provably always false.
+    ///
+    /// This is a design cleanup, not a throughput win: it saves one set lookup
+    /// (~20-30 ns, so ~0.3 ms per 10k links). It is worth slightly more under
+    /// `bloom`, where each probe is an mmap hit plus a set lookup that was
+    /// otherwise paid twice.
+    ///
+    /// Only call this immediately after an `is_allowed*` check on the same link.
+    #[cfg(feature = "disk")]
+    pub(crate) async fn insert_link_unchecked(&mut self, new_url: &CaseInsensitiveString) {
+        let mem_load = crate::utils::detect_system::get_global_memory_state_sync();
+        let beyond_memory_limits = self.links_visited.len() >= *LINKS_VISITED_MEMORY_LIMIT;
+        let seed_check = mem_load == 2 || mem_load == 1 || beyond_memory_limits;
+
+        if seed_check {
+            let mut seeded = false;
+            if let Some(sqlite) = &self.sqlite {
+                if !sqlite.ready() {
+                    let _ = self.seed().await;
+                    seeded = true;
+                }
+            }
+            if let Some(sqlite) = self.sqlite.as_mut() {
+                sqlite.set_seeded(seeded);
+            }
+        }
+
+        if mem_load == 2 || beyond_memory_limits || self.shared_disk_enabled() {
+            self.insert_url_disk(new_url).await
+        } else if mem_load == 1 {
+            if self.links_visited.len() <= 100 {
+                self.links_visited.insert(new_url.clone());
+            } else {
+                self.insert_url_disk(new_url).await
+            }
+        } else {
+            self.links_visited.insert(new_url.clone());
+        }
+    }
+
+    /// Insert a URL that is already known to be absent from the visited set.
+    ///
+    /// See the `disk` variant of [`Self::insert_link_unchecked`] for why the
+    /// `contains` guard is redundant on the admission path.
+    #[cfg(not(feature = "disk"))]
+    pub(crate) async fn insert_link_unchecked(&mut self, link: &CaseInsensitiveString) {
+        self.links_visited.insert(link.clone());
     }
 
     /// Insert a new signature if it doesn't exist. This does nothing with `disk` flag enabled.
     #[cfg(feature = "disk")]
     pub async fn insert_signature(&mut self, new_signature: u64) {
-        let mem_load = crate::utils::detect_system::get_global_memory_state().await;
+        let mem_load = crate::utils::detect_system::get_global_memory_state_sync();
         let beyond_memory_limits = self.signatures.len() >= *LINKS_VISITED_MEMORY_LIMIT;
         let seed_check = mem_load == 2 || mem_load == 1 || beyond_memory_limits;
 
@@ -1276,6 +2182,19 @@ impl Website {
         }
     }
 
+    /// Budget check for sitemap URLs. When `SPIDER_SITEMAP_RESPECT_BUDGET` is set
+    /// the sitemap fetch is charged against the crawl budget (and traversal stops
+    /// once the budget is exhausted); default off keeps the historical budgetless
+    /// sitemap traversal, so the default path is byte-identical.
+    #[cfg(feature = "sitemap")]
+    pub(crate) fn is_allowed_sitemap(&mut self, link: &CaseInsensitiveString) -> ProcessLinkStatus {
+        if *SITEMAP_RESPECT_BUDGET {
+            self.is_allowed(link)
+        } else {
+            self.is_allowed_budgetless(link)
+        }
+    }
+
     /// return `true` if URL:
     ///
     /// - is optionally whitelisted
@@ -1290,7 +2209,12 @@ impl Website {
         let blocked_whitelist = !whitelist.is_empty() && !contains(whitelist, link.inner());
         let blocked_blacklist = !blacklist.is_empty() && contains(blacklist, link.inner());
 
-        if blocked_whitelist || blocked_blacklist || !self.is_allowed_robots(link.as_ref()) {
+        if blocked_whitelist || blocked_blacklist {
+            ProcessLinkStatus::Blocked
+        } else if !self.is_allowed_robots(link.as_ref()) {
+            if let Some(cb) = &self.on_link_blocked_callback {
+                cb(link.as_ref().to_string());
+            }
             ProcessLinkStatus::Blocked
         } else {
             ProcessLinkStatus::Allowed
@@ -1311,7 +2235,12 @@ impl Website {
         let blocked_whitelist = !whitelist.is_empty() && !contains(whitelist, link);
         let blocked_blacklist = !blacklist.is_empty() && contains(blacklist, link);
 
-        if blocked_whitelist || blocked_blacklist || !self.is_allowed_robots(link) {
+        if blocked_whitelist || blocked_blacklist {
+            ProcessLinkStatus::Blocked
+        } else if !self.is_allowed_robots(link) {
+            if let Some(cb) = &self.on_link_blocked_callback {
+                cb(link.to_string());
+            }
             ProcessLinkStatus::Blocked
         } else {
             ProcessLinkStatus::Allowed
@@ -1343,7 +2272,9 @@ impl Website {
 
         if let Some(segments) = get_path_from_url(link)
             .strip_prefix('/')
-            .map(|remainder| remainder.split('/'))
+            // Skip empty segments so a trailing slash ("/a/b/") counts the same
+            // depth as "/a/b" instead of an extra phantom level.
+            .map(|remainder| remainder.split('/').filter(|segment| !segment.is_empty()))
         {
             let mut depth: usize = 0;
 
@@ -1408,7 +2339,11 @@ impl Website {
                 if !skip_paths && !exceeded_wild_budget {
                     let path_segments = get_path_from_url(link)
                         .strip_prefix('/')
-                        .map(|remainder| remainder.split('/'));
+                        // Skip empty segments so a trailing slash does not inflate
+                        // the depth count or re-check the final budget key.
+                        .map(|remainder| {
+                            remainder.split('/').filter(|segment| !segment.is_empty())
+                        });
 
                     match path_segments {
                         Some(segments) => {
@@ -1512,6 +2447,26 @@ impl Website {
     /// Drain the extra links used for things like the sitemap.
     pub fn drain_extra_links(&mut self) -> hashbrown::hash_set::Drain<'_, CaseInsensitiveString> {
         self.extra_links.drain()
+    }
+
+    /// Insert a single link into extra_links if under the memory cap.
+    #[inline]
+    fn extra_links_insert(&mut self, link: CaseInsensitiveString) {
+        if self.extra_links.len() < *EXTRA_LINKS_MEMORY_LIMIT {
+            self.extra_links.insert(link);
+        }
+    }
+
+    /// Extend extra_links from an iterator, stopping at the memory cap.
+    #[inline]
+    fn extra_links_extend(&mut self, iter: impl IntoIterator<Item = CaseInsensitiveString>) {
+        let limit = *EXTRA_LINKS_MEMORY_LIMIT;
+        for link in iter {
+            if self.extra_links.len() >= limit {
+                break;
+            }
+            self.extra_links.insert(link);
+        }
     }
 
     /// Set the initial status code of the request.
@@ -1633,7 +2588,7 @@ impl Website {
         &mut self,
         extra_links: HashSet<CaseInsensitiveString>,
     ) -> &HashSet<CaseInsensitiveString> {
-        self.extra_links.extend(extra_links);
+        self.extra_links_extend(extra_links);
         &self.extra_links
     }
 
@@ -1649,6 +2604,11 @@ impl Website {
     }
 
     /// Clear all pages and links stored in memory.
+    ///
+    /// Reusing a `Website` across runs accumulates: the retained pages buffer is
+    /// never reset by a crawl, so successive `scrape*` calls keep appending until
+    /// this (or [`Self::clear_all`]) is called. Set `SPIDER_MAX_RETAINED_PAGES`
+    /// to cap the buffer instead; it defaults to `0` (unlimited).
     pub fn clear(&mut self) {
         self.links_visited.clear();
         self.signatures.clear();
@@ -1662,6 +2622,11 @@ impl Website {
     }
 
     /// Page getter.
+    ///
+    /// Only populated by the `scrape*` entry points, which initialize the buffer
+    /// and never reset it — reusing the same `Website` accumulates pages across
+    /// runs until [`Self::clear`] / [`Self::clear_all`] is called. The buffer is
+    /// unbounded by default; set `SPIDER_MAX_RETAINED_PAGES` to cap it.
     pub fn get_pages(&self) -> Option<&Vec<Page>> {
         self.pages.as_ref()
     }
@@ -1809,6 +2774,41 @@ impl Website {
     /// Crawls commenced from fresh run.
     pub fn start(&mut self) {
         self.shutdown = false;
+        self.release_channel_backlog();
+    }
+
+    /// Release the broadcast ring backlog held by the internal placeholder receivers.
+    ///
+    /// [`Self::subscribe`] / [`Self::queue`] store an `Arc<broadcast::Receiver<_>>`
+    /// that is never read from — it exists so `Sender::send` never fails and so
+    /// [`Self::subscription_guard`] can tell "only us" (`receiver_count() == 1`)
+    /// apart from "a real subscriber is alive". Tokio keeps a slot's value alive
+    /// until every receiver has consumed it, so that placeholder pins up to
+    /// `capacity` full [`Page`]s (HTML + screenshot + content map) for the
+    /// lifetime of the `Website` — 512 of them when `warc` is on.
+    ///
+    /// Re-subscribing drops the stale cursor and starts a fresh one at the
+    /// current tail, which claims nothing. This is unobservable: a
+    /// `broadcast::Receiver` only ever yields values sent after it was created,
+    /// so no caller could have read the released backlog anyway.
+    ///
+    /// The new receiver is created *before* the old one is dropped so
+    /// `receiver_count()` never dips to zero — a zero count would make an
+    /// in-flight `Sender::send` fail. The whole body is synchronous and takes
+    /// `&mut self`, so it holds no borrow or lock across an `.await` and cannot
+    /// be re-entered while a crawl task is broadcasting.
+    ///
+    /// Only ring memory is touched: `links_visited` and `status` are left alone,
+    /// preserving the `crawl_sitemap().await.persist_links().crawl().await`
+    /// chaining contract.
+    pub(crate) fn release_channel_backlog(&mut self) {
+        if let Some((tx, rx)) = self.channel.as_mut() {
+            *rx = Arc::new(tx.subscribe());
+        }
+
+        if let Some((tx, rx)) = self.channel_queue.as_mut() {
+            *rx = Arc::new(tx.subscribe());
+        }
     }
 
     /// configure the robots parser on initial crawl attempt and run.
@@ -1842,6 +2842,94 @@ impl Website {
         }
     }
 
+    /// SSRF guard for redirect targets. Refuses hops into loopback,
+    /// link-local (cloud-metadata), private, unique-local, broadcast,
+    /// unspecified or otherwise reserved addresses, and non-HTTP(S)
+    /// schemes.
+    ///
+    /// The configured seed URL is fetched directly and never passes
+    /// through the redirect policy, so an intentionally-internal start
+    /// URL still works — only an *unexpected* redirect into internal
+    /// space is blocked, which is the SSRF exfiltration vector an
+    /// attacker-controlled page uses (cf. GHSA-8v6v-g4rh-jmcm). Operates
+    /// on the already-parsed `Url` so it adds no allocation per hop.
+    fn is_ssrf_redirect(url: &Url) -> bool {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        fn is_internal_v4(v4: Ipv4Addr) -> bool {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // RFC 1122 reserves all of 0.0.0.0/8 as "this network";
+                // `is_unspecified` only matches 0.0.0.0 itself.
+                || v4.octets()[0] == 0
+        }
+
+        fn is_internal_v6(v6: Ipv6Addr) -> bool {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 is the IPv6 side of RFC 1918, and where the
+                // cloud metadata service answers (fd00:ec2::254).
+                || v6.is_unique_local()
+                // fe80::/10 is the IPv6 side of 169.254.0.0/16.
+                || v6.is_unicast_link_local()
+                || v6.to_ipv4_mapped().is_some_and(is_internal_v4)
+        }
+
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return true;
+        }
+        let host = match url.host_str() {
+            Some(h) => h,
+            None => return true,
+        };
+        if host == "localhost"
+            || host == "0.0.0.0"
+            || host.ends_with(".localhost")
+            || host == "[::1]"
+            || host == "[::0]"
+        {
+            return true;
+        }
+        if host == "169.254.169.254"
+            || host == "metadata.google.internal"
+            || host == "metadata.goog"
+        {
+            return true;
+        }
+        // `url` serializes IPv6 hosts with brackets; strip one pair so
+        // bracketed / IPv4-mapped literals can't bypass the parse.
+        let ip_host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        match ip_host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => is_internal_v4(v4),
+            Ok(IpAddr::V6(v6)) => is_internal_v6(v6),
+            _ => false,
+        }
+    }
+
+    /// Redirect policy for `Loose` (and the no-parsed-domain fallback):
+    /// the same hop cap as `Policy::limited`, but every hop is first
+    /// screened by [`Website::is_ssrf_redirect`].
+    fn ssrf_limited_policy(limit: usize) -> Policy {
+        use crate::client::redirect::Attempt;
+
+        Policy::custom(move |attempt: Attempt| {
+            if Self::is_ssrf_redirect(attempt.url()) {
+                attempt.error("SSRF blocked: redirect to internal address")
+            } else if attempt.previous().len() > limit {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        })
+    }
+
     /// Setup strict a strict redirect policy for request. All redirects need to match the host.
     pub fn setup_strict_policy(&self) -> Policy {
         use crate::client::redirect::Attempt;
@@ -1870,6 +2958,9 @@ impl Website {
                     let initial_redirect = Arc::new(AtomicU8::new(0));
 
                     move |attempt: Attempt| {
+                        if Self::is_ssrf_redirect(attempt.url()) {
+                            return attempt.error("SSRF blocked: redirect to internal address");
+                        }
                         if tld && domain_name(attempt.url()) == host_domain_name
                             || subdomains
                                 && attempt
@@ -1895,14 +2986,17 @@ impl Website {
                 };
                 Policy::custom(custom_policy)
             }
-            _ => default_policy,
+            // No parsed crawl domain to scope against — still screen
+            // every redirect hop for SSRF rather than falling back to a
+            // bare auto-follow policy.
+            _ => Self::ssrf_limited_policy(self.configuration.redirect_limit),
         }
     }
 
     /// Setup redirect policy for reqwest.
     pub fn setup_redirect_policy(&self) -> Policy {
         match self.configuration.redirect_policy {
-            RedirectPolicy::Loose => Policy::limited(self.configuration.redirect_limit),
+            RedirectPolicy::Loose => Self::ssrf_limited_policy(self.configuration.redirect_limit),
             RedirectPolicy::None => Policy::none(),
             RedirectPolicy::Strict => self.setup_strict_policy(),
         }
@@ -2069,6 +3163,12 @@ impl Website {
                     .default_http_read_timeout
                     .unwrap_or(Duration::from_secs(42 * timeout_mult)),
             );
+
+        let client = if let Some(network_interface) = &self.configuration.network_interface {
+            set_interface_wreq(client, network_interface)
+        } else {
+            client
+        };
 
         let client = if let Some(local_address) = &self.configuration.local_address {
             client.local_address(*local_address)
@@ -2262,7 +3362,12 @@ impl Website {
         if self.configuration.cache {
             let mut cache_options = HttpCacheOptions::default();
 
-            cache_options.cache_key = Some(Arc::new(|req: &http::request::Parts| {
+            let ns: Option<String> = self
+                .configuration
+                .cache_namespace
+                .as_ref()
+                .map(|s| s.as_str().to_string());
+            cache_options.cache_key = Some(Arc::new(move |req: &http::request::Parts| {
                 let mut auth_token = None;
                 if let Some(auth) = req.headers.get("authorization") {
                     if let Ok(token) = auth.to_str() {
@@ -2271,7 +3376,7 @@ impl Website {
                         }
                     }
                 }
-                create_cache_key(req, Some(req.method.as_str()), auth_token)
+                create_cache_key(req, Some(req.method.as_str()), auth_token, ns.as_deref())
             }));
             client.with(Cache(HttpCache {
                 mode: CacheMode::Default,
@@ -2456,7 +3561,12 @@ impl Website {
         if self.configuration.cache {
             let mut cache_options = HttpCacheOptions::default();
 
-            cache_options.cache_key = Some(Arc::new(|req: &http::request::Parts| {
+            let ns: Option<String> = self
+                .configuration
+                .cache_namespace
+                .as_ref()
+                .map(|s| s.as_str().to_string());
+            cache_options.cache_key = Some(Arc::new(move |req: &http::request::Parts| {
                 let mut auth_token = None;
                 if let Some(auth) = req.headers.get("authorization") {
                     if let Ok(token) = auth.to_str() {
@@ -2465,7 +3575,7 @@ impl Website {
                         }
                     }
                 }
-                create_cache_key(req, Some(req.method.as_str()), auth_token)
+                create_cache_key(req, Some(req.method.as_str()), auth_token, ns.as_deref())
             }));
 
             Some(
@@ -2505,6 +3615,115 @@ impl Website {
         let client = self.configure_http_client_builder();
         // should unwrap using native-tls-alpn
         unsafe { client.build().unwrap_unchecked() }
+    }
+
+    /// Build an HTTP client whose proxy set comes from a parameter
+    /// rather than [`crate::configuration::Configuration::proxies`].
+    ///
+    /// Mirrors the proxy-attachment logic in
+    /// [`Self::configure_http_client_builder`] (linux plain-socks
+    /// rewrite, [`crate::configuration::ProxyIgnore`] filter, etc.) so
+    /// the secondary client matches the primary's networking semantics
+    /// — only the proxy list is different. Used internally to back
+    /// [`Self::secondary_http_client_for`].
+    ///
+    /// Currently available only on the no-cache, non-decentralized
+    /// build configuration. On `cache_request` / `decentralized`,
+    /// callers should leave
+    /// [`crate::configuration::Configuration::proxies_by_kind`] unset
+    /// or accept that secondary routing falls back to primary.
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    fn build_http_client_with_proxies(
+        &self,
+        proxies: &[crate::configuration::RequestProxy],
+    ) -> Client {
+        let client = self.configure_base_client();
+        let mut client = match &self.configuration.request_timeout {
+            Some(t) => client.timeout(*t),
+            _ => client,
+        };
+        let linux = cfg!(target_os = "linux");
+        let ignore_plain_socks = proxies.len() >= 2 && linux;
+        let replace_plain_socks = proxies.len() == 1 && linux;
+
+        for p in proxies {
+            if p.ignore == crate::configuration::ProxyIgnore::Http {
+                continue;
+            }
+            let socks = p.addr.starts_with("socks://");
+            if ignore_plain_socks && socks {
+                continue;
+            }
+            if replace_plain_socks && socks {
+                if let Ok(proxy) =
+                    crate::client::Proxy::all(p.addr.replacen("socks://", "http://", 1))
+                {
+                    client = client.proxy(proxy);
+                }
+            } else if let Ok(proxy) = crate::client::Proxy::all(&p.addr) {
+                client = client.proxy(proxy);
+            }
+        }
+
+        let client = self.configure_http_client_cookies(client);
+        // matches `configure_http_client` for this cfg
+        unsafe { client.build().unwrap_unchecked() }
+    }
+
+    /// Return a lazily-built secondary HTTP client for the given
+    /// [`crate::configuration::ProxyKind`], or `None` when no secondary
+    /// is configured / not supported on this feature build.
+    ///
+    /// **V1 wiring scope:** only [`crate::configuration::ProxyKind::MediaAsset`]
+    /// is auto-built. [`crate::configuration::ProxyKind::Default`] always
+    /// returns `None` (caller uses the primary client). Other variants
+    /// also return `None` in V1; callers may wire them at the
+    /// application layer.
+    ///
+    /// **Lifecycle:** the returned `Arc<Client>` keeps the underlying
+    /// reqwest connection pool alive only while at least one clone is
+    /// in-flight. When the last clone is dropped, the client (and its
+    /// pool) is freed automatically. The next call to this method
+    /// rebuilds it on-demand. No mutex, no idle timer, no GC.
+    ///
+    /// Returns `None` when:
+    /// * `proxy_strategy` is not set on this `Website`, or
+    /// * `Configuration::proxies_by_kind` has no entry for `kind`, or
+    /// * the requested kind is not auto-routed in this version
+    ///   ([`ProxyKind::Default`], [`ProxyKind::Custom`]), or
+    /// * the build configuration disables the secondary path
+    ///   (`cache_request` / `decentralized`).
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    pub fn secondary_http_client_for(
+        &self,
+        kind: &crate::configuration::ProxyKind,
+    ) -> Option<std::sync::Arc<Client>> {
+        self.proxy_strategy.as_ref()?;
+        let map = self.configuration.proxies_by_kind.as_ref()?;
+        let proxies = map.get(kind)?;
+        match kind {
+            crate::configuration::ProxyKind::MediaAsset => {
+                let proxies = proxies.clone();
+                Some(
+                    self.secondary_media_client
+                        .get_or_build(|| self.build_http_client_with_proxies(&proxies)),
+                )
+            }
+            // V1: Default always uses primary; Custom is consumer-routed.
+            _ => None,
+        }
+    }
+
+    /// Stub for non-default feature builds. Always returns `None` so
+    /// callers fall back to the primary client. See
+    /// [`Self::secondary_http_client_for`] documentation for the
+    /// supported configuration.
+    #[cfg(any(feature = "decentralized", feature = "cache_request"))]
+    pub fn secondary_http_client_for(
+        &self,
+        _kind: &crate::configuration::ProxyKind,
+    ) -> Option<std::sync::Arc<Client>> {
+        None
     }
 
     /// Configure http client.
@@ -2562,9 +3781,17 @@ impl Website {
             }
         }
 
-        for worker in WORKERS.iter() {
-            if let Ok(worker) = crate::client::Proxy::all(worker) {
-                client = client.proxy(worker);
+        if self.has_worker_override() {
+            for worker in self.override_proxy_urls() {
+                if let Ok(worker) = crate::client::Proxy::all(&worker) {
+                    client = client.proxy(worker);
+                }
+            }
+        } else {
+            for worker in WORKERS.iter() {
+                if let Ok(worker) = crate::client::Proxy::all(worker) {
+                    client = client.proxy(worker);
+                }
             }
         }
 
@@ -2643,15 +3870,28 @@ impl Website {
             }
         }
 
-        for worker in WORKERS.iter() {
-            if let Ok(worker) = crate::client::Proxy::all(worker) {
-                client = client.proxy(worker);
+        if self.has_worker_override() {
+            for worker in self.override_proxy_urls() {
+                if let Ok(worker) = crate::client::Proxy::all(&worker) {
+                    client = client.proxy(worker);
+                }
+            }
+        } else {
+            for worker in WORKERS.iter() {
+                if let Ok(worker) = crate::client::Proxy::all(worker) {
+                    client = client.proxy(worker);
+                }
             }
         }
 
         let mut cache_options = HttpCacheOptions::default();
 
-        cache_options.cache_key = Some(Arc::new(|req: &http::request::Parts| {
+        let ns: Option<String> = self
+            .configuration
+            .cache_namespace
+            .as_ref()
+            .map(|s| s.as_str().to_string());
+        cache_options.cache_key = Some(Arc::new(move |req: &http::request::Parts| {
             let mut auth_token = None;
             if let Some(auth) = req.headers.get("authorization") {
                 if let Ok(token) = auth.to_str() {
@@ -2660,7 +3900,7 @@ impl Website {
                     }
                 }
             }
-            create_cache_key(req, Some(req.method.as_str()), auth_token)
+            create_cache_key(req, Some(req.method.as_str()), auth_token, ns.as_deref())
         }));
 
         if !self.configuration.modify_headers && self.configuration.modify_http_client_headers {
@@ -2684,17 +3924,46 @@ impl Website {
             .default_headers(headers)
             .build()
             .unwrap_unchecked()
-        })
-        .with(Cache(HttpCache {
-            mode: CacheMode::Default,
-            manager: CACACHE_MANAGER.clone(),
-            options: cache_options,
-        }));
+        });
+
+        // Gate the http-cache-reqwest middleware on `configuration.cache`,
+        // matching `configure_http_client_builder` (line ~2683) and the
+        // proxy-client builder (line ~2882). Previously this path attached
+        // the middleware unconditionally — which meant every request,
+        // even on `with_caching(false)` clients, ran through the cache
+        // layer. That layer wraps any underlying transport error as
+        // `HttpCacheError::Cache(err.to_string())`, destroying the source
+        // chain. Spider's `crate::page::status_code_from_reqwest_error`
+        // (page.rs:~1019) then can't recover the original error type
+        // (DNS / refused / reset / timed out / SSL / etc.) and conservatively
+        // buckets every wrapped transport error as 526 ADDRESS_UNREACHABLE
+        // (page.rs:1020). Downstream consumers see a misleading 526 for
+        // hosts that actually resolve and aren't unreachable — they were
+        // just blocked or slow.
+        //
+        // Behavior change: when `configuration.cache=false`, requests no
+        // longer go through the cache layer (which was a no-op for them
+        // anyway) and transport errors keep their proper classification.
+        // When `configuration.cache=true`, behavior is unchanged.
+        let client = if self.configuration.cache {
+            client.with(Cache(HttpCache {
+                mode: CacheMode::Default,
+                manager: CACACHE_MANAGER.clone(),
+                options: cache_options,
+            }))
+        } else {
+            // `cache_options` was computed up front to avoid threading
+            // the option construction across both branches; intentionally
+            // dropped here when caching is disabled.
+            let _ = cache_options;
+            client
+        };
 
         client.build()
     }
 
     /// Setup atomic controller. This does nothing without the 'control' feature flag enabled.
+    /// The caller owns the returned task and must abort it when no longer needed.
     #[cfg(feature = "control")]
     pub fn configure_handler(&self) -> Option<(Arc<AtomicI8>, tokio::task::JoinHandle<()>)> {
         use crate::utils::{Handler, CONTROLLER};
@@ -2707,7 +3976,8 @@ impl Website {
             let target_id = self.target_id();
 
             let join_handle = crate::utils::spawn_task("control_handler", async move {
-                let mut l = CONTROLLER.read().await.1.to_owned();
+                // Lock-free: cloning a `watch::Receiver` needs only `&self`.
+                let mut l = CONTROLLER.1.to_owned();
 
                 while l.changed().await.is_ok() {
                     let n = &*l.borrow();
@@ -2806,10 +4076,7 @@ impl Website {
                     Ok((writer, file_handle)) => {
                         self.warc_writer = Some(writer.clone());
                         // Subscribe to the page broadcast channel for lock-free WARC writing.
-                        let rx = self.subscribe(512).unwrap_or_else(|| {
-                            let (_, rx) = tokio::sync::broadcast::channel(1);
-                            rx
-                        });
+                        let rx = self.subscribe(512);
                         // Bridge: reads from broadcast, serializes + sends to file writer.
                         // Already spawns its own task internally.
                         let _bridge = crate::utils::warc::spawn_warc_writer(writer, rx);
@@ -2835,6 +4102,33 @@ impl Website {
         #[cfg(not(feature = "decentralized"))]
         {
             self.client_rotator = self.build_rotated_clients();
+        }
+
+        // Prefetch proxy hostnames + start adaptive background refresh.
+        #[cfg(feature = "dns_cache")]
+        {
+            // Abort any prior refresh task (e.g. from a previous crawl run).
+            if let Some(ref h) = self.proxy_dns_abort {
+                h.abort();
+            }
+            self.proxy_dns_abort = None;
+
+            if let Some(ref proxies) = self.configuration.proxies {
+                let addrs: Vec<String> = proxies.iter().map(|p| p.addr.clone()).collect();
+                if !addrs.is_empty() {
+                    let dns = crate::utils::dns_cache::shared_dns_cache();
+                    // Fire-and-forget prefetch — warms cache before first request.
+                    let dns_clone = dns.clone();
+                    let addrs_clone = addrs.clone();
+                    tokio::spawn(async move {
+                        dns_clone.prefetch_proxy_hosts(&addrs_clone).await;
+                    });
+                    // Adaptive refresh keeps proxy DNS warm for the crawl duration.
+                    let handle = dns.spawn_proxy_dns_refresh(&addrs);
+                    self.proxy_dns_abort =
+                        Some(Arc::new(ProxyDnsAbortGuard(handle.abort_handle())));
+                }
+            }
         }
 
         #[cfg(feature = "parallel_backends")]
@@ -2869,6 +4163,10 @@ impl Website {
         &mut self,
     ) -> (Client, Option<(Arc<AtomicI8>, tokio::task::JoinHandle<()>)>) {
         let setup = self.setup_base();
+        let guard = setup
+            .1
+            .as_ref()
+            .map(|(_, task)| ControlHandlerGuard::new(task));
         if self.status != CrawlStatus::Active {
             self.clear_all().await;
         } else {
@@ -2879,6 +4177,9 @@ impl Website {
         // true when robot_file_parser is None, so this is safe.
         if !self.single_page() {
             self.configure_robots_parser(&setup.0).await;
+        }
+        if let Some(guard) = guard {
+            guard.disarm();
         }
         setup
     }
@@ -2916,12 +4217,12 @@ impl Website {
         page: &crate::page::Page,
         links: &HashSet<CaseInsensitiveString>,
     ) {
-        use crate::utils::{detect_open_resty_forbidden, APACHE_FORBIDDEN};
+        use crate::utils::detect_open_resty_forbidden;
 
         if page.status_code == reqwest::StatusCode::FORBIDDEN && links.is_empty() {
             if is_safe_javascript_challenge(page) {
                 self.website_meta_info = WebsiteMetaInfo::RequiresJavascript;
-            } else if page.get_html_bytes_u8() == *APACHE_FORBIDDEN {
+            } else if detect_apache_forbidden(page.get_html_bytes_u8()) {
                 self.website_meta_info = WebsiteMetaInfo::Apache403;
             } else if detect_open_resty_forbidden(page.get_html_bytes_u8()) {
                 self.website_meta_info = WebsiteMetaInfo::OpenResty403;
@@ -2929,6 +4230,10 @@ impl Website {
             self.status = CrawlStatus::Blocked;
         } else if page.status_code == reqwest::StatusCode::TOO_MANY_REQUESTS {
             self.status = CrawlStatus::RateLimited;
+        } else if page.status_code == *DNS_RESOLVE_ERROR
+            || page.status_code == *ADDRESS_UNREACHABLE_ERROR
+        {
+            self.status = CrawlStatus::ConnectError;
         } else if (page.status_code == *UNKNOWN_STATUS_ERROR
             || page.status_code == *CHROME_UNKNOWN_STATUS_ERROR)
             && page.is_empty()
@@ -2963,10 +4268,10 @@ impl Website {
 
         let url = self.url.inner();
 
-        let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-        let mut links_ssg = HashSet::new();
+        let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+        let mut links_ssg = HashSet::with_capacity(16);
         let mut links_pages = if self.configuration.return_page_links {
-            Some(HashSet::new())
+            Some(HashSet::with_capacity(32))
         } else {
             None
         };
@@ -2979,7 +4284,12 @@ impl Website {
 
         let mut domain_parsed = self.domain_parsed.take();
 
-        let mut retry_count = self.configuration.retry;
+        let retry_strategy = self.retry_strategy.clone();
+        let mut retry_count: u32 = match &retry_strategy {
+            Some(s) => s.max_retries(),
+            None => self.configuration.retry as u32,
+        };
+        let mut attempt: u32 = 0;
         let mut last_err: Option<std::io::Error> = None;
 
         let build_error_page = |status: StatusCode, _err: std::io::Error| {
@@ -3043,11 +4353,10 @@ impl Website {
 
                 if page.needs_retry() && retry_count > 0 {
                     retry_count -= 1;
-                    if let Some(timeout) = page.get_timeout() {
-                        tokio::time::sleep(timeout).await;
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    }
+                    let status_delay = page.get_timeout().unwrap_or_default();
+                    let backoff = crate::utils::backoff::backoff_delay(attempt, 1_000, 60_000);
+                    tokio::time::sleep(status_delay.max(backoff)).await;
+                    attempt += 1;
                     continue;
                 }
 
@@ -3065,9 +4374,12 @@ impl Website {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         };
 
-        if page.get_html_bytes_u8().starts_with(b"<?xml") {
-            page.links_stream_xml_links_stream_base(base, &page.get_html(), &mut links, &None)
-                .await;
+        if page.is_xml {
+            if let Some(xml_bytes) = page.html.take() {
+                page.links_stream_xml_links_stream_base(base, &xml_bytes, &mut links, &None)
+                    .await;
+                page.html = Some(xml_bytes);
+            }
         }
 
         emit_log(url);
@@ -3080,10 +4392,10 @@ impl Website {
         }
 
         let url_ci = match &self.on_link_find_callback {
-            Some(cb) => cb(*self.url.clone(), None).0,
-            _ => *self.url.clone(),
+            Some(cb) => cb((*self.url).clone(), None).0,
+            _ => (*self.url).clone(),
         };
-        self.insert_link(url_ci).await;
+        self.insert_link(&url_ci).await;
 
         if self.configuration.return_page_links {
             page.page_links = links_pages
@@ -3094,11 +4406,7 @@ impl Website {
         links.extend(links_ssg);
 
         self.initial_status_code = page.status_code;
-        self.initial_html_length = if page.is_empty() {
-            0
-        } else {
-            page.get_html_bytes_u8().len()
-        };
+        self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
         self.initial_anti_bot_tech = page.anti_bot_tech;
         self.initial_page_should_retry = page.needs_retry();
         self.initial_page_waf_check = page.waf_check;
@@ -3108,12 +4416,12 @@ impl Website {
         if let Some(ref cb) = self.on_should_crawl_callback {
             if !cb.call(&page) {
                 page.blocked_crawl = true;
-                channel_send_page(&self.channel, page, &self.channel_guard);
+                channel_send_page(&self.channel, page, &self.channel_guard).await;
                 return Default::default();
             }
         }
 
-        channel_send_page(&self.channel, page, &self.channel_guard);
+        channel_send_page(&self.channel, page, &self.channel_guard).await;
 
         links
     }
@@ -3136,10 +4444,10 @@ impl Website {
         {
             let url = self.url.inner();
 
-            let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-            let mut links_ssg = HashSet::new();
+            let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+            let mut links_ssg = HashSet::with_capacity(16);
             let mut links_pages = if self.configuration.return_page_links {
-                Some(HashSet::new())
+                Some(HashSet::with_capacity(32))
             } else {
                 None
             };
@@ -3149,26 +4457,53 @@ impl Website {
             page_links_settings.subdomains = self.configuration.subdomains;
             page_links_settings.tld = self.configuration.tld;
             page_links_settings.normalize = self.configuration.normalize;
+            // Skip link extraction for single-page crawls unless the user wants page links.
+            page_links_settings.skip_links =
+                self.single_page() && !self.configuration.return_page_links;
 
             let mut domain_parsed = self.domain_parsed.take();
+
+            // In-process fetch engine for the seed fetch (raw path). Cloned
+            // into owned locals so the borrow never conflicts with the
+            // `&mut self` field access on the fetch calls below.
+            let engine_ref = self.fetch_engine.clone();
+            let engine_cfg = engine_ref
+                .as_ref()
+                .map(|_| std::sync::Arc::new((*self.configuration).clone()));
+            let engine_ctx = match (engine_ref.as_ref(), engine_cfg.as_ref()) {
+                (Some(e), Some(cfg)) => {
+                    Some(crate::fetch_engine::EngineFetchCtx::new(e, cfg.as_ref()))
+                }
+                _ => None,
+            };
 
             #[allow(unused_mut)]
             let mut page = if let Some(mut seeded_page) = self.build_seed_page() {
                 // Extract links and metadata from seeded HTML content if not binary
                 #[cfg(not(feature = "decentralized"))]
-                {
-                    let html_bytes = seeded_page.get_html_bytes_u8();
-                    if !html_bytes.is_empty() && !auto_encoder::is_binary_file(html_bytes) {
-                        let html = seeded_page.get_html();
-                        let extracted_links: HashSet<CaseInsensitiveString> = seeded_page
-                            .links_stream_base_ssg(base, &html, client, &self.domain_parsed)
-                            .await;
-                        links.extend(extracted_links);
+                if !page_links_settings.skip_links {
+                    let skip = {
+                        let html_bytes = seeded_page.get_html_bytes_u8();
+                        html_bytes.is_empty() || crate::utils::is_binary_body(html_bytes)
+                    };
+                    if !skip {
+                        if let Some(html_bytes) = seeded_page.html.take() {
+                            let extracted_links: HashSet<CaseInsensitiveString> = seeded_page
+                                .links_stream_base_ssg(
+                                    base,
+                                    &html_bytes,
+                                    client,
+                                    &self.domain_parsed,
+                                )
+                                .await;
+                            seeded_page.html = Some(html_bytes);
+                            links.extend(extracted_links);
+                        }
                     }
                 }
                 seeded_page
             } else {
-                Page::new_page_streaming(
+                Page::new_page_streaming_engine(
                     url,
                     client,
                     false,
@@ -3180,13 +4515,18 @@ impl Website {
                     &domain_parsed, // original domain
                     &mut self.domain_parsed,
                     &mut links_pages,
+                    self.configuration.auto_http_first_byte_args(),
+                    engine_ctx,
                 )
                 .await
             };
 
-            if page.get_html_bytes_u8().starts_with(b"<?xml") {
-                page.links_stream_xml_links_stream_base(base, &page.get_html(), &mut links, &None)
-                    .await;
+            if !page_links_settings.skip_links && page.is_xml {
+                if let Some(xml_bytes) = page.html.take() {
+                    page.links_stream_xml_links_stream_base(base, &xml_bytes, &mut links, &None)
+                        .await;
+                    page.html = Some(xml_bytes);
+                }
             }
 
             if self.domain_parsed.is_none() {
@@ -3196,20 +4536,69 @@ impl Website {
                 }
             }
 
-            let mut retry_count = self.configuration.retry;
-            let domains_caseless = &self.configuration.external_domains_caseless;
+            let retry_strategy = self.retry_strategy.clone();
+            let mut retry_count: u32 = match &retry_strategy {
+                Some(s) => s.max_retries(),
+                None => self.configuration.retry as u32,
+            };
+            page.proxy_configured = self.configuration.proxies.is_some();
+            let mut attempt: u32 = 0;
 
             while page.needs_retry() && retry_count > 0 {
                 retry_count -= 1;
-                if let Some(timeout) = page.get_timeout() {
-                    tokio::time::sleep(timeout).await;
-                }
+                attempt += 1;
+
+                // Consult the retry strategy if set. Scope the outcome borrow
+                // so it doesn't conflict with apply_directive's &mut self.
+                let directive = match &retry_strategy {
+                    Some(s) => {
+                        let outcome = crate::retry_strategy::AttemptOutcome {
+                            attempt,
+                            status_code: page.status_code,
+                            should_retry: page.should_retry,
+                            content_truncated: page.content_truncated,
+                            waf_check: page.waf_check,
+                            anti_bot_tech: &page.anti_bot_tech,
+                            proxy_configured: page.proxy_configured,
+                            url: self.url.inner(),
+                            profile_key: page.profile_key.as_deref(),
+                            html_length: page.size(),
+                            bytes_transferred: page.bytes_transferred,
+                            #[cfg(not(feature = "page_error_status_details"))]
+                            error_status: page.error_status.as_deref(),
+                            #[cfg(feature = "page_error_status_details")]
+                            error_status: None,
+                            final_redirect_destination: page.final_redirect_destination.as_deref(),
+                        };
+                        Some(s.on_retry(&outcome))
+                    }
+                    None => None,
+                };
+                let (directive_backoff, directive_profile_key) = match directive {
+                    Some(d) => {
+                        if !d.should_retry {
+                            break;
+                        }
+                        crate::retry_strategy::apply_directive(self, &d);
+                        (d.backoff, d.profile_key)
+                    }
+                    None => (None, None),
+                };
+
+                // Re-borrow after apply_directive to avoid borrow conflicts.
+                let url = self.url.inner();
+                let domains_caseless = &self.configuration.external_domains_caseless;
+                let status_delay = page.get_timeout().unwrap_or_default();
+                let backoff = directive_backoff.unwrap_or_else(|| {
+                    crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000)
+                });
+                tokio::time::sleep(status_delay.max(backoff)).await;
 
                 if page.status_code == StatusCode::GATEWAY_TIMEOUT {
                     let mut domain_parsed_clone = self.domain_parsed.clone();
 
-                    if let Err(elasped) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
-                        page = Page::new_page_streaming(
+                    if let Err(elapsed) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
+                        page = Page::new_page_streaming_engine(
                             url,
                             client,
                             false,
@@ -3221,17 +4610,23 @@ impl Website {
                             &domain_parsed,
                             &mut domain_parsed_clone,
                             &mut links_pages,
+                            (None, None),
+                            engine_ctx,
                         )
                         .await;
                     })
                     .await
                     {
-                        log::info!("backoff gateway timeout exceeded {elasped}");
+                        log::info!("backoff gateway timeout exceeded {elapsed}");
+                        // Timeout fired — page was NOT reassigned. Clear should_retry
+                        // to stop the loop from burning remaining retries on a stale page.
+                        page.should_retry = false;
+                        break;
                     }
 
                     self.domain_parsed = domain_parsed_clone;
                 } else {
-                    page = Page::new_page_streaming(
+                    page = Page::new_page_streaming_engine(
                         url,
                         client,
                         false,
@@ -3243,12 +4638,19 @@ impl Website {
                         &domain_parsed,
                         &mut self.domain_parsed,
                         &mut links_pages,
+                        self.configuration.auto_http_first_byte_args(),
+                        engine_ctx,
                     )
                     .await;
                 }
+
+                // Stamp the profile key from the strategy directive.
+                if let Some(ref pk) = directive_profile_key {
+                    page.profile_key = Some(pk.clone());
+                }
             }
 
-            emit_log(url);
+            emit_log(self.url.inner());
 
             if let Some(signature) = page.signature {
                 if !self.is_signature_allowed(signature).await {
@@ -3258,11 +4660,11 @@ impl Website {
             }
 
             let url = match &self.on_link_find_callback {
-                Some(cb) => cb(*self.url.clone(), None).0,
-                _ => *self.url.clone(),
+                Some(cb) => cb((*self.url).clone(), None).0,
+                _ => (*self.url).clone(),
             };
 
-            self.insert_link(url).await;
+            self.insert_link(&url).await;
 
             if self.configuration.return_page_links {
                 page.page_links = links_pages
@@ -3273,11 +4675,7 @@ impl Website {
             links.extend(links_ssg);
 
             self.initial_status_code = page.status_code;
-            self.initial_html_length = if page.is_empty() {
-                0
-            } else {
-                page.get_html_bytes_u8().len()
-            };
+            self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
             self.initial_anti_bot_tech = page.anti_bot_tech;
             self.initial_page_should_retry = page.needs_retry();
             self.initial_page_waf_check = page.waf_check;
@@ -3287,12 +4685,12 @@ impl Website {
             if let Some(ref cb) = self.on_should_crawl_callback {
                 if !cb.call(&page) {
                     page.blocked_crawl = true;
-                    channel_send_page(&self.channel, page, &self.channel_guard);
+                    channel_send_page(&self.channel, page, &self.channel_guard).await;
                     return Default::default();
                 }
             }
 
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
 
             links
         } else {
@@ -3363,10 +4761,10 @@ impl Website {
         ) = self.setup_selectors();
 
         if self.single_page() {
-            let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
+            let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
             let mut links_pages: Option<HashSet<CaseInsensitiveString>> =
                 if self.configuration.return_page_links {
-                    Some(HashSet::new())
+                    Some(HashSet::with_capacity(32))
                 } else {
                     None
                 };
@@ -3390,7 +4788,7 @@ impl Website {
                     {
                         page.error_status = Some(_err.to_string());
                     }
-                    channel_send_page(&self.channel, page, &self.channel_guard);
+                    channel_send_page(&self.channel, page, &self.channel_guard).await;
                     return;
                 }
             };
@@ -3415,7 +4813,7 @@ impl Website {
             )
             .await;
 
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
             return;
         }
 
@@ -3456,6 +4854,7 @@ impl Website {
         ));
 
         let mut set: JoinSet<(HashSet<CaseInsensitiveString>, Option<u64>)> = JoinSet::new();
+        let retry_strategy_ref = self.retry_strategy.clone();
 
         let mut exceeded_budget = false;
         let concurrency = throttle.is_zero();
@@ -3479,10 +4878,6 @@ impl Website {
             let mut stream = tokio_stream::iter(std::mem::take(&mut links));
 
             loop {
-                if !concurrency {
-                    tokio::time::sleep(*throttle).await;
-                }
-
                 let semaphore = get_semaphore(&semaphore, !self.configuration.shared_queue).await;
 
                 tokio::select! {
@@ -3494,12 +4889,10 @@ impl Website {
                     {
                         if !self.handle_process(handle, &mut interval, async {
                             emit_log_shutdown(link.inner());
-                            let permits = set.len();
                             set.shutdown().await;
-                            semaphore.add_permits(permits);
                         }).await {
                             while let Some(links) = stream.next().await {
-                                self.extra_links.insert(links);
+                                self.extra_links_insert(links);
                             }
                             break 'outer;
                         }
@@ -3514,19 +4907,24 @@ impl Website {
                         }
 
                         emit_log(link.inner());
-                        self.insert_link(link.clone()).await;
+                        self.insert_link(&link).await;
+
+                        if !concurrency {
+                            tokio::time::sleep(*throttle).await;
+                        }
 
                         if let Ok(permit) = semaphore.clone().acquire_owned().await {
                             let shared = shared.clone();
                             let on_should_crawl_callback = on_should_crawl_callback.clone();
+                            let retry_strategy_ref = retry_strategy_ref.clone();
                             spawn_set("page_fetch_cmd", &mut set, async move {
                                 let link_result = match &shared.10 {
                                     Some(cb) => cb(link, None),
                                     _ => (link, None),
                                 };
 
-                                let mut out_links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                let mut links_pages = if shared.7 { Some(HashSet::new()) } else { None };
+                                let mut out_links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                let mut links_pages = if shared.7 { Some(HashSet::with_capacity(32)) } else { None };
 
                                 let mut relative_selectors = shared.2.clone();
                                 let mut r_settings = shared.8;
@@ -3535,7 +4933,11 @@ impl Website {
                                 let target_url = link_result.0.as_ref();
 
                                 // Run cmd -> bytes with retry
-                                let mut retry_count = shared.6;
+                                let mut retry_count: u32 = match &retry_strategy_ref {
+                                    Some(s) => s.max_retries(),
+                                    None => shared.6 as u32,
+                                };
+                                let mut attempt: u32 = 0;
                                 let mut last_err: Option<std::io::Error> = None;
 
                                 let bytes = loop {
@@ -3554,6 +4956,37 @@ impl Website {
 
                                     if retry_count == 0 { break None; }
                                     retry_count -= 1;
+                                    attempt += 1;
+
+                                    // Consult the retry strategy if set.
+                                    if let Some(ref s) = retry_strategy_ref {
+                                        // Bind the stringified error to a `let` so the temporary
+                                        // `String` outlives the `.as_deref()` borrow below.
+                                        let last_err_str = last_err.as_ref().map(|e| e.to_string());
+                                        let outcome = crate::retry_strategy::AttemptOutcome {
+                                            attempt,
+                                            status_code: reqwest::StatusCode::BAD_GATEWAY,
+                                            should_retry: true,
+                                            content_truncated: false,
+                                            waf_check: false,
+                                            anti_bot_tech: &crate::page::AntiBotTech::None,
+                                            proxy_configured: false,
+                                            url: target_url,
+                                            profile_key: None,
+                                            html_length: 0,
+                                            bytes_transferred: None,
+                                            error_status: last_err_str.as_deref(),
+                                            final_redirect_destination: None,
+                                        };
+                                        let directive = s.on_retry(&outcome);
+                                        if !directive.should_retry {
+                                            break None;
+                                        }
+                                        if let Some(d) = directive.backoff {
+                                            tokio::time::sleep(d).await;
+                                            continue;
+                                        }
+                                    }
 
                                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                 };
@@ -3596,18 +5029,22 @@ impl Website {
                                 if let Some(ref cb) = on_should_crawl_callback {
                                     if !cb.call(&page) {
                                         page.blocked_crawl = true;
-                                        channel_send_page(&shared.3, page, &shared.5);
+                                        channel_send_page(&shared.3, page, &shared.5).await;
                                         drop(permit);
                                         return Default::default();
                                     }
                                 }
 
                                 let signature = page.signature;
-                                channel_send_page(&shared.3, page, &shared.5);
+                                channel_send_page(&shared.3, page, &shared.5).await;
                                 drop(permit);
 
                                 (out_links, signature)
                             });
+                        } else {
+                            self.links_visited.remove(&link);
+                            self.extra_links_insert(link);
+                            break;
                         }
 
                         self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
@@ -3639,11 +5076,11 @@ impl Website {
                 if (links.is_empty() && set.is_empty()) || exceeded_budget {
                     if exceeded_budget {
                         while let Some(links) = stream.next().await {
-                            self.extra_links.insert(links);
+                            self.extra_links_insert(links);
                         }
                         while let Some(links) = set.join_next().await {
                             if let Ok(links) = links {
-                                self.extra_links.extend(links.0);
+                                self.extra_links_extend(links.0);
                             }
                         }
                     }
@@ -3660,7 +5097,7 @@ impl Website {
         }
 
         if !links.is_empty() {
-            self.extra_links.extend(links);
+            self.extra_links_extend(links);
         }
     }
 
@@ -3692,6 +5129,13 @@ impl Website {
         base: &mut RelativeSelectors,
         _: bool,
         chrome_page: &chromiumoxide::Page,
+        // Gateway re-acquire inputs: the primary browser (for `websocket_address()`)
+        // and its `browser_dead` flag. Used to re-dial the gateway for a fresh
+        // acquisition on a dead-browser / gateway-timeout failure. (The endpoint
+        // may resolve to a gateway ingress rather than a specific backend, so
+        // this is a fresh acquisition retry, not a pinned reconnect.)
+        browser: &chromiumoxide::Browser,
+        browser_dead: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> HashSet<CaseInsensitiveString> {
         if self.skip_initial {
             return Default::default();
@@ -3706,121 +5150,195 @@ impl Website {
                 self.setup_chrome_interception(chrome_page)
             );
 
-            let mut page = if let Some(seeded_html) = self.get_seeded_html() {
-                Page::new_seeded(
-                    self.url.inner(),
-                    client,
-                    chrome_page,
-                    &self.configuration.wait_for,
-                    &self.configuration.screenshot,
-                    false, // we use the initial about:blank page.
-                    &self.configuration.openai_config,
-                    &self.configuration.execution_scripts,
-                    &self.configuration.automation_scripts,
-                    &self.configuration.viewport,
-                    &self.configuration.request_timeout,
-                    &self.configuration.track_events,
-                    self.configuration.referer.clone(),
-                    self.configuration.max_page_bytes,
-                    self.configuration.get_cache_options(),
-                    &self.configuration.cache_policy,
-                    Some(seeded_html.clone()),
-                    Some(&self.cookie_jar),
-                    &self.configuration.remote_multimodal,
-                )
-                .await
+            // Pre-allocate the link sets so the streaming extractor can
+            // populate them on the fly — same flow as the recursive
+            // chrome_page_fetch! macro. SSG manifest discovery + XML
+            // fallback are handled inside Page::new_seeded_streaming /
+            // Page::new_streaming, eliminating the legacy two-pass walk
+            // that previously ran after this block.
+            let return_page_links = self.configuration.return_page_links;
+            let full_resources = self.configuration.full_resources;
+            let skip_links = self.single_page() && !return_page_links;
+
+            let mut links: HashSet<CaseInsensitiveString> =
+                HashSet::with_capacity(crate::page::link_set_capacity());
+            let mut links_pages: Option<HashSet<CaseInsensitiveString>> = if return_page_links {
+                Some(Default::default())
             } else {
-                Page::new(
-                    self.url.inner(),
-                    client,
-                    chrome_page,
-                    &self.configuration.wait_for,
-                    &self.configuration.screenshot,
-                    false, // we use the initial about:blank page.
-                    &self.configuration.openai_config,
-                    &self.configuration.execution_scripts,
-                    &self.configuration.automation_scripts,
-                    &self.configuration.viewport,
-                    &self.configuration.request_timeout,
-                    &self.configuration.track_events,
-                    self.configuration.referer.clone(),
-                    self.configuration.max_page_bytes,
-                    self.configuration.get_cache_options(),
-                    &self.configuration.cache_policy,
-                    &self.configuration.remote_multimodal,
-                )
-                .await
+                None
             };
 
-            let mut retry_count = self.configuration.retry;
+            let (mut page, mut extract_succeeded) =
+                if let Some(seeded_html) = self.get_seeded_html() {
+                    Page::new_seeded_streaming(
+                        self.url.inner(),
+                        client,
+                        chrome_page,
+                        false, // we use the initial about:blank page.
+                        self.configuration.referer.clone(),
+                        self.configuration.max_page_bytes,
+                        self.configuration.get_cache_options(),
+                        Some(seeded_html.clone()),
+                        Some(&self.cookie_jar),
+                        self.configuration.cache_namespace_str(),
+                        &self.configuration.chrome_fetch_params(),
+                        &*base,
+                        &self.configuration.external_domains_caseless,
+                        &mut links,
+                        &mut links_pages,
+                        full_resources,
+                        skip_links,
+                        true,
+                    )
+                    .await
+                } else {
+                    Page::new_streaming(
+                        self.url.inner(),
+                        client,
+                        chrome_page,
+                        false, // we use the initial about:blank page.
+                        self.configuration.referer.clone(),
+                        self.configuration.max_page_bytes,
+                        self.configuration.get_cache_options(),
+                        self.configuration.cache_namespace_str(),
+                        &self.configuration.chrome_fetch_params(),
+                        &*base,
+                        &self.configuration.external_domains_caseless,
+                        &mut links,
+                        &mut links_pages,
+                        full_resources,
+                        skip_links,
+                        true,
+                    )
+                    .await
+                };
+
+            let retry_strategy = self.retry_strategy.clone();
+            let mut retry_count: u32 = match &retry_strategy {
+                Some(s) => s.max_retries(),
+                None => self.configuration.retry as u32,
+            };
+            page.proxy_configured = self.configuration.proxies.is_some();
 
             if let Some(final_redirect_destination) = &page.final_redirect_destination {
                 if final_redirect_destination == "chrome-error://chromewebdata/"
                     && page.status_code.is_success()
                     && page.is_empty()
-                    && self.configuration.proxies.is_some()
+                    && page.proxy_configured
                 {
-                    page.error_status = Some("Invalid proxy configuration.".into());
+                    #[cfg(not(feature = "page_error_status_details"))]
+                    {
+                        page.error_status = Some("Invalid proxy configuration.".into());
+                    }
                     page.should_retry = true;
                     page.status_code = *crate::page::CHROME_UNKNOWN_STATUS_ERROR;
                 }
             }
 
+            let mut attempt: u32 = 0;
             while page.needs_retry() && retry_count > 0 {
                 retry_count -= 1;
-                if let Some(timeout) = page.get_timeout() {
-                    tokio::time::sleep(timeout).await;
+                attempt += 1;
+
+                // Consult the retry strategy if set.
+                let (directive_backoff, directive_profile_key) = match &retry_strategy {
+                    Some(s) => {
+                        let outcome = crate::retry_strategy::AttemptOutcome {
+                            attempt,
+                            status_code: page.status_code,
+                            should_retry: page.should_retry,
+                            content_truncated: page.content_truncated,
+                            waf_check: page.waf_check,
+                            anti_bot_tech: &page.anti_bot_tech,
+                            proxy_configured: page.proxy_configured,
+                            url: self.url.inner(),
+                            profile_key: page.profile_key.as_deref(),
+                            html_length: page.size(),
+                            bytes_transferred: page.bytes_transferred,
+                            #[cfg(not(feature = "page_error_status_details"))]
+                            error_status: page.error_status.as_deref(),
+                            #[cfg(feature = "page_error_status_details")]
+                            error_status: None,
+                            final_redirect_destination: page.final_redirect_destination.as_deref(),
+                        };
+                        let directive = s.on_retry(&outcome);
+                        if !directive.should_retry {
+                            break;
+                        }
+                        crate::retry_strategy::apply_directive(self, &directive);
+                        (directive.backoff, directive.profile_key)
+                    }
+                    None => (None, None),
+                };
+
+                let status_delay = page.get_timeout().unwrap_or_default();
+                let backoff = directive_backoff.unwrap_or_else(|| {
+                    crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000)
+                });
+                tokio::time::sleep(status_delay.max(backoff)).await;
+
+                // Drop prior attempt's extracted state so only the
+                // final attempt's links flow downstream.
+                links.clear();
+                if let Some(ref mut lp) = links_pages {
+                    lp.clear();
                 }
+
                 if page.status_code == StatusCode::GATEWAY_TIMEOUT {
                     if let Err(elasped) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
-                        let next_page = Page::new(
+                        let (next_page, succ) = Page::new_streaming(
                             self.url.inner(),
                             client,
                             chrome_page,
-                            &self.configuration.wait_for,
-                            &self.configuration.screenshot,
                             false, // we use the initial about:blank page.
-                            &self.configuration.openai_config,
-                            &self.configuration.execution_scripts,
-                            &self.configuration.automation_scripts,
-                            &self.configuration.viewport,
-                            &self.configuration.request_timeout,
-                            &self.configuration.track_events,
                             self.configuration.referer.clone(),
                             self.configuration.max_page_bytes,
                             self.configuration.get_cache_options(),
-                            &self.configuration.cache_policy,
-                            &self.configuration.remote_multimodal,
+                            self.configuration.cache_namespace_str(),
+                            &self.configuration.chrome_fetch_params(),
+                            &*base,
+                            &self.configuration.external_domains_caseless,
+                            &mut links,
+                            &mut links_pages,
+                            full_resources,
+                            skip_links,
+                            true,
                         )
                         .await;
                         page = next_page;
+                        extract_succeeded = succ;
                     })
                     .await
                     {
                         log::warn!("backoff timeout {elasped}");
                     }
                 } else {
-                    let next_page = Page::new(
+                    let (next_page, succ) = Page::new_streaming(
                         self.url.inner(),
                         client,
                         chrome_page,
-                        &self.configuration.wait_for,
-                        &self.configuration.screenshot,
                         false, // we use the initial about:blank page.
-                        &self.configuration.openai_config,
-                        &self.configuration.execution_scripts,
-                        &self.configuration.automation_scripts,
-                        &self.configuration.viewport,
-                        &self.configuration.request_timeout,
-                        &self.configuration.track_events,
                         self.configuration.referer.clone(),
                         self.configuration.max_page_bytes,
                         self.configuration.get_cache_options(),
-                        &self.configuration.cache_policy,
-                        &self.configuration.remote_multimodal,
+                        self.configuration.cache_namespace_str(),
+                        &self.configuration.chrome_fetch_params(),
+                        &*base,
+                        &self.configuration.external_domains_caseless,
+                        &mut links,
+                        &mut links_pages,
+                        full_resources,
+                        skip_links,
+                        true,
                     )
                     .await;
                     page = next_page;
+                    extract_succeeded = succ;
+                }
+
+                // Stamp the profile key from the strategy directive.
+                if let Some(ref pk) = directive_profile_key {
+                    page.profile_key = Some(pk.clone());
                 }
 
                 // check the page again for final.
@@ -3830,9 +5348,144 @@ impl Website {
                         && page.is_empty()
                         && self.configuration.proxies.is_some()
                     {
-                        page.error_status = Some("Invalid proxy configuration.".into());
+                        #[cfg(not(feature = "page_error_status_details"))]
+                        {
+                            page.error_status = Some("Invalid proxy configuration.".into());
+                        }
                         page.should_retry = true;
                         page.status_code = *crate::page::CHROME_UNKNOWN_STATUS_ERROR;
+                    }
+                }
+            }
+
+            // ── In-request gateway re-acquire (retry the acquisition) ──
+            // The retries above re-render on the same tab/browser. If that
+            // browser died — e.g. the first-byte watchdog saw a gateway
+            // acquisition timeout and flipped `browser_dead` — re-dial the
+            // gateway (`browser.websocket_address()`) for a fresh acquisition and
+            // re-render on it. NOTE: the endpoint may resolve to a gateway
+            // ingress rather than a specific backend, so this is a fresh
+            // acquisition, not a pinned reconnect; it still helps when
+            // acquisition failures are roughly independent per attempt. Bounded
+            // budget; gives up if it keeps failing. A jittered delay precedes
+            // each attempt so concurrent requests don't re-acquire in lockstep
+            // (opt out with `SPIDER_CHROME_REACQUIRE=0`). Skipped under
+            // `chrome_store_page` (the subscriber keeps the live tab past this
+            // scope).
+            if !cfg!(feature = "chrome_store_page")
+                && self
+                    .configuration
+                    .enhancements
+                    .enabled(crate::configuration::CrawlEnhancement::GatewayReacquire)
+            {
+                let mut reacquire_budget: u32 = 2;
+                let mut reacquire_attempt: u32 = 0;
+                while reacquire_budget > 0
+                    && browser_dead.load(std::sync::atomic::Ordering::Acquire)
+                    && (page.needs_retry() || page.is_empty())
+                {
+                    reacquire_budget -= 1;
+                    log::warn!(
+                        "[chrome-reacquire] {} (establish) browser dead — gateway re-acquire (budget left {})",
+                        self.url.inner().as_str(),
+                        reacquire_budget
+                    );
+                    // Decorrelate concurrent re-acquisitions with full jitter
+                    // so a saturated gateway isn't hit in lockstep.
+                    let reacquire_jitter =
+                        crate::utils::backoff::backoff_delay(reacquire_attempt, 250, 5_000);
+                    reacquire_attempt += 1;
+                    if !reacquire_jitter.is_zero() {
+                        tokio::time::sleep(reacquire_jitter).await;
+                    }
+                    match crate::features::chrome::relaunch_browser_at(
+                        browser.websocket_address().clone(),
+                        &self.configuration,
+                    )
+                    .await
+                    {
+                        Some((fresh_browser, fresh_handle, fresh_ctx, fresh_dead, fresh_url)) => {
+                            match crate::features::chrome::attempt_navigation(
+                                "about:blank",
+                                &fresh_browser,
+                                &self.configuration.request_timeout,
+                                &fresh_ctx,
+                                &self.configuration.viewport,
+                            )
+                            .await
+                            {
+                                Ok(fresh_tab) => {
+                                    let _fresh_tab_guard =
+                                        crate::features::chrome::TabCloseGuard::new(
+                                            fresh_tab.clone(),
+                                        );
+                                    let _ = tokio::join!(
+                                        crate::features::chrome::setup_chrome_events(
+                                            &fresh_tab,
+                                            &self.configuration
+                                        ),
+                                        self.setup_chrome_interception(&fresh_tab)
+                                    );
+
+                                    links.clear();
+                                    if let Some(ref mut lp) = links_pages {
+                                        lp.clear();
+                                    }
+
+                                    let (next_page, succ) = Page::new_streaming(
+                                        self.url.inner(),
+                                        client,
+                                        &fresh_tab,
+                                        false,
+                                        self.configuration.referer.clone(),
+                                        self.configuration.max_page_bytes,
+                                        self.configuration.get_cache_options(),
+                                        self.configuration.cache_namespace_str(),
+                                        &self
+                                            .configuration
+                                            .chrome_fetch_params()
+                                            .with_browser_dead(&fresh_dead)
+                                            .with_chrome_endpoint(fresh_url.as_deref()),
+                                        &*base,
+                                        &self.configuration.external_domains_caseless,
+                                        &mut links,
+                                        &mut links_pages,
+                                        full_resources,
+                                        skip_links,
+                                        true,
+                                    )
+                                    .await;
+                                    page = next_page;
+                                    extract_succeeded = succ;
+                                }
+                                Err(_) => {
+                                    log::warn!(
+                                        "[chrome-reacquire] {} (establish) gateway re-acquire: fresh tab failed",
+                                        self.url.inner().as_str()
+                                    );
+                                }
+                            }
+
+                            // Dispose the physical reconnect's handler; the
+                            // browser drops (WS closes) at scope end.
+                            fresh_handle.abort();
+
+                            if !page.needs_retry() && !page.is_empty() {
+                                log::info!(
+                                    "[chrome-reacquire] {} (establish) recovered via gateway re-acquire ({})",
+                                    self.url.inner().as_str(),
+                                    fresh_url.as_deref().unwrap_or("?")
+                                );
+                                break;
+                            }
+                        }
+                        None => {
+                            log::warn!(
+                                "[chrome-reacquire] {} (establish) gateway re-acquire failed — giving up",
+                                self.url.inner().as_str()
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -3871,36 +5524,50 @@ impl Website {
             }
 
             let url = match &self.on_link_find_callback {
-                Some(cb) => cb(*self.url.clone(), None).0,
-                _ => *self.url.clone(),
+                Some(cb) => cb((*self.url).clone(), None).0,
+                _ => (*self.url).clone(),
             };
 
-            self.insert_link(url).await;
+            self.insert_link(&url).await;
 
-            // setup link tracking.
-            if self.configuration.return_page_links && page.page_links.is_none() {
-                page.page_links = Some(Box::default());
-            }
-
-            let xml_file = page.get_html_bytes_u8().starts_with(b"<?xml");
-
-            let mut links = if !page.is_empty() && !xml_file {
-                page.links_ssg(base, client, &self.domain_parsed).await
+            // The streaming pump in `Page::new_streaming` /
+            // `Page::new_seeded_streaming` populated `links` (and
+            // `links_pages` when `return_page_links` was set) on the
+            // fly — including SSG manifest discovery for HTML pages and
+            // quick_xml extraction for `is_xml` responses.  Only fall
+            // back to the legacy two-pass walk when streaming declined
+            // (mid-stream rewriter error, redirect-base mismatch,
+            // body-mutating solver, etc.) so behavior stays byte-
+            // identical with prior releases.
+            if extract_succeeded {
+                if return_page_links {
+                    page.page_links = links_pages.take().map(Box::new);
+                }
             } else {
-                Default::default()
-            };
-
-            if xml_file {
-                page.links_stream_xml_links_stream_base(base, &page.get_html(), &mut links, &None)
-                    .await;
+                if return_page_links && page.page_links.is_none() {
+                    page.page_links = Some(Box::default());
+                }
+                let xml_file = page.is_xml;
+                links = if skip_links {
+                    Default::default()
+                } else if !page.is_empty() && !xml_file {
+                    page.links_ssg(base, client, &self.domain_parsed).await
+                } else {
+                    Default::default()
+                };
+                if !skip_links && xml_file {
+                    if let Some(xml_bytes) = page.html.take() {
+                        page.links_stream_xml_links_stream_base(
+                            base, &xml_bytes, &mut links, &None,
+                        )
+                        .await;
+                        page.html = Some(xml_bytes);
+                    }
+                }
             }
 
             self.initial_status_code = page.status_code;
-            self.initial_html_length = if page.is_empty() {
-                0
-            } else {
-                page.get_html_bytes_u8().len()
-            };
+            self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
             self.initial_anti_bot_tech = page.anti_bot_tech;
             self.initial_page_should_retry = page.needs_retry();
             self.initial_page_waf_check = page.waf_check;
@@ -3910,12 +5577,12 @@ impl Website {
             if let Some(ref cb) = self.on_should_crawl_callback {
                 if !cb.call(&page) {
                     page.blocked_crawl = true;
-                    channel_send_page(&self.channel, page, &self.channel_guard);
+                    channel_send_page(&self.channel, page, &self.channel_guard).await;
                     return Default::default();
                 }
             }
 
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
 
             links
         } else {
@@ -3931,6 +5598,9 @@ impl Website {
         base: &mut RelativeSelectors,
         url: &Option<&str>,
         chrome_page: &chromiumoxide::Page,
+        // Gateway re-acquire inputs (see `crawl_establish`).
+        browser: &chromiumoxide::Browser,
+        browser_dead: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> HashSet<CaseInsensitiveString> {
         if self
             .is_allowed_default(self.get_base_link())
@@ -3941,96 +5611,170 @@ impl Website {
                 self.setup_chrome_interception(chrome_page)
             );
 
-            let mut page = Page::new(
-                url.unwrap_or(self.url.inner()),
+            // Same streaming-extraction setup as `crawl_establish` —
+            // SSG manifest discovery + XML extraction happen inside
+            // `Page::new_streaming` so the legacy post-fetch
+            // `links_ssg` / XML walks below are only reached when
+            // streaming declined (redirect-base mismatch, mid-stream
+            // error, etc.).
+            let return_page_links = self.configuration.return_page_links;
+            let full_resources = self.configuration.full_resources;
+            let skip_links = self.single_page() && !return_page_links;
+
+            let mut links: HashSet<CaseInsensitiveString> =
+                HashSet::with_capacity(crate::page::link_set_capacity());
+            let mut links_pages: Option<HashSet<CaseInsensitiveString>> = if return_page_links {
+                Some(Default::default())
+            } else {
+                None
+            };
+
+            let target_url = url.unwrap_or(self.url.inner());
+            let (mut page, mut extract_succeeded) = Page::new_streaming(
+                target_url,
                 client,
                 chrome_page,
-                &self.configuration.wait_for,
-                &self.configuration.screenshot,
                 false, // we use the initial about:blank page.
-                &self.configuration.openai_config,
-                &self.configuration.execution_scripts,
-                &self.configuration.automation_scripts,
-                &self.configuration.viewport,
-                &self.configuration.request_timeout,
-                &self.configuration.track_events,
                 self.configuration.referer.clone(),
                 self.configuration.max_page_bytes,
                 self.configuration.get_cache_options(),
-                &self.configuration.cache_policy,
-                &self.configuration.remote_multimodal,
+                self.configuration.cache_namespace_str(),
+                &self.configuration.chrome_fetch_params(),
+                &*base,
+                &self.configuration.external_domains_caseless,
+                &mut links,
+                &mut links_pages,
+                full_resources,
+                skip_links,
+                true,
             )
             .await;
 
-            let mut retry_count = self.configuration.retry;
+            let retry_strategy = self.retry_strategy.as_ref();
+            let mut retry_count: u32 = match retry_strategy {
+                Some(s) => s.max_retries(),
+                None => self.configuration.retry as u32,
+            };
+            page.proxy_configured = self.configuration.proxies.is_some();
 
             if let Some(final_redirect_destination) = &page.final_redirect_destination {
                 if final_redirect_destination == "chrome-error://chromewebdata/"
                     && page.status_code.is_success()
                     && page.is_empty()
-                    && self.configuration.proxies.is_some()
+                    && page.proxy_configured
                 {
-                    page.error_status = Some("Invalid proxy configuration.".into());
+                    #[cfg(not(feature = "page_error_status_details"))]
+                    {
+                        page.error_status = Some("Invalid proxy configuration.".into());
+                    }
                     page.should_retry = true;
                     page.status_code = *crate::page::CHROME_UNKNOWN_STATUS_ERROR;
                 }
             }
 
+            let mut attempt: u32 = 0;
             while page.needs_retry() && retry_count > 0 {
                 retry_count -= 1;
-                if let Some(timeout) = page.get_timeout() {
-                    tokio::time::sleep(timeout).await;
+                attempt += 1;
+
+                // Consult the retry strategy if set (read-only context, no config mutation).
+                let (directive_backoff, directive_profile_key) = match retry_strategy {
+                    Some(s) => {
+                        let outcome = crate::retry_strategy::AttemptOutcome {
+                            attempt,
+                            status_code: page.status_code,
+                            should_retry: page.should_retry,
+                            content_truncated: page.content_truncated,
+                            waf_check: page.waf_check,
+                            anti_bot_tech: &page.anti_bot_tech,
+                            proxy_configured: page.proxy_configured,
+                            url: self.url.inner(),
+                            profile_key: page.profile_key.as_deref(),
+                            html_length: page.size(),
+                            bytes_transferred: page.bytes_transferred,
+                            #[cfg(not(feature = "page_error_status_details"))]
+                            error_status: page.error_status.as_deref(),
+                            #[cfg(feature = "page_error_status_details")]
+                            error_status: None,
+                            final_redirect_destination: page.final_redirect_destination.as_deref(),
+                        };
+                        let directive = s.on_retry(&outcome);
+                        if !directive.should_retry {
+                            break;
+                        }
+                        (directive.backoff, directive.profile_key)
+                    }
+                    None => (None, None),
+                };
+
+                let status_delay = page.get_timeout().unwrap_or_default();
+                let backoff = directive_backoff.unwrap_or_else(|| {
+                    crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000)
+                });
+                tokio::time::sleep(status_delay.max(backoff)).await;
+
+                // Drop prior attempt's extracted state so only the
+                // final attempt's links flow downstream.
+                links.clear();
+                if let Some(ref mut lp) = links_pages {
+                    lp.clear();
                 }
+
                 if page.status_code == StatusCode::GATEWAY_TIMEOUT {
                     if let Err(elasped) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
-                        let next_page = Page::new(
+                        let (next_page, succ) = Page::new_streaming(
                             self.url.inner(),
                             client,
                             chrome_page,
-                            &self.configuration.wait_for,
-                            &self.configuration.screenshot,
                             false, // we use the initial about:blank page.
-                            &self.configuration.openai_config,
-                            &self.configuration.execution_scripts,
-                            &self.configuration.automation_scripts,
-                            &self.configuration.viewport,
-                            &self.configuration.request_timeout,
-                            &self.configuration.track_events,
                             self.configuration.referer.clone(),
                             self.configuration.max_page_bytes,
                             self.configuration.get_cache_options(),
-                            &self.configuration.cache_policy,
-                            &self.configuration.remote_multimodal,
+                            self.configuration.cache_namespace_str(),
+                            &self.configuration.chrome_fetch_params(),
+                            &*base,
+                            &self.configuration.external_domains_caseless,
+                            &mut links,
+                            &mut links_pages,
+                            full_resources,
+                            skip_links,
+                            true,
                         )
                         .await;
                         page = next_page;
+                        extract_succeeded = succ;
                     })
                     .await
                     {
                         log::warn!("backoff timeout {elasped}");
                     }
                 } else {
-                    let next_page = Page::new(
+                    let (next_page, succ) = Page::new_streaming(
                         self.url.inner(),
                         client,
                         chrome_page,
-                        &self.configuration.wait_for,
-                        &self.configuration.screenshot,
                         false, // we use the initial about:blank page.
-                        &self.configuration.openai_config,
-                        &self.configuration.execution_scripts,
-                        &self.configuration.automation_scripts,
-                        &self.configuration.viewport,
-                        &self.configuration.request_timeout,
-                        &self.configuration.track_events,
                         self.configuration.referer.clone(),
                         self.configuration.max_page_bytes,
                         self.configuration.get_cache_options(),
-                        &self.configuration.cache_policy,
-                        &self.configuration.remote_multimodal,
+                        self.configuration.cache_namespace_str(),
+                        &self.configuration.chrome_fetch_params(),
+                        &*base,
+                        &self.configuration.external_domains_caseless,
+                        &mut links,
+                        &mut links_pages,
+                        full_resources,
+                        skip_links,
+                        true,
                     )
                     .await;
                     page = next_page;
+                    extract_succeeded = succ;
+                }
+
+                // Stamp the profile key from the strategy directive.
+                if let Some(ref pk) = directive_profile_key {
+                    page.profile_key = Some(pk.clone());
                 }
 
                 // check the page again for final.
@@ -4040,9 +5784,144 @@ impl Website {
                         && page.is_empty()
                         && self.configuration.proxies.is_some()
                     {
-                        page.error_status = Some("Invalid proxy configuration.".into());
+                        #[cfg(not(feature = "page_error_status_details"))]
+                        {
+                            page.error_status = Some("Invalid proxy configuration.".into());
+                        }
                         page.should_retry = true;
                         page.status_code = *crate::page::CHROME_UNKNOWN_STATUS_ERROR;
+                    }
+                }
+            }
+
+            // ── In-request gateway re-acquire (retry the acquisition) ──
+            // The retries above re-render on the same tab/browser. If that
+            // browser died — e.g. the first-byte watchdog saw a gateway
+            // acquisition timeout and flipped `browser_dead` — re-dial the
+            // gateway (`browser.websocket_address()`) for a fresh acquisition and
+            // re-render on it. NOTE: the endpoint may resolve to a gateway
+            // ingress rather than a specific backend, so this is a fresh
+            // acquisition, not a pinned reconnect; it still helps when
+            // acquisition failures are roughly independent per attempt. Bounded
+            // budget; gives up if it keeps failing. A jittered delay precedes
+            // each attempt so concurrent requests don't re-acquire in lockstep
+            // (opt out with `SPIDER_CHROME_REACQUIRE=0`). Skipped under
+            // `chrome_store_page` (the subscriber keeps the live tab past this
+            // scope).
+            if !cfg!(feature = "chrome_store_page")
+                && self
+                    .configuration
+                    .enhancements
+                    .enabled(crate::configuration::CrawlEnhancement::GatewayReacquire)
+            {
+                let mut reacquire_budget: u32 = 2;
+                let mut reacquire_attempt: u32 = 0;
+                while reacquire_budget > 0
+                    && browser_dead.load(std::sync::atomic::Ordering::Acquire)
+                    && (page.needs_retry() || page.is_empty())
+                {
+                    reacquire_budget -= 1;
+                    log::warn!(
+                        "[chrome-reacquire] {} (establish) browser dead — gateway re-acquire (budget left {})",
+                        self.url.inner().as_str(),
+                        reacquire_budget
+                    );
+                    // Decorrelate concurrent re-acquisitions with full jitter
+                    // so a saturated gateway isn't hit in lockstep.
+                    let reacquire_jitter =
+                        crate::utils::backoff::backoff_delay(reacquire_attempt, 250, 5_000);
+                    reacquire_attempt += 1;
+                    if !reacquire_jitter.is_zero() {
+                        tokio::time::sleep(reacquire_jitter).await;
+                    }
+                    match crate::features::chrome::relaunch_browser_at(
+                        browser.websocket_address().clone(),
+                        &self.configuration,
+                    )
+                    .await
+                    {
+                        Some((fresh_browser, fresh_handle, fresh_ctx, fresh_dead, fresh_url)) => {
+                            match crate::features::chrome::attempt_navigation(
+                                "about:blank",
+                                &fresh_browser,
+                                &self.configuration.request_timeout,
+                                &fresh_ctx,
+                                &self.configuration.viewport,
+                            )
+                            .await
+                            {
+                                Ok(fresh_tab) => {
+                                    let _fresh_tab_guard =
+                                        crate::features::chrome::TabCloseGuard::new(
+                                            fresh_tab.clone(),
+                                        );
+                                    let _ = tokio::join!(
+                                        crate::features::chrome::setup_chrome_events(
+                                            &fresh_tab,
+                                            &self.configuration
+                                        ),
+                                        self.setup_chrome_interception(&fresh_tab)
+                                    );
+
+                                    links.clear();
+                                    if let Some(ref mut lp) = links_pages {
+                                        lp.clear();
+                                    }
+
+                                    let (next_page, succ) = Page::new_streaming(
+                                        self.url.inner(),
+                                        client,
+                                        &fresh_tab,
+                                        false,
+                                        self.configuration.referer.clone(),
+                                        self.configuration.max_page_bytes,
+                                        self.configuration.get_cache_options(),
+                                        self.configuration.cache_namespace_str(),
+                                        &self
+                                            .configuration
+                                            .chrome_fetch_params()
+                                            .with_browser_dead(&fresh_dead)
+                                            .with_chrome_endpoint(fresh_url.as_deref()),
+                                        &*base,
+                                        &self.configuration.external_domains_caseless,
+                                        &mut links,
+                                        &mut links_pages,
+                                        full_resources,
+                                        skip_links,
+                                        true,
+                                    )
+                                    .await;
+                                    page = next_page;
+                                    extract_succeeded = succ;
+                                }
+                                Err(_) => {
+                                    log::warn!(
+                                        "[chrome-reacquire] {} (establish) gateway re-acquire: fresh tab failed",
+                                        self.url.inner().as_str()
+                                    );
+                                }
+                            }
+
+                            // Dispose the physical reconnect's handler; the
+                            // browser drops (WS closes) at scope end.
+                            fresh_handle.abort();
+
+                            if !page.needs_retry() && !page.is_empty() {
+                                log::info!(
+                                    "[chrome-reacquire] {} (establish) recovered via gateway re-acquire ({})",
+                                    self.url.inner().as_str(),
+                                    fresh_url.as_deref().unwrap_or("?")
+                                );
+                                break;
+                            }
+                        }
+                        None => {
+                            log::warn!(
+                                "[chrome-reacquire] {} (establish) gateway re-acquire failed — giving up",
+                                self.url.inner().as_str()
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -4073,32 +5952,46 @@ impl Website {
 
             emit_log(self.url.inner());
 
-            if self.configuration.return_page_links && page.page_links.is_none() {
-                page.page_links = Some(Box::default());
-            }
-
-            let xml_file = page.get_html_bytes_u8().starts_with(b"<?xml");
-
-            let mut links = if !page.is_empty() && !xml_file {
-                page.links_ssg(base, client, &self.domain_parsed).await
+            // Streaming pump populated `links` (and `links_pages`) on
+            // the fly, including SSG manifest discovery and quick_xml
+            // for `is_xml` responses. Fall back to the legacy two-pass
+            // walk only when streaming declined.
+            if extract_succeeded {
+                if return_page_links {
+                    page.page_links = links_pages.take().map(Box::new);
+                }
             } else {
-                Default::default()
-            };
-
-            if xml_file {
-                page.links_stream_xml_links_stream_base(base, &page.get_html(), &mut links, &None)
-                    .await;
+                if return_page_links && page.page_links.is_none() {
+                    page.page_links = Some(Box::default());
+                }
+                let xml_file = page.is_xml;
+                links = if skip_links {
+                    Default::default()
+                } else if !page.is_empty() && !xml_file {
+                    page.links_ssg(base, client, &self.domain_parsed).await
+                } else {
+                    Default::default()
+                };
+                if !skip_links && xml_file {
+                    if let Some(xml_bytes) = page.html.take() {
+                        page.links_stream_xml_links_stream_base(
+                            base, &xml_bytes, &mut links, &None,
+                        )
+                        .await;
+                        page.html = Some(xml_bytes);
+                    }
+                }
             }
 
             if let Some(ref cb) = self.on_should_crawl_callback {
                 if !cb.call(&page) {
                     page.blocked_crawl = true;
-                    channel_send_page(&self.channel, page, &self.channel_guard);
+                    channel_send_page(&self.channel, page, &self.channel_guard).await;
                     return Default::default();
                 }
             }
 
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
 
             links
         } else {
@@ -4135,13 +6028,54 @@ impl Website {
             let mut page =
                 Page::new_page_webdriver(url.unwrap_or(self.url.inner()), driver, timeout).await;
 
-            let mut retry_count = self.configuration.retry;
+            let retry_strategy = self.retry_strategy.as_ref();
+            let mut retry_count: u32 = match retry_strategy {
+                Some(s) => s.max_retries(),
+                None => self.configuration.retry as u32,
+            };
+            page.proxy_configured = self.configuration.proxies.is_some();
+            let mut attempt: u32 = 0;
 
             while page.needs_retry() && retry_count > 0 {
                 retry_count -= 1;
-                if let Some(timeout_duration) = page.get_timeout() {
-                    tokio::time::sleep(timeout_duration).await;
-                }
+                attempt += 1;
+
+                // Consult the retry strategy if set (read-only context, no config mutation).
+                let (directive_backoff, directive_profile_key) = match retry_strategy {
+                    Some(s) => {
+                        let outcome = crate::retry_strategy::AttemptOutcome {
+                            attempt,
+                            status_code: page.status_code,
+                            should_retry: page.should_retry,
+                            content_truncated: page.content_truncated,
+                            waf_check: page.waf_check,
+                            anti_bot_tech: &page.anti_bot_tech,
+                            proxy_configured: page.proxy_configured,
+                            url: self.url.inner(),
+                            profile_key: page.profile_key.as_deref(),
+                            html_length: page.size(),
+                            bytes_transferred: page.bytes_transferred,
+                            #[cfg(not(feature = "page_error_status_details"))]
+                            error_status: page.error_status.as_deref(),
+                            #[cfg(feature = "page_error_status_details")]
+                            error_status: None,
+                            final_redirect_destination: page.final_redirect_destination.as_deref(),
+                        };
+                        let directive = s.on_retry(&outcome);
+                        if !directive.should_retry {
+                            break;
+                        }
+                        (directive.backoff, directive.profile_key)
+                    }
+                    None => (None, None),
+                };
+
+                let status_delay = page.get_timeout().unwrap_or_default();
+                let backoff = directive_backoff.unwrap_or_else(|| {
+                    crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000)
+                });
+                tokio::time::sleep(status_delay.max(backoff)).await;
+
                 if page.status_code == StatusCode::GATEWAY_TIMEOUT {
                     if let Err(elapsed) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
                         let next_page =
@@ -4156,6 +6090,11 @@ impl Website {
                     let next_page =
                         Page::new_page_webdriver(self.url.inner(), driver, timeout).await;
                     page = next_page;
+                }
+
+                // Stamp the profile key from the strategy directive.
+                if let Some(ref pk) = directive_profile_key {
+                    page.profile_key = Some(pk.clone());
                 }
             }
 
@@ -4179,28 +6118,35 @@ impl Website {
                 page.page_links = Some(Box::default());
             }
 
-            let xml_file = page.get_html_bytes_u8().starts_with(b"<?xml");
+            // Skip link extraction for single-page crawls unless the user wants page links.
+            let skip_links = self.single_page() && !self.configuration.return_page_links;
+            let xml_file = page.is_xml;
 
-            let mut links = if !page.is_empty() && !xml_file {
+            let mut links = if skip_links {
+                Default::default()
+            } else if !page.is_empty() && !xml_file {
                 page.links_ssg(base, client, &self.domain_parsed).await
             } else {
                 Default::default()
             };
 
-            if xml_file {
-                page.links_stream_xml_links_stream_base(base, &page.get_html(), &mut links, &None)
-                    .await;
+            if !skip_links && xml_file {
+                if let Some(xml_bytes) = page.html.take() {
+                    page.links_stream_xml_links_stream_base(base, &xml_bytes, &mut links, &None)
+                        .await;
+                    page.html = Some(xml_bytes);
+                }
             }
 
             if let Some(ref cb) = self.on_should_crawl_callback {
                 if !cb.call(&page) {
                     page.blocked_crawl = true;
-                    channel_send_page(&self.channel, page, &self.channel_guard);
+                    channel_send_page(&self.channel, page, &self.channel_guard).await;
                     return Default::default();
                 }
             }
 
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
 
             links
         } else {
@@ -4232,6 +6178,7 @@ impl Website {
                 &client,
                 self.configuration.get_cache_options(),
                 &self.configuration.cache_policy,
+                self.configuration.cache_namespace_str(),
             )
             .await;
 
@@ -4239,18 +6186,16 @@ impl Website {
                 self.insert_signature(sid).await;
             }
 
-            self.insert_link(match &self.on_link_find_callback {
-                Some(cb) => cb(*self.url.to_owned(), None).0,
-                _ => *self.url.to_owned(),
-            })
-            .await;
+            let initial_url = match &self.on_link_find_callback {
+                // Clone the inner CaseInsensitiveString directly instead of
+                // cloning the Box and then deref-moving out of it.
+                Some(cb) => cb((*self.url).clone(), None).0,
+                _ => (*self.url).clone(),
+            };
+            self.insert_link(&initial_url).await;
 
             self.initial_status_code = page.status_code;
-            self.initial_html_length = if page.is_empty() {
-                0
-            } else {
-                page.get_html_bytes_u8().len()
-            };
+            self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
             self.initial_anti_bot_tech = page.anti_bot_tech;
             self.initial_page_should_retry = page.needs_retry();
             self.initial_page_waf_check = page.waf_check;
@@ -4266,7 +6211,7 @@ impl Website {
 
             self.set_crawl_initial_status(&page, &links);
 
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
 
             links
         } else {
@@ -4284,7 +6229,7 @@ impl Website {
         _: &(CompactString, smallvec::SmallVec<[CompactString; 2]>),
         http_worker: bool,
     ) -> HashSet<CaseInsensitiveString> {
-        let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
+        let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
         let expanded = self.get_expanded_links(self.url.inner().as_str());
         self.configuration.configure_allowlist();
 
@@ -4300,13 +6245,14 @@ impl Website {
 
             let mut page = Page::new_page_with_cache(
                 &if http_worker && link.as_ref().starts_with("https") {
-                    link.inner().replacen("https", "http", 1).to_string()
+                    link.inner().replacen("https", "http", 1)
                 } else {
                     link.inner().to_string()
                 },
                 client,
                 self.configuration.get_cache_options(),
                 &self.configuration.cache_policy,
+                self.configuration.cache_namespace_str(),
             )
             .await;
 
@@ -4322,16 +6268,14 @@ impl Website {
                 self.insert_signature(sid).await;
             }
 
-            self.insert_link(link_result.0).await;
+            self.insert_link(&link_result.0).await;
 
             if self.configuration.return_page_links {
                 page.page_links = Some(Default::default());
             }
 
-            channel_send_page(&self.channel, page.clone(), &self.channel_guard);
-
-            let page_links = page.links;
-
+            let page_links = page.links.clone();
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
             links.extend(page_links);
         }
 
@@ -4346,13 +6290,22 @@ impl Website {
         base: &mut RelativeSelectors,
         _: bool,
         page: &chromiumoxide::Page,
+        // Gateway re-acquire inputs — accepted for signature parity with the
+        // non-glob `crawl_establish`; the per-glob-link loop does not yet wire
+        // the re-acquire.
+        _browser: &chromiumoxide::Browser,
+        _browser_dead: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> HashSet<CaseInsensitiveString> {
         if self.skip_initial {
             return Default::default();
         }
-        let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
+        let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
         let expanded = self.get_expanded_links(&self.url.inner().as_str());
         self.configuration.configure_allowlist();
+
+        let return_page_links = self.configuration.return_page_links;
+        let full_resources = self.configuration.full_resources;
+        let skip_links = self.single_page() && !return_page_links;
 
         for link in expanded {
             let allowed = self.is_allowed(&link);
@@ -4364,24 +6317,34 @@ impl Website {
                 continue;
             }
 
-            let mut page = Page::new(
+            // Per-glob-URL streaming pump: same SSG/XML/skip_links
+            // story as the non-glob `crawl_establish`.
+            let mut next_links: HashSet<CaseInsensitiveString> =
+                HashSet::with_capacity(crate::page::link_set_capacity());
+            let mut next_links_pages: Option<HashSet<CaseInsensitiveString>> = if return_page_links
+            {
+                Some(Default::default())
+            } else {
+                None
+            };
+
+            let (mut page, extract_succeeded) = Page::new_streaming(
                 &link.inner().as_str(),
                 &client,
                 &page,
-                &self.configuration.wait_for,
-                &self.configuration.screenshot,
                 false, // we use the initial about:blank page.
-                &self.configuration.openai_config,
-                &self.configuration.execution_scripts,
-                &self.configuration.automation_scripts,
-                &self.configuration.viewport,
-                &self.configuration.request_timeout,
-                &self.configuration.track_events,
                 self.configuration.referer.clone(),
                 self.configuration.max_page_bytes,
                 self.configuration.get_cache_options(),
-                &self.configuration.cache_policy,
-                &self.configuration.remote_multimodal,
+                self.configuration.cache_namespace_str(),
+                &self.configuration.chrome_fetch_params(),
+                &*base,
+                &self.configuration.external_domains_caseless,
+                &mut next_links,
+                &mut next_links_pages,
+                full_resources,
+                skip_links,
+                true,
             )
             .await;
 
@@ -4397,21 +6360,27 @@ impl Website {
                 self.insert_signature(sid).await;
             }
 
-            self.insert_link(link_result.0).await;
+            self.insert_link(&link_result.0).await;
 
-            if self.configuration.return_page_links {
-                page.page_links = Some(Default::default());
-                let next_links = HashSet::from(page.links(&base, &self.domain_parsed).await);
-
-                channel_send_page(&self.channel, page.clone(), &self.channel_guard);
-
-                links.extend(next_links);
+            // Apply streamed page-links + fall back to legacy walk
+            // when streaming declined (redirect-base mismatch, etc.).
+            let next_links = if extract_succeeded {
+                if return_page_links {
+                    page.page_links = next_links_pages.take().map(Box::new);
+                }
+                next_links
             } else {
-                channel_send_page(&self.channel, page.clone(), &self.channel_guard);
-                let next_links = HashSet::from(page.links(&base, &self.domain_parsed).await);
-
-                links.extend(next_links);
-            }
+                if return_page_links {
+                    page.page_links = Some(Default::default());
+                }
+                if skip_links {
+                    Default::default()
+                } else {
+                    HashSet::from(page.links(&base, &self.domain_parsed).await)
+                }
+            };
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
+            links.extend(next_links);
         }
 
         links
@@ -4428,11 +6397,21 @@ impl Website {
         if self.skip_initial {
             return Default::default();
         }
-        let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
+        let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
         let domain_name = self.url.inner();
         let expanded = self.get_expanded_links(domain_name.as_str());
 
         self.configuration.configure_allowlist();
+
+        // In-process fetch engine for the seed fetches (raw glob path).
+        let engine_ref = self.fetch_engine.clone();
+        let engine_cfg = engine_ref
+            .as_ref()
+            .map(|_| std::sync::Arc::new((*self.configuration).clone()));
+        let engine_ctx = match (engine_ref.as_ref(), engine_cfg.as_ref()) {
+            (Some(e), Some(cfg)) => Some(crate::fetch_engine::EngineFetchCtx::new(e, cfg.as_ref())),
+            _ => None,
+        };
 
         for url in expanded {
             #[cfg(feature = "regex")]
@@ -4443,9 +6422,9 @@ impl Website {
                 .is_allowed_default(url_ref)
                 .eq(&ProcessLinkStatus::Allowed)
             {
-                let mut links_ssg = HashSet::new();
+                let mut links_ssg = HashSet::with_capacity(16);
                 let mut links_pages = if self.configuration.return_page_links {
-                    Some(HashSet::new())
+                    Some(HashSet::with_capacity(32))
                 } else {
                     None
                 };
@@ -4455,10 +6434,13 @@ impl Website {
                 page_links_settings.subdomains = self.configuration.subdomains;
                 page_links_settings.tld = self.configuration.tld;
                 page_links_settings.normalize = self.configuration.normalize;
+                // Skip link extraction for single-page crawls unless the user wants page links.
+                page_links_settings.skip_links =
+                    self.single_page() && !self.configuration.return_page_links;
 
                 let mut domain_parsed = self.domain_parsed.take();
 
-                let mut page = Page::new_page_streaming(
+                let mut page = Page::new_page_streaming_engine(
                     &url,
                     client,
                     false,
@@ -4470,6 +6452,8 @@ impl Website {
                     &domain_parsed, // original domain
                     &mut self.domain_parsed,
                     &mut links_pages,
+                    self.configuration.auto_http_first_byte_args(),
+                    engine_ctx,
                 )
                 .await;
 
@@ -4480,20 +6464,70 @@ impl Website {
                     }
                 }
 
-                let mut retry_count = self.configuration.retry;
-                let domains_caseless = &self.configuration.external_domains_caseless;
+                let retry_strategy = self.retry_strategy.clone();
+                let mut retry_count: u32 = match &retry_strategy {
+                    Some(s) => s.max_retries(),
+                    None => self.configuration.retry as u32,
+                };
+                page.proxy_configured = self.configuration.proxies.is_some();
+                let mut attempt: u32 = 0;
 
                 while page.needs_retry() && retry_count > 0 {
                     retry_count -= 1;
-                    if let Some(timeout) = page.get_timeout() {
-                        tokio::time::sleep(timeout).await;
-                    }
+                    attempt += 1;
+
+                    // Consult the retry strategy if set. Scope the outcome
+                    // so it doesn't conflict with apply_directive's &mut self.
+                    let directive = match &retry_strategy {
+                        Some(s) => {
+                            let outcome = crate::retry_strategy::AttemptOutcome {
+                                attempt,
+                                status_code: page.status_code,
+                                should_retry: page.should_retry,
+                                content_truncated: page.content_truncated,
+                                waf_check: page.waf_check,
+                                anti_bot_tech: &page.anti_bot_tech,
+                                proxy_configured: page.proxy_configured,
+                                url: url.inner(),
+                                profile_key: page.profile_key.as_deref(),
+                                html_length: page.size(),
+                                bytes_transferred: page.bytes_transferred,
+                                #[cfg(not(feature = "page_error_status_details"))]
+                                error_status: page.error_status.as_deref(),
+                                #[cfg(feature = "page_error_status_details")]
+                                error_status: None,
+                                final_redirect_destination: page
+                                    .final_redirect_destination
+                                    .as_deref(),
+                            };
+                            Some(s.on_retry(&outcome))
+                        }
+                        None => None,
+                    };
+                    let (directive_backoff, directive_profile_key) = match directive {
+                        Some(d) => {
+                            if !d.should_retry {
+                                break;
+                            }
+                            crate::retry_strategy::apply_directive(self, &d);
+                            (d.backoff, d.profile_key)
+                        }
+                        None => (None, None),
+                    };
+
+                    // Re-borrow after apply_directive to avoid borrow conflicts.
+                    let domains_caseless = &self.configuration.external_domains_caseless;
+                    let status_delay = page.get_timeout().unwrap_or_default();
+                    let backoff = directive_backoff.unwrap_or_else(|| {
+                        crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000)
+                    });
+                    tokio::time::sleep(status_delay.max(backoff)).await;
 
                     if page.status_code == StatusCode::GATEWAY_TIMEOUT {
                         let mut domain_parsed_clone = self.domain_parsed.clone();
 
-                        if let Err(elasped) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
-                            page = Page::new_page_streaming(
+                        if let Err(elapsed) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
+                            page = Page::new_page_streaming_engine(
                                 &url,
                                 client,
                                 false,
@@ -4505,17 +6539,21 @@ impl Website {
                                 &domain_parsed,
                                 &mut domain_parsed_clone,
                                 &mut links_pages,
+                                (None, None),
+                                engine_ctx,
                             )
                             .await;
                         })
                         .await
                         {
-                            log::info!("backoff gateway timeout exceeded {elasped}");
+                            log::info!("backoff gateway timeout exceeded {elapsed}");
+                            page.should_retry = false;
+                            break;
                         }
 
                         self.domain_parsed = domain_parsed_clone;
                     } else {
-                        page = Page::new_page_streaming(
+                        page = Page::new_page_streaming_engine(
                             &url,
                             client,
                             false,
@@ -4527,8 +6565,15 @@ impl Website {
                             &domain_parsed,
                             &mut self.domain_parsed,
                             &mut links_pages,
+                            self.configuration.auto_http_first_byte_args(),
+                            engine_ctx,
                         )
                         .await;
+                    }
+
+                    // Stamp the profile key from the strategy directive.
+                    if let Some(ref pk) = directive_profile_key {
+                        page.profile_key = Some(pk.clone());
                     }
                 }
 
@@ -4541,13 +6586,12 @@ impl Website {
                     self.insert_signature(signature).await;
                 }
 
-                self.insert_link(
-                    self.on_link_find_callback
-                        .as_ref()
-                        .map(|cb| cb(*self.url.clone(), None).0)
-                        .unwrap_or_else(|| *self.url.clone()),
-                )
-                .await;
+                let initial_url = self
+                    .on_link_find_callback
+                    .as_ref()
+                    .map(|cb| cb((*self.url).clone(), None).0)
+                    .unwrap_or_else(|| (*self.url).clone());
+                self.insert_link(&initial_url).await;
 
                 if self.configuration.return_page_links {
                     page.page_links = links_pages.filter(|pages| !pages.is_empty()).map(Box::new);
@@ -4556,11 +6600,7 @@ impl Website {
                 links.extend(links_ssg);
 
                 self.initial_status_code = page.status_code;
-                self.initial_html_length = if page.is_empty() {
-                    0
-                } else {
-                    page.get_html_bytes_u8().len()
-                };
+                self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
                 self.initial_anti_bot_tech = page.anti_bot_tech;
                 self.initial_page_should_retry = page.needs_retry();
                 self.initial_page_waf_check = page.waf_check;
@@ -4570,12 +6610,12 @@ impl Website {
                 if let Some(ref cb) = self.on_should_crawl_callback {
                     if !cb.call(&page) {
                         page.blocked_crawl = true;
-                        channel_send_page(&self.channel, page, &self.channel_guard);
+                        channel_send_page(&self.channel, page, &self.channel_guard).await;
                         return Default::default();
                     }
                 }
 
-                channel_send_page(&self.channel, page, &self.channel_guard);
+                channel_send_page(&self.channel, page, &self.channel_guard).await;
             }
         }
 
@@ -4587,7 +6627,7 @@ impl Website {
     pub async fn crawl_establish_smart(
         &mut self,
         client: &Client,
-        mut base: &mut RelativeSelectors,
+        base: &mut RelativeSelectors,
         browser: &crate::features::chrome::OnceBrowser,
     ) -> HashSet<CaseInsensitiveString> {
         if self.skip_initial {
@@ -4595,7 +6635,7 @@ impl Website {
         }
 
         let links: HashSet<CaseInsensitiveString> = if self
-            .is_allowed_default(&self.get_base_link())
+            .is_allowed_default(self.get_base_link())
             .eq(&ProcessLinkStatus::Allowed)
         {
             let url = self.url.inner();
@@ -4604,21 +6644,75 @@ impl Website {
                 seeded_page
             } else {
                 Page::new_page_with_cache(
-                    &url,
-                    &client,
+                    url,
+                    client,
                     self.configuration.get_cache_options(),
                     &self.configuration.cache_policy,
+                    self.configuration.cache_namespace_str(),
                 )
                 .await
             };
 
-            let mut retry_count = self.configuration.retry;
+            let retry_strategy = self.retry_strategy.clone();
+            let mut retry_count: u32 = match &retry_strategy {
+                Some(s) => s.max_retries(),
+                None => self.configuration.retry as u32,
+            };
+            page.proxy_configured = self.configuration.proxies.is_some();
+            let mut attempt: u32 = 0;
+            // Track whether the loop already invoked chrome. Smart mode's
+            // post-loop transport-failure fallback (below) must not double
+            // invoke chrome when the retry budget already covered it.
+            let mut chrome_attempted = false;
 
             while page.needs_retry() && retry_count > 0 {
                 retry_count -= 1;
-                if let Some(timeout) = page.get_timeout() {
-                    tokio::time::sleep(timeout).await;
-                }
+                attempt += 1;
+
+                // Consult the retry strategy if set. Scope the outcome
+                // so it doesn't conflict with apply_directive's &mut self.
+                let directive = match &retry_strategy {
+                    Some(s) => {
+                        let outcome = crate::retry_strategy::AttemptOutcome {
+                            attempt,
+                            status_code: page.status_code,
+                            should_retry: page.should_retry,
+                            content_truncated: page.content_truncated,
+                            waf_check: page.waf_check,
+                            anti_bot_tech: &page.anti_bot_tech,
+                            proxy_configured: page.proxy_configured,
+                            url: self.url.inner(),
+                            profile_key: page.profile_key.as_deref(),
+                            html_length: page.size(),
+                            bytes_transferred: page.bytes_transferred,
+                            #[cfg(not(feature = "page_error_status_details"))]
+                            error_status: page.error_status.as_deref(),
+                            #[cfg(feature = "page_error_status_details")]
+                            error_status: None,
+                            final_redirect_destination: page.final_redirect_destination.as_deref(),
+                        };
+                        Some(s.on_retry(&outcome))
+                    }
+                    None => None,
+                };
+                let (directive_backoff, directive_profile_key) = match directive {
+                    Some(d) => {
+                        if !d.should_retry {
+                            break;
+                        }
+                        crate::retry_strategy::apply_directive(self, &d);
+                        (d.backoff, d.profile_key)
+                    }
+                    None => (None, None),
+                };
+
+                // Re-borrow url after apply_directive to avoid borrow conflicts.
+                let url = self.url.inner();
+                let status_delay = page.get_timeout().unwrap_or_default();
+                let backoff = directive_backoff.unwrap_or_else(|| {
+                    crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000)
+                });
+                tokio::time::sleep(status_delay.max(backoff)).await;
                 let client_error = page.status_code.is_client_error();
 
                 if page.status_code == StatusCode::GATEWAY_TIMEOUT {
@@ -4633,12 +6727,14 @@ impl Website {
                                 browser,
                             )
                             .await;
+                            chrome_attempted = true;
                         } else {
                             let next_page = Page::new_page_with_cache(
                                 url,
-                                &client,
+                                client,
                                 self.configuration.get_cache_options(),
                                 &self.configuration.cache_policy,
+                                self.configuration.cache_namespace_str(),
                             )
                             .await;
                             page = next_page;
@@ -4648,64 +6744,112 @@ impl Website {
                     {
                         log::warn!("backoff timeout {elasped}");
                     }
+                } else if retry_count.is_power_of_two() || client_error {
+                    Website::render_chrome_page(
+                        &self.configuration,
+                        client,
+                        &mut page,
+                        url,
+                        &self.domain_parsed,
+                        browser,
+                    )
+                    .await;
+                    chrome_attempted = true;
                 } else {
-                    if retry_count.is_power_of_two() || client_error {
-                        Website::render_chrome_page(
-                            &self.configuration,
-                            client,
-                            &mut page,
-                            url,
-                            &self.domain_parsed,
-                            browser,
-                        )
-                        .await
-                    } else {
-                        page = Page::new_page_with_cache(
-                            url,
-                            &client,
-                            self.configuration.get_cache_options(),
-                            &self.configuration.cache_policy,
-                        )
-                        .await;
-                    }
+                    page = Page::new_page_with_cache(
+                        url,
+                        client,
+                        self.configuration.get_cache_options(),
+                        &self.configuration.cache_policy,
+                        self.configuration.cache_namespace_str(),
+                    )
+                    .await;
+                }
+
+                // Stamp the profile key from the strategy directive.
+                if let Some(ref pk) = directive_profile_key {
+                    page.profile_key = Some(pk.clone());
                 }
             }
 
-            let (page_links, bytes_transferred): (HashSet<CaseInsensitiveString>, Option<f64>) =
-                page.smart_links(
-                    &base,
+            // Smart-mode chrome fallback for transport-level HTTP failures.
+            // When the initial HTTP fetch produces no usable content (TLS
+            // handshake failure on a cert/SAN mismatch — e.g. `www.host.io`
+            // whose cert is only valid for the bare host but redirects 301
+            // → bare host on the first byte; connection refused; SOCKS
+            // tunnel failure; etc.) the retry loop above never runs at the
+            // default `retry=0`, and even at `retry=1` its power-of-two
+            // heuristic does not trigger chrome on a 5xx (`is_power_of_two(0)
+            // == false`). Smart mode's "HTTP first, JS rendering as needed"
+            // contract degrades to plain HTTP-only without this guarantee.
+            // Run exactly one chrome attempt — chrome's broader protocol
+            // tolerance (`--ignore-certificate-errors`, redirect following
+            // before TLS verification, etc.) recovers many cases reqwest's
+            // strict TLS rejects.
+            //
+            // **Performance contract**: skipped on every success path. The
+            // double gate (`needs_retry` AND `is_empty`) excludes legitimate
+            // empty 200s (e.g. HEAD-style endpoints, beacon URLs) from
+            // triggering an unwanted chrome navigation. Skipped when the
+            // loop already invoked chrome to avoid duplicate work.
+            if !chrome_attempted && page.needs_retry() && page.is_empty() {
+                let fallback_url = self.url.inner();
+                Website::render_chrome_page(
                     &self.configuration,
+                    client,
+                    &mut page,
+                    fallback_url,
                     &self.domain_parsed,
-                    &browser,
-                    Some(&self.cookie_jar),
+                    browser,
                 )
                 .await;
+            }
 
-            if let Some(domain) = &page.final_redirect_destination {
+            // Apply the redirect-aware selector update BEFORE link extraction
+            // so site-relative hrefs (e.g. `/foo`) resolve against the rendered
+            // page's host, not the original input host. Without this, a 301 from
+            // `fleet.io` → `www.fleetio.com` left every extracted `/path` link
+            // pointing at the pre-redirect host (which then 404s).
+            if let Some(domain) = page.final_redirect_destination.as_deref() {
+                let domain_owned = domain.to_string();
                 let prior_domain = self.domain_parsed.take();
                 crate::utils::modify_selectors(
                     &prior_domain,
-                    domain,
+                    &domain_owned,
                     &mut self.domain_parsed,
                     &mut self.url,
-                    &mut base,
+                    base,
                     AllowedDomainTypes::new(self.configuration.subdomains, self.configuration.tld),
                 );
             }
 
-            emit_log(&self.url.inner());
+            // Skip link extraction for single-page crawls unless the user wants page links.
+            let (page_links, bytes_transferred): (HashSet<CaseInsensitiveString>, Option<f64>) =
+                if self.single_page() && !self.configuration.return_page_links {
+                    (Default::default(), None)
+                } else {
+                    page.smart_links(
+                        base,
+                        &self.configuration,
+                        &self.domain_parsed,
+                        browser,
+                        Some(&self.cookie_jar),
+                    )
+                    .await
+                };
+
+            emit_log(self.url.inner());
 
             if let Some(sid) = page.signature {
                 self.insert_signature(sid).await;
             }
 
-            self.insert_link(
-                self.on_link_find_callback
-                    .as_ref()
-                    .map(|cb| cb(*self.url.clone(), None).0)
-                    .unwrap_or_else(|| *self.url.clone()),
-            )
-            .await;
+            let initial_url = self
+                .on_link_find_callback
+                .as_ref()
+                .map(|cb| cb((*self.url).clone(), None).0)
+                .unwrap_or_else(|| (*self.url).clone());
+            self.insert_link(&initial_url).await;
 
             let links = if !page_links.is_empty() {
                 page_links
@@ -4716,11 +6860,7 @@ impl Website {
             page.bytes_transferred = bytes_transferred;
 
             self.initial_status_code = page.status_code;
-            self.initial_html_length = if page.is_empty() {
-                0
-            } else {
-                page.get_html_bytes_u8().len()
-            };
+            self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
             self.initial_anti_bot_tech = page.anti_bot_tech;
             self.initial_page_should_retry = page.needs_retry();
             self.initial_page_waf_check = page.waf_check;
@@ -4738,12 +6878,12 @@ impl Website {
             if let Some(cb) = &mut self.on_should_crawl_callback {
                 if !cb.call(&page) {
                     page.blocked_crawl = true;
-                    channel_send_page(&self.channel, page, &self.channel_guard);
+                    channel_send_page(&self.channel, page, &self.channel_guard).await;
                     return Default::default();
                 }
             }
 
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
 
             links
         } else {
@@ -4764,7 +6904,7 @@ impl Website {
         browser: &crate::features::chrome::OnceBrowser,
     ) {
         if let Some(browser_controller) = browser
-            .get_or_init(|| crate::website::Website::setup_browser_base(&config, &base, None))
+            .get_or_init(|| crate::website::Website::setup_browser_base(config, base, None))
             .await
         {
             if let Ok(chrome_page) = crate::features::chrome::attempt_navigation(
@@ -4776,35 +6916,34 @@ impl Website {
             )
             .await
             {
+                // Close this render tab on every exit path (success, error,
+                // panic, cancellation). `chrome_page` is local to this block —
+                // its rendered content is moved into the spider `Page` — so the
+                // guard hands the tab to the background tab-closer on drop;
+                // without it the CDP target leaks per smart fallback render.
+                let _tab_guard = crate::features::chrome::TabCloseGuard::new(chrome_page.clone());
+
                 let (_, intercept_handle) = tokio::join!(
-                    crate::features::chrome::setup_chrome_events(&chrome_page, &config),
+                    crate::features::chrome::setup_chrome_events(&chrome_page, config),
                     crate::features::chrome::setup_chrome_interception_base(
                         &chrome_page,
                         config.chrome_intercept.enabled,
                         &config.auth_challenge_response,
                         config.chrome_intercept.block_visuals,
-                        &url,
+                        url,
                     )
                 );
 
                 let next_page = Page::new(
-                    &url,
-                    &client,
+                    url,
+                    client,
                     &chrome_page,
-                    &config.wait_for,
-                    &config.screenshot,
                     false, // we use the initial about:blank page.
-                    &config.openai_config,
-                    &config.execution_scripts,
-                    &config.automation_scripts,
-                    &config.viewport,
-                    &config.request_timeout,
-                    &config.track_events,
                     config.referer.clone(),
                     config.max_page_bytes,
                     config.get_cache_options(),
-                    &config.cache_policy,
-                    &config.remote_multimodal,
+                    config.cache_namespace_str(),
+                    &config.chrome_fetch_params(),
                 )
                 .await;
 
@@ -4824,7 +6963,17 @@ impl Website {
     }
 
     /// Set the crawl status depending on crawl state. The crawl that only changes if the state is Start or Active.
+    ///
+    /// This is the common completion point of every public `crawl*` entry point
+    /// (and therefore of every `scrape*`, which drives an inner `crawl*`), so it
+    /// also releases the broadcast backlog and reports any pages dropped by
+    /// `SPIDER_MAX_RETAINED_PAGES`. `subscription_guard` has already run by the
+    /// time we get here, so releasing the placeholder receiver cannot affect its
+    /// `receiver_count()` check.
     pub fn set_crawl_status(&mut self) {
+        self.release_channel_backlog();
+        report_dropped_pages();
+
         if self.status == CrawlStatus::Start || self.status == CrawlStatus::Active {
             self.status = if self.domain_parsed.is_none() {
                 CrawlStatus::Invalid
@@ -4835,7 +6984,20 @@ impl Website {
     }
 
     /// Setup the Semaphore for the crawl.
+    ///
+    /// Resolution order:
+    /// 1. An externally-owned adaptive semaphore set via
+    ///    [`Self::with_concurrency_semaphore`] /
+    ///    [`Self::with_adaptive_concurrency`]. Lets an admission
+    ///    controller resize concurrency mid-crawl through
+    ///    [`crate::utils::adaptive_concurrency::AdaptiveSemaphore`].
+    /// 2. The shared global semaphore when `shared_queue` is on.
+    /// 3. A fresh `Semaphore` sized to `configuration.concurrency_limit`
+    ///    (or `DEFAULT_PERMITS`). Byte-for-byte the pre-adaptive path.
     pub fn setup_semaphore(&self) -> Arc<Semaphore> {
+        if let Some(sem) = self.adaptive_concurrency_semaphore.as_ref() {
+            return Arc::clone(sem);
+        }
         if self.configuration.shared_queue {
             SEM_SHARED.clone()
         } else {
@@ -4845,6 +7007,83 @@ impl Website {
                     .unwrap_or(*DEFAULT_PERMITS),
             ))
         }
+    }
+
+    /// `true` when this `Website` has any per-website worker URL override set
+    /// (crawl or scraper). When `false`, the legacy global `WORKERS`/`SEM`
+    /// path is taken (byte-identical to pre-override behavior).
+    #[cfg(feature = "decentralized")]
+    #[inline]
+    pub(crate) fn has_worker_override(&self) -> bool {
+        self.configuration.worker_connection_urls.is_some()
+            || self.configuration.scraper_worker_connection_urls.is_some()
+    }
+
+    /// Resolved, trimmed, deduplicated combined (scraper + crawl) worker
+    /// proxy URLs for this `Website`. Only meaningful when
+    /// `has_worker_override()` is `true`. Order mirrors the legacy
+    /// `WORKERS` set iteration semantics: scraper URLs first, then crawl
+    /// URLs, with later duplicates dropped.
+    ///
+    /// Allocates a fresh `Vec` per call; not on a hot path (called once
+    /// per HTTP client build / crawl entry).
+    #[cfg(feature = "decentralized")]
+    fn override_proxy_urls(&self) -> Vec<String> {
+        let scraper = self
+            .configuration
+            .scraper_worker_connection_urls
+            .as_deref()
+            .unwrap_or(&[]);
+        let crawl = self
+            .configuration
+            .worker_connection_urls
+            .as_deref()
+            .unwrap_or(&[]);
+
+        let mut out: Vec<String> = Vec::with_capacity(scraper.len() + crawl.len());
+        let mut seen: HashSet<String> = HashSet::with_capacity(scraper.len() + crawl.len());
+
+        for url in scraper.iter().chain(crawl.iter()) {
+            let url = url.trim();
+            if url.is_empty() {
+                continue;
+            }
+            if seen.insert(url.to_string()) {
+                out.push(url.to_string());
+            }
+        }
+
+        out
+    }
+
+    /// `true` when this `Website`'s crawl worker pool routes traffic
+    /// through an `http:`-prefixed worker URL. Used by the decentralized
+    /// crawl loop to flip the `https`→`http` scheme rewrite. Falls back
+    /// to the existing `SPIDER_WORKER` env-var sniff when no per-website
+    /// override is set (byte-identical to pre-override behavior).
+    #[cfg(feature = "decentralized")]
+    fn http_worker_active(&self) -> bool {
+        match self.configuration.worker_connection_urls.as_deref() {
+            Some(urls) => urls.iter().any(|u| u.trim().starts_with("http:")),
+            None => std::env::var("SPIDER_WORKER")
+                .unwrap_or_else(|_| "http:".to_string())
+                .starts_with("http:"),
+        }
+    }
+
+    /// Per-website override semaphore for the decentralized crawl loop.
+    /// `None` when no override is set (caller falls back to the
+    /// process-wide `SEM`). When `Some`, sized as
+    /// `calc_limits(3) * combined_worker_count.max(1)` to mirror the
+    /// global `SEM` sizing formula for byte-identical concurrency under
+    /// the same effective worker count.
+    #[cfg(feature = "decentralized")]
+    fn override_worker_semaphore(&self) -> Option<Arc<Semaphore>> {
+        if !self.has_worker_override() {
+            return None;
+        }
+        let count = self.override_proxy_urls().len().max(1);
+        Some(Arc::new(Semaphore::const_new(calc_limits(3) * count)))
     }
 
     /// Fast path: serve single-page crawl from cache, bypassing ALL heavy setup.
@@ -4875,23 +7114,20 @@ impl Website {
             &target_url,
             cache_options.as_ref(),
             &self.configuration.cache_policy,
+            self.configuration.cache_namespace_str(),
         )
         .await
         {
             self.status = CrawlStatus::Active;
             let mut page_response =
-                crate::utils::build_cached_html_page_response(&target_url, &html);
+                crate::utils::build_cached_html_page_response(&target_url, html);
             self.apply_custom_antibot_check(&mut page_response);
             let page = build(&target_url, page_response);
             self.initial_status_code = page.status_code;
-            self.initial_html_length = if page.is_empty() {
-                0
-            } else {
-                page.get_html_bytes_u8().len()
-            };
+            self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
             self.links_visited
                 .insert(CaseInsensitiveString::from(target_url.as_str()));
-            channel_send_page(&self.channel, page, &self.channel_guard);
+            channel_send_page(&self.channel, page, &self.channel_guard).await;
             self.subscription_guard().await;
             return true;
         }
@@ -4935,6 +7171,7 @@ impl Website {
             &target_url,
             cache_options.as_ref(),
             &self.configuration.cache_policy,
+            self.configuration.cache_namespace_str(),
         )
         .await
         {
@@ -4949,7 +7186,7 @@ impl Website {
         let normalize = self.configuration.normalize;
 
         // Build page from cached HTML
-        let mut page_response = build_cached_html_page_response(&target_url, &html);
+        let mut page_response = build_cached_html_page_response(&target_url, html);
         self.apply_custom_antibot_check(&mut page_response);
         let mut page = build(&target_url, page_response);
 
@@ -4962,7 +7199,11 @@ impl Website {
         }
 
         let page_base = page.base.take().map(Box::new);
-        let mut links: HashSet<CaseInsensitiveString> = if full_resources {
+        // Skip link extraction for single-page crawls unless the user wants page links.
+        let skip_links = self.single_page() && !return_page_links;
+        let mut links: HashSet<CaseInsensitiveString> = if skip_links {
+            Default::default()
+        } else if full_resources {
             page.links_full(&selectors, &page_base).await
         } else {
             page.links(&selectors, &page_base).await
@@ -4976,17 +7217,13 @@ impl Website {
 
         // Set initial metadata
         self.initial_status_code = page.status_code;
-        self.initial_html_length = if page.is_empty() {
-            0
-        } else {
-            page.get_html_bytes_u8().len()
-        };
+        self.initial_html_length = if page.is_empty() { 0 } else { page.size() };
 
         let url = match &self.on_link_find_callback {
-            Some(cb) => cb(*self.url.clone(), None).0,
-            _ => *self.url.clone(),
+            Some(cb) => cb((*self.url).clone(), None).0,
+            _ => (*self.url).clone(),
         };
-        self.insert_link(url).await;
+        self.insert_link(&url).await;
         self.links_visited
             .insert(CaseInsensitiveString::from(target_url.as_str()));
 
@@ -4995,7 +7232,7 @@ impl Website {
         if normalize {
             if let Some(sig) = page.signature {
                 if !self.is_signature_allowed(sig).await {
-                    channel_send_page(&self.channel, page, &self.channel_guard);
+                    channel_send_page(&self.channel, page, &self.channel_guard).await;
                     self.subscription_guard().await;
                     return true;
                 }
@@ -5008,13 +7245,13 @@ impl Website {
         if let Some(ref cb) = self.on_should_crawl_callback {
             if !cb.call(&page) {
                 page.blocked_crawl = true;
-                channel_send_page(&self.channel, page, &self.channel_guard);
+                channel_send_page(&self.channel, page, &self.channel_guard).await;
                 self.subscription_guard().await;
                 return true; // blocked, but cache phase handled it
             }
         }
 
-        channel_send_page(&self.channel, page, &self.channel_guard);
+        channel_send_page(&self.channel, page, &self.channel_guard).await;
 
         // If single_page, we're done
         if self.single_page() {
@@ -5026,7 +7263,7 @@ impl Website {
         let mut cache_misses: HashSet<CaseInsensitiveString> = HashSet::new();
 
         'cache_loop: loop {
-            let current_links: Vec<CaseInsensitiveString> = links.drain().collect();
+            let current_links = std::mem::take(&mut links);
             if current_links.is_empty() {
                 break;
             }
@@ -5046,15 +7283,18 @@ impl Website {
                     &link_url,
                     cache_options.as_ref(),
                     &self.configuration.cache_policy,
+                    self.configuration.cache_namespace_str(),
                 )
                 .await
                 {
                     Some(cached_html) => {
                         emit_log(&link_url);
-                        self.insert_link(link.clone()).await;
+                        // `is_allowed` above already probed the visited set and
+                        // nothing between the two can insert (`&mut self`).
+                        self.insert_link_unchecked(&link).await;
 
                         let mut page_response =
-                            build_cached_html_page_response(&link_url, &cached_html);
+                            build_cached_html_page_response(&link_url, cached_html);
                         self.apply_custom_antibot_check(&mut page_response);
                         let mut page = build(&link_url, page_response);
 
@@ -5088,12 +7328,12 @@ impl Website {
                         if let Some(ref cb) = self.on_should_crawl_callback {
                             if !cb.call(&page) {
                                 page.blocked_crawl = true;
-                                channel_send_page(&self.channel, page, &self.channel_guard);
+                                channel_send_page(&self.channel, page, &self.channel_guard).await;
                                 continue;
                             }
                         }
 
-                        channel_send_page(&self.channel, page, &self.channel_guard);
+                        channel_send_page(&self.channel, page, &self.channel_guard).await;
                         // Add newly discovered links for further cache processing
                         links.extend(new_links);
                     }
@@ -5107,7 +7347,7 @@ impl Website {
 
         // If there are cache misses, put them in extra_links for Chrome/HTTP
         if !cache_misses.is_empty() {
-            self.extra_links.extend(cache_misses);
+            self.extra_links_extend(cache_misses);
             return false; // Need Chrome/HTTP for remaining links
         }
 
@@ -5127,57 +7367,73 @@ impl Website {
 
     /// Start to crawl website with async concurrency.
     pub async fn crawl(&mut self) {
-        if !self.status.eq(&CrawlStatus::FirewallBlocked) {
-            self.start();
-            if self.try_cache_shortcircuit().await {
+        #[cfg(feature = "balance")]
+        let __spool_arc = self.ensure_spool_dir();
+        let __body = async {
+            if !self.status.eq(&CrawlStatus::FirewallBlocked) {
+                self.start();
+                if self.try_cache_shortcircuit().await {
+                    self.set_crawl_status();
+                    return;
+                }
+                let (client, handle) = self.setup().await;
+                let (handle, control_guard) = match handle {
+                    Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
+                    _ => (None, None),
+                };
+                let crawl_timeout = self.configuration.crawl_timeout;
+                let url = self.url.inner().to_string();
+                run_with_crawl_timeout(crawl_timeout, &url, async {
+                    self.crawl_concurrent(&client, &handle).await;
+                    self.sitemap_crawl_chain(&client, &handle, false).await;
+                })
+                .await;
                 self.set_crawl_status();
-                return;
+                drop(control_guard);
+                self.client.replace(client);
             }
-            let (client, handle) = self.setup().await;
-            let (handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
-                _ => (None, None),
-            };
-            let crawl_timeout = self.configuration.crawl_timeout;
-            let url = self.url.inner().to_string();
-            run_with_crawl_timeout(crawl_timeout, &url, async {
-                self.crawl_concurrent(&client, &handle).await;
-                self.sitemap_crawl_chain(&client, &handle, false).await;
-            })
+        };
+        #[cfg(feature = "balance")]
+        crate::utils::html_spool::WEBSITE_SPOOL_DIR
+            .scope(__spool_arc, __body)
             .await;
-            self.set_crawl_status();
-            if let Some(h) = join_handle {
-                h.abort()
-            }
-            self.client.replace(client);
-        }
+        #[cfg(not(feature = "balance"))]
+        __body.await;
     }
 
     /// Start to crawl website with async concurrency using the sitemap. This does not page forward into the request. This does nothing without the `sitemap` flag enabled.
     pub async fn crawl_sitemap(&mut self) {
-        if !self.status.eq(&CrawlStatus::FirewallBlocked) {
-            self.start();
-            if self.try_cache_shortcircuit().await {
+        #[cfg(feature = "balance")]
+        let __spool_arc = self.ensure_spool_dir();
+        let __body = async {
+            if !self.status.eq(&CrawlStatus::FirewallBlocked) {
+                self.start();
+                if self.try_cache_shortcircuit().await {
+                    self.set_crawl_status();
+                    return;
+                }
+                let (client, handle) = self.setup().await;
+                let (handle, control_guard) = match handle {
+                    Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
+                    _ => (None, None),
+                };
+                let crawl_timeout = self.configuration.crawl_timeout;
+                let url = self.url.inner().to_string();
+                run_with_crawl_timeout(crawl_timeout, &url, async {
+                    self.sitemap_crawl(&client, &handle, false).await;
+                })
+                .await;
                 self.set_crawl_status();
-                return;
+                drop(control_guard);
+                self.client.replace(client);
             }
-            let (client, handle) = self.setup().await;
-            let (handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
-                _ => (None, None),
-            };
-            let crawl_timeout = self.configuration.crawl_timeout;
-            let url = self.url.inner().to_string();
-            run_with_crawl_timeout(crawl_timeout, &url, async {
-                self.sitemap_crawl(&client, &handle, false).await;
-            })
+        };
+        #[cfg(feature = "balance")]
+        crate::utils::html_spool::WEBSITE_SPOOL_DIR
+            .scope(__spool_arc, __body)
             .await;
-            self.set_crawl_status();
-            if let Some(h) = join_handle {
-                h.abort()
-            }
-            self.client.replace(client);
-        }
+        #[cfg(not(feature = "balance"))]
+        __body.await;
     }
 
     /// Start to crawl website with async concurrency using the sitemap. This does not page forward into the request. This does nothing without the `sitemap` and the `chrome` flag enabled.
@@ -5187,32 +7443,44 @@ impl Website {
         not(feature = "decentralized")
     ))]
     pub async fn crawl_sitemap_chrome(&mut self) {
-        if !self.status.eq(&CrawlStatus::FirewallBlocked) {
-            self.start();
-            let (client, handle) = self.setup().await;
-            let (handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
-                _ => (None, None),
-            };
-            let crawl_timeout = self.configuration.crawl_timeout;
-            let url = self.url.inner().to_string();
-            run_with_crawl_timeout(crawl_timeout, &url, async {
-                self.sitemap_crawl_chrome(&client, &handle, false).await;
-            })
-            .await;
-            self.set_crawl_status();
-            if let Some(h) = join_handle {
-                h.abort()
+        #[cfg(feature = "balance")]
+        let __spool_arc = self.ensure_spool_dir();
+        let __body = async {
+            if !self.status.eq(&CrawlStatus::FirewallBlocked) {
+                self.start();
+                let (client, handle) = self.setup().await;
+                let (handle, control_guard) = match handle {
+                    Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
+                    _ => (None, None),
+                };
+                let crawl_timeout = self.configuration.crawl_timeout;
+                let url = self.url.inner().to_string();
+                run_with_crawl_timeout(crawl_timeout, &url, async {
+                    self.sitemap_crawl_chrome(&client, &handle, false).await;
+                })
+                .await;
+                self.set_crawl_status();
+                drop(control_guard);
+                self.client.replace(client);
             }
-            self.client.replace(client);
-        }
+        };
+        #[cfg(feature = "balance")]
+        crate::utils::html_spool::WEBSITE_SPOOL_DIR
+            .scope(__spool_arc, __body)
+            .await;
+        #[cfg(not(feature = "balance"))]
+        __body.await;
     }
 
     /// Configures the website crawling process for concurrent execution with the ability to send it across threads for subscriptions.
     pub async fn configure_setup(&mut self) {
         self.status = CrawlStatus::Active;
         self.start();
-        self.setup().await;
+        let (_, handler) = self.setup().await;
+        // Send crawls create their own controller; setup must not detach one.
+        if let Some((_, task)) = handler {
+            task.abort();
+        }
         self.configuration.configure_allowlist();
         self.send_configured = true;
     }
@@ -5222,7 +7490,11 @@ impl Website {
     pub fn configure_setup_norobots(&mut self) {
         self.status = CrawlStatus::Active;
         self.start();
-        self.setup_base();
+        let (_, handler) = self.setup_base();
+        // Send crawls create their own controller; setup must not detach one.
+        if let Some((_, task)) = handler {
+            task.abort();
+        }
         self.configuration.configure_allowlist();
         self.send_configured = true;
     }
@@ -5233,28 +7505,36 @@ impl Website {
     /// It checks the status to ensure it is not firewall-blocked before proceeding with concurrent crawling.
     /// You can pass in a manual url in order to setup a new crawl directly with pre-configurations ready.
     pub async fn crawl_raw_send(&self, url: Option<&str>) {
-        if !self.status.eq(&CrawlStatus::FirewallBlocked) {
-            let (client, handle) = (
-                match &self.client {
-                    Some(c) => c.to_owned(),
-                    _ => self.configure_http_client(),
-                },
-                self.configure_handler(),
-            );
-            let (handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
-                _ => (None, None),
-            };
-            let crawl_timeout = self.configuration.crawl_timeout;
-            let u = self.url.inner().to_string();
-            run_with_crawl_timeout(crawl_timeout, &u, async {
-                self.crawl_concurrent_raw_send(&client, &handle, &url).await;
-            })
-            .await;
-            if let Some(h) = join_handle {
-                h.abort()
+        #[cfg(feature = "balance")]
+        let __spool_arc = self.ensure_spool_dir();
+        let __body = async {
+            if !self.status.eq(&CrawlStatus::FirewallBlocked) {
+                let (client, handle) = (
+                    match &self.client {
+                        Some(c) => c.to_owned(),
+                        _ => self.configure_http_client(),
+                    },
+                    self.configure_handler(),
+                );
+                let (handle, control_guard) = match handle {
+                    Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
+                    _ => (None, None),
+                };
+                let crawl_timeout = self.configuration.crawl_timeout;
+                let u = self.url.inner().to_string();
+                run_with_crawl_timeout(crawl_timeout, &u, async {
+                    self.crawl_concurrent_raw_send(&client, &handle, &url).await;
+                })
+                .await;
+                drop(control_guard);
             }
-        }
+        };
+        #[cfg(feature = "balance")]
+        crate::utils::html_spool::WEBSITE_SPOOL_DIR
+            .scope(__spool_arc, __body)
+            .await;
+        #[cfg(not(feature = "balance"))]
+        __body.await;
     }
 
     #[cfg(all(feature = "chrome", not(feature = "decentralized")))]
@@ -5262,28 +7542,36 @@ impl Website {
     /// Use `website.configure_setup().await` before executing this function to re-use the initial setup.
     /// You can pass in a manual url in order to setup a new crawl directly with pre-configurations ready.
     pub async fn crawl_chrome_send(&self, url: Option<&str>) {
-        if !self.status.eq(&CrawlStatus::FirewallBlocked) {
-            let (client, handle) = (
-                match &self.client {
-                    Some(c) => c.to_owned(),
-                    _ => self.configure_http_client(),
-                },
-                self.configure_handler(),
-            );
-            let (handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
-                _ => (None, None),
-            };
-            let crawl_timeout = self.configuration.crawl_timeout;
-            let u = self.url.inner().to_string();
-            run_with_crawl_timeout(crawl_timeout, &u, async {
-                self.crawl_concurrent_send(&client, &handle, &url).await;
-            })
-            .await;
-            if let Some(h) = join_handle {
-                h.abort()
+        #[cfg(feature = "balance")]
+        let __spool_arc = self.ensure_spool_dir();
+        let __body = async {
+            if !self.status.eq(&CrawlStatus::FirewallBlocked) {
+                let (client, handle) = (
+                    match &self.client {
+                        Some(c) => c.to_owned(),
+                        _ => self.configure_http_client(),
+                    },
+                    self.configure_handler(),
+                );
+                let (handle, control_guard) = match handle {
+                    Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
+                    _ => (None, None),
+                };
+                let crawl_timeout = self.configuration.crawl_timeout;
+                let u = self.url.inner().to_string();
+                run_with_crawl_timeout(crawl_timeout, &u, async {
+                    self.crawl_concurrent_send(&client, &handle, &url).await;
+                })
+                .await;
+                drop(control_guard);
             }
-        }
+        };
+        #[cfg(feature = "balance")]
+        crate::utils::html_spool::WEBSITE_SPOOL_DIR
+            .scope(__spool_arc, __body)
+            .await;
+        #[cfg(not(feature = "balance"))]
+        __body.await;
     }
 
     #[cfg(all(feature = "chrome", feature = "decentralized"))]
@@ -5301,14 +7589,12 @@ impl Website {
                 },
                 self.configure_handler(),
             );
-            let (_handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
+            let (_handle, control_guard) = match handle {
+                Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
                 _ => (None, None),
             };
             self._fetch_chrome(&client, &url).await;
-            if let Some(h) = join_handle {
-                h.abort()
-            }
+            drop(control_guard);
         }
     }
 
@@ -5327,14 +7613,12 @@ impl Website {
                 },
                 self.configure_handler(),
             );
-            let (_handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
+            let (_handle, control_guard) = match handle {
+                Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
                 _ => (None, None),
             };
             self._fetch_chrome_persisted(&client, &url, browser).await;
-            if let Some(h) = join_handle {
-                h.abort()
-            }
+            drop(control_guard);
         }
     }
 
@@ -5353,29 +7637,37 @@ impl Website {
     #[cfg(all(not(feature = "decentralized"), feature = "smart"))]
     /// Start to crawl website with async concurrency smart. Use HTTP first and JavaScript Rendering as needed. This has no effect without the `smart` flag enabled.
     pub async fn crawl_smart(&mut self) {
-        if !self.status.eq(&CrawlStatus::FirewallBlocked) {
-            self.start();
-            if self.try_cache_shortcircuit().await {
+        #[cfg(feature = "balance")]
+        let __spool_arc = self.ensure_spool_dir();
+        let __body = async {
+            if !self.status.eq(&CrawlStatus::FirewallBlocked) {
+                self.start();
+                if self.try_cache_shortcircuit().await {
+                    self.set_crawl_status();
+                    return;
+                }
+                let (client, handle) = self.setup().await;
+                let (handle, control_guard) = match handle {
+                    Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
+                    _ => (None, None),
+                };
+                let crawl_timeout = self.configuration.crawl_timeout;
+                let url = self.url.inner().to_string();
+                run_with_crawl_timeout(crawl_timeout, &url, async {
+                    self.crawl_concurrent_smart(&client, &handle).await;
+                })
+                .await;
                 self.set_crawl_status();
-                return;
+                drop(control_guard);
+                self.client.replace(client);
             }
-            let (client, handle) = self.setup().await;
-            let (handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
-                _ => (None, None),
-            };
-            let crawl_timeout = self.configuration.crawl_timeout;
-            let url = self.url.inner().to_string();
-            run_with_crawl_timeout(crawl_timeout, &url, async {
-                self.crawl_concurrent_smart(&client, &handle).await;
-            })
+        };
+        #[cfg(feature = "balance")]
+        crate::utils::html_spool::WEBSITE_SPOOL_DIR
+            .scope(__spool_arc, __body)
             .await;
-            self.set_crawl_status();
-            if let Some(h) = join_handle {
-                h.abort()
-            }
-            self.client.replace(client);
-        }
+        #[cfg(not(feature = "balance"))]
+        __body.await;
     }
 
     #[cfg(all(not(feature = "decentralized"), not(feature = "smart")))]
@@ -5386,41 +7678,71 @@ impl Website {
 
     /// Start to crawl website with async concurrency using the base raw functionality. Useful when using the `chrome` feature and defaulting to the basic implementation.
     pub async fn crawl_raw(&mut self) {
-        if !self.status.eq(&CrawlStatus::FirewallBlocked) {
-            self.start();
-            if self.try_cache_shortcircuit().await {
+        #[cfg(feature = "balance")]
+        let __spool_arc = self.ensure_spool_dir();
+        let __body = async {
+            if !self.status.eq(&CrawlStatus::FirewallBlocked) {
+                self.start();
+                if self.try_cache_shortcircuit().await {
+                    self.set_crawl_status();
+                    return;
+                }
+                let (client, handle) = self.setup().await;
+                let (handle, control_guard) = match handle {
+                    Some(h) => (Some(h.0), Some(ControlHandlerGuard::new(&h.1))),
+                    _ => (None, None),
+                };
+                let crawl_timeout = self.configuration.crawl_timeout;
+                let url = self.url.inner().to_string();
+                run_with_crawl_timeout(crawl_timeout, &url, async {
+                    self.crawl_concurrent_raw(&client, &handle).await;
+                    self.sitemap_crawl_chain_raw(&client, &handle, false).await;
+                })
+                .await;
                 self.set_crawl_status();
-                return;
+                drop(control_guard);
+                self.client.replace(client);
             }
-            let (client, handle) = self.setup().await;
-            let (handle, join_handle) = match handle {
-                Some(h) => (Some(h.0), Some(h.1)),
-                _ => (None, None),
-            };
-            let crawl_timeout = self.configuration.crawl_timeout;
-            let url = self.url.inner().to_string();
-            run_with_crawl_timeout(crawl_timeout, &url, async {
-                self.crawl_concurrent_raw(&client, &handle).await;
-                self.sitemap_crawl_chain(&client, &handle, false).await;
-            })
+        };
+        #[cfg(feature = "balance")]
+        crate::utils::html_spool::WEBSITE_SPOOL_DIR
+            .scope(__spool_arc, __body)
             .await;
-            self.set_crawl_status();
-            if let Some(h) = join_handle {
-                h.abort()
-            }
-            self.client.replace(client);
-        }
+        #[cfg(not(feature = "balance"))]
+        __body.await;
     }
 
-    /// Shed HTML from older pages under critical memory pressure to prevent OOM.
-    /// Keeps the most recent pages intact and preserves all metadata.
-    #[cfg(feature = "balance")]
-    fn shed_page_html(pages: &mut Vec<Page>) {
-        let keep_recent = 100;
-        let len = pages.len();
-        if len > keep_recent {
-            for page in &mut pages[..len - keep_recent] {
-                page.set_html_bytes(None);
+    /// Safety net: spool any accumulated pages that still have in-memory
+    /// HTML.  `channel_send_page` handles most pages, but direct pushes
+    /// (e.g. `pages.push(page.clone())`) may bypass the channel path.
+    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+    async fn shed_page_html(pages: &mut Vec<Page>) {
+        for page in pages.iter_mut() {
+            let html_len = page.html.as_ref().map_or(0, |b| b.len());
+            if html_len > 0 && crate::utils::html_spool::should_spool(html_len) {
+                page.spool_html_to_disk_async().await;
+            }
+
+            // Opt-in (default off => byte-identical): under memory pressure also
+            // drop retained screenshot / content-map bytes. Reuses the same
+            // `should_spool` pressure+size heuristic as HTML; lossy for the
+            // retained copy only.
+            #[cfg(any(feature = "chrome", feature = "spider_cloud"))]
+            if *SHED_MEDIA_UNDER_PRESSURE {
+                #[cfg(feature = "chrome")]
+                if page
+                    .screenshot_bytes
+                    .as_ref()
+                    .is_some_and(|b| crate::utils::html_spool::should_spool(b.len()))
+                {
+                    page.screenshot_bytes = None;
+                }
+                #[cfg(feature = "spider_cloud")]
+                if page.content_map.as_ref().is_some_and(|m| {
+                    crate::utils::html_spool::should_spool(m.values().map(|b| b.len()).sum())
+                }) {
+                    page.content_map = None;
+                }
             }
         }
     }
@@ -5429,7 +7751,7 @@ impl Website {
     pub async fn scrape(&mut self) {
         if !self.status.eq(&CrawlStatus::FirewallBlocked) {
             let mut w = self.clone();
-            let mut rx2 = w.subscribe(0).expect("receiver enabled");
+            let mut rx2 = w.subscribe(0);
 
             if self.pages.is_none() {
                 self.pages = Some(Vec::new());
@@ -5458,12 +7780,12 @@ impl Website {
                                 if let Some(sid) = page.signature {
                                     self.insert_signature(sid).await;
                                 }
-                                self.insert_link(page.get_url().into()).await;
+                                { let url: CaseInsensitiveString = page.get_url().into(); self.insert_link(&url).await; }
                                 if let Some(p) = self.pages.as_mut() {
-                                    p.push(page);
-                                    #[cfg(feature = "balance")]
-                                    if crate::utils::detect_system::get_process_memory_state().await >= 2 {
-                                        Self::shed_page_html(p);
+                                    push_page_capped(p, page);
+                                    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+                                    if crate::utils::detect_system::get_process_memory_state_sync() >= 1 {
+                                        Self::shed_page_html(p).await;
                                     }
                                 }
                             } else {
@@ -5484,7 +7806,7 @@ impl Website {
     pub async fn scrape_raw(&mut self) {
         if !self.status.eq(&CrawlStatus::FirewallBlocked) {
             let mut w = self.clone();
-            let mut rx2 = w.subscribe(0).expect("receiver enabled");
+            let mut rx2 = w.subscribe(0);
 
             if self.pages.is_none() {
                 self.pages = Some(Vec::new());
@@ -5508,9 +7830,13 @@ impl Website {
                                 if let Some(sid) = page.signature {
                                     self.insert_signature(sid).await;
                                 }
-                                self.insert_link(page.get_url().into()).await;
+                                { let url: CaseInsensitiveString = page.get_url().into(); self.insert_link(&url).await; }
                                 if let Some(p) = self.pages.as_mut() {
-                                    p.push(page);
+                                    push_page_capped(p, page);
+                                    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+                                    if crate::utils::detect_system::get_process_memory_state_sync() >= 1 {
+                                        Self::shed_page_html(p).await;
+                                    }
                                 }
                             } else {
                                 break;
@@ -5529,7 +7855,7 @@ impl Website {
     pub async fn scrape_smart(&mut self) {
         if !self.status.eq(&CrawlStatus::FirewallBlocked) {
             let mut w = self.clone();
-            let mut rx2 = w.subscribe(0).expect("receiver enabled");
+            let mut rx2 = w.subscribe(0);
 
             if self.pages.is_none() {
                 self.pages = Some(Vec::new());
@@ -5553,9 +7879,13 @@ impl Website {
                                 if let Some(sid) = page.signature {
                                     self.insert_signature(sid).await;
                                 }
-                                self.insert_link(page.get_url().into()).await;
+                                { let url: CaseInsensitiveString = page.get_url().into(); self.insert_link(&url).await; }
                                 if let Some(p) = self.pages.as_mut() {
-                                    p.push(page);
+                                    push_page_capped(p, page);
+                                    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+                                    if crate::utils::detect_system::get_process_memory_state_sync() >= 1 {
+                                        Self::shed_page_html(p).await;
+                                    }
                                 }
                             } else {
                                 break;
@@ -5574,7 +7904,7 @@ impl Website {
     pub async fn scrape_sitemap(&mut self) {
         if !self.status.eq(&CrawlStatus::FirewallBlocked) {
             let mut w = self.clone();
-            let mut rx2 = w.subscribe(0).expect("receiver enabled");
+            let mut rx2 = w.subscribe(0);
 
             if self.pages.is_none() {
                 self.pages = Some(Vec::new());
@@ -5598,9 +7928,13 @@ impl Website {
                                 if let Some(sid) = page.signature {
                                     self.insert_signature(sid).await;
                                 }
-                                self.insert_link(page.get_url().into()).await;
+                                { let url: CaseInsensitiveString = page.get_url().into(); self.insert_link(&url).await; }
                                 if let Some(p) = self.pages.as_mut() {
-                                    p.push(page);
+                                    push_page_capped(p, page);
+                                    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+                                    if crate::utils::detect_system::get_process_memory_state_sync() >= 1 {
+                                        Self::shed_page_html(p).await;
+                                    }
                                 }
                             } else {
                                 break;
@@ -5634,7 +7968,21 @@ impl Website {
         }
 
         if let Some(q) = q {
-            while let Ok(link) = q.try_recv() {
+            loop {
+                let link = match q.try_recv() {
+                    Ok(link) => link,
+                    // Lagged: the producer outran the drain and the broadcast ring
+                    // overwrote the oldest URLs. Log the loss and keep draining the
+                    // newer entries instead of aborting the drain, which previously
+                    // stranded everything still buffered behind the lag.
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                        log::warn!("crawl queue lagged; {n} queued URLs were dropped");
+                        continue;
+                    }
+                    // Empty (fully drained) or Closed (sender gone): done.
+                    Err(_) => break,
+                };
+
                 let s = link.into();
                 let allowed = self.is_allowed_budgetless(&s);
 
@@ -5662,9 +8010,181 @@ impl Website {
         }
     }
 
+    /// BFS using `remote_fetcher` for the per-URL fetch, spider for
+    /// everything else.
+    ///
+    /// Concurrency-bounded by [`setup_semaphore`](Self::setup_semaphore)
+    /// — same primitive as `crawl_concurrent_raw` uses. Skips spider's
+    /// internal retry / cache / hedge / parallel-backends machinery on
+    /// the assumption that the user's fetcher implementation handles
+    /// those concerns on its own side (which is the typical case —
+    /// gottem's orchestrator, for example, brings its own retry ladder
+    /// across cloud vendors).
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    async fn crawl_concurrent_remote(&mut self, handle: &Option<Arc<AtomicI8>>) {
+        use crate::fetcher::FetchContext;
+
+        let fetcher = match self.remote_fetcher.clone() {
+            Some(f) => f,
+            None => return,
+        };
+
+        self.start();
+        self.status = CrawlStatus::Active;
+
+        // Setup phase: selectors + initial frontier seed. Spider owns
+        // robots / allow-deny compilation; we just reuse the helpers.
+        let selectors = self.setup_selectors();
+        let base: Option<Box<Url>> = self.domain_parsed.as_deref().cloned().map(Box::new);
+        let return_page_links = self.configuration.return_page_links;
+        let only_html = self.configuration.only_html && !self.configuration.full_resources;
+        let _ = only_html; // surfaced via configuration to user fetchers
+
+        // Seed link — same primitive `crawl_concurrent_raw` uses.
+        let seed_ci = CaseInsensitiveString::from(self.url.inner().as_str());
+        let mut frontier: HashSet<CaseInsensitiveString> = HashSet::new();
+        // Drain any pre-seeded extra_links first; insert seed if it
+        // wasn't already covered.
+        for l in self.drain_extra_links() {
+            frontier.insert(l);
+        }
+        if !frontier.contains(&seed_ci) {
+            frontier.insert(seed_ci);
+        }
+
+        let semaphore = self.setup_semaphore();
+        let channel = self.channel.clone();
+        let channel_guard = self.channel_guard.clone();
+        let on_link_find_callback = self.on_link_find_callback.clone();
+        // `Arc` clone of the configuration so worker tasks borrow it
+        // immutably; spider's allow-deny / robots checks still drive
+        // through `self` on the dispatcher side.
+        let cfg_arc: Arc<crate::configuration::Configuration> =
+            Arc::new((*self.configuration).clone());
+
+        // Drain mid-crawl queued links each iteration (parity with
+        // `crawl_concurrent_raw`'s queue handling).
+        let mut q = self.channel_queue.as_ref().map(|q| q.0.subscribe());
+        let mut exceeded_budget = false;
+
+        'outer: loop {
+            self.dequeue(&mut q, &mut frontier, &mut exceeded_budget)
+                .await;
+            if exceeded_budget || frontier.is_empty() {
+                break;
+            }
+
+            let mut set: tokio::task::JoinSet<HashSet<CaseInsensitiveString>> =
+                tokio::task::JoinSet::new();
+            let current: Vec<CaseInsensitiveString> = frontier.drain().collect();
+
+            for link in current {
+                let allowed = self.is_allowed(&link);
+                if allowed.eq(&ProcessLinkStatus::BudgetExceeded) {
+                    exceeded_budget = true;
+                    break;
+                }
+                if allowed.eq(&ProcessLinkStatus::Blocked) || !self.is_allowed_disk(&link).await {
+                    continue;
+                }
+                self.insert_link(&link).await;
+
+                // Honor `on_link_find` callback (URL rewrite hook).
+                let (link, _) = match &on_link_find_callback {
+                    Some(cb) => cb(link, None),
+                    None => (link, None),
+                };
+
+                if !self
+                    .handle_process(
+                        handle,
+                        &mut tokio::time::interval(std::time::Duration::from_millis(1)),
+                        async {},
+                    )
+                    .await
+                {
+                    break 'outer;
+                }
+
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break 'outer,
+                };
+
+                let fetcher = fetcher.clone();
+                let channel = channel.clone();
+                let channel_guard = channel_guard.clone();
+                let selectors_clone = selectors.clone();
+                let base_clone = base.clone();
+                let cfg = cfg_arc.clone();
+
+                set.spawn(async move {
+                    let _permit = permit;
+                    let target_url = link.inner().to_string();
+                    let resp = fetcher
+                        .fetch(FetchContext {
+                            url: &target_url,
+                            configuration: &cfg,
+                        })
+                        .await;
+                    // Build a synthetic Page from the fetcher's bytes.
+                    // No second network round-trip — `page::build` is
+                    // pure.
+                    let mut page = crate::page::build(&target_url, resp);
+
+                    // Link extraction — same primitives the standard
+                    // crawl loop uses. `links` is async (HTML parse
+                    // via lol_html); page owns its bytes. The
+                    // `on_should_crawl` callback is intentionally not
+                    // honored on this path (today) — users requesting
+                    // remote fetch are typically performing their own
+                    // post-fetch filtering on the consumer side.
+                    let extracted = page.links(&selectors_clone, &base_clone).await;
+                    if return_page_links {
+                        page.page_links = Some(Box::new(extracted.clone()));
+                    }
+                    channel_send_page(&channel, page, &channel_guard).await;
+                    extracted
+                });
+            }
+
+            while let Some(joined) = set.join_next().await {
+                if let Ok(new_links) = joined {
+                    for link in new_links {
+                        // Skip immediate-allow check here; the next
+                        // outer-loop iteration will re-gate via
+                        // `is_allowed` which is the source of truth
+                        // for visited / depth / allow / deny / budget.
+                        frontier.insert(link);
+                    }
+                }
+            }
+
+            if exceeded_budget {
+                break;
+            }
+        }
+
+        self.subscription_guard().await;
+        self.status = CrawlStatus::Idle;
+        let _ = selectors;
+    }
+
     /// Start to crawl website concurrently - used mainly for chrome instances to connect to default raw HTTP.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn crawl_concurrent_raw(&mut self, client: &Client, handle: &Option<Arc<AtomicI8>>) {
+        // When a `RemoteFetcher` is installed, every per-URL fetch is
+        // delegated to it instead of running spider's built-in
+        // reqwest/cache/hedge/parallel-backends machinery. Spider
+        // continues to own visited tracking, depth, allow/deny, robots,
+        // link extraction, and the subscription channel — only the
+        // network round-trip moves outside. This branch is a no-op when
+        // `remote_fetcher` is `None` (the default), so today's behavior
+        // is unchanged for every existing caller.
+        if self.remote_fetcher.is_some() {
+            self.crawl_concurrent_remote(handle).await;
+            return;
+        }
         self.start();
 
         // Cache-only phase first
@@ -5711,6 +8231,16 @@ impl Website {
                 feature = "cache_mem",
                 feature = "chrome_remote_cache"
             ))]
+            let cache_namespace_raw: Option<String> = self
+                .configuration
+                .cache_namespace
+                .as_ref()
+                .map(|s| s.as_str().to_string());
+            #[cfg(any(
+                feature = "cache",
+                feature = "cache_mem",
+                feature = "chrome_remote_cache"
+            ))]
             let normalize_raw = self.configuration.normalize;
             let mut q = self.channel_queue.as_ref().map(|q| q.0.subscribe());
 
@@ -5745,6 +8275,15 @@ impl Website {
             ));
 
             let mut set: JoinSet<(HashSet<CaseInsensitiveString>, Option<u64>)> = JoinSet::new();
+            let retry_strategy_ref = self.retry_strategy.clone();
+            // In-process HTTP fetch engine, cloned once per crawl; the full
+            // config is snapshotted into an `Arc` only when an engine is
+            // installed, so each spawned task borrows it to build a
+            // per-task `EngineFetchCtx`.
+            let engine_ref = self.fetch_engine.clone();
+            let engine_cfg = engine_ref
+                .as_ref()
+                .map(|_| std::sync::Arc::new((*self.configuration).clone()));
 
             #[cfg(feature = "auto_throttle")]
             let auto_throttle_arc = self.auto_throttle.clone();
@@ -5771,6 +8310,24 @@ impl Website {
             let mut exceeded_budget = false;
             let concurrency = throttle.is_zero();
 
+            // `self.url` is constant for the crawl, so the domain key used for the
+            // adaptive per-domain delay is resolved once here instead of being
+            // re-derived (and re-scanned) on every admitted link. `None` covers both
+            // "no auto-throttle installed" and "no domain in the base url", which is
+            // exactly the pair of conditions the per-link arm used to re-check.
+            #[cfg(feature = "auto_throttle")]
+            let auto_throttle_domain: Option<CompactString> = if auto_throttle_arc.is_some() {
+                let domain = crate::utils::get_domain_from_url(self.url.inner());
+
+                if domain.is_empty() {
+                    None
+                } else {
+                    Some(domain.into())
+                }
+            } else {
+                None
+            };
+
             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
 
             if !concurrency && !links.is_empty() {
@@ -5790,22 +8347,6 @@ impl Website {
                 let mut stream = tokio_stream::iter(std::mem::take(&mut links));
 
                 loop {
-                    if !concurrency {
-                        tokio::time::sleep(*throttle).await;
-                    }
-
-                    // Auto-throttle: apply adaptive per-domain delay on top of static delay.
-                    #[cfg(feature = "auto_throttle")]
-                    if let Some(ref at) = auto_throttle_arc {
-                        let domain = crate::utils::get_domain_from_url(self.url.inner());
-                        if !domain.is_empty() {
-                            let adaptive = at.delay_for(domain);
-                            if adaptive > *throttle {
-                                tokio::time::sleep(adaptive - *throttle).await;
-                            }
-                        }
-                    }
-
                     let semaphore =
                         get_semaphore(&semaphore, !self.configuration.shared_queue).await;
 
@@ -5814,12 +8355,10 @@ impl Website {
                         Some(link) = stream.next(), if semaphore.available_permits() > 0 && !crawl_duration_expired(&self.configuration.crawl_timeout, &crawl_breaker) => {
                             if !self.handle_process(handle, &mut interval, async {
                                 emit_log_shutdown(link.inner());
-                                let permits = set.len();
                                 set.shutdown().await;
-                                semaphore.add_permits(permits);
                             }).await {
                                 while let Some(links) = stream.next().await {
-                                    self.extra_links.insert(links);
+                                    self.extra_links_insert(links);
                                 }
                                 break 'outer;
                             }
@@ -5836,7 +8375,24 @@ impl Website {
 
                             emit_log(link.inner());
 
-                            self.insert_link(link.clone()).await;
+                            // `is_allowed` above already probed the visited set and
+                            // nothing between the two can insert (`&mut self`).
+                            self.insert_link_unchecked(&link).await;
+
+                            if !concurrency {
+                                tokio::time::sleep(*throttle).await;
+                            }
+
+                            // Auto-throttle: apply adaptive per-domain delay on top of static delay.
+                            #[cfg(feature = "auto_throttle")]
+                            if let (Some(at), Some(domain)) =
+                                (auto_throttle_arc.as_ref(), auto_throttle_domain.as_ref())
+                            {
+                                let adaptive = at.delay_for(domain.as_str());
+                                if adaptive > *throttle {
+                                    tokio::time::sleep(adaptive - *throttle).await;
+                                }
+                            }
 
                             if let Ok(permit) = semaphore.clone().acquire_owned().await {
                                 let shared = shared.clone();
@@ -5850,6 +8406,8 @@ impl Website {
                                 let cache_opts = cache_options_raw.clone();
                                 #[cfg(any(feature = "cache", feature = "cache_mem", feature = "chrome_remote_cache"))]
                                 let cache_pol = cache_policy_raw.clone();
+                                #[cfg(any(feature = "cache", feature = "cache_mem", feature = "chrome_remote_cache"))]
+                                let cache_ns = cache_namespace_raw.clone();
                                 #[cfg(any(feature = "cache", feature = "cache_mem", feature = "chrome_remote_cache"))]
                                 let normalize = normalize_raw;
                                 #[cfg(any(feature = "cache", feature = "cache_mem", feature = "chrome_remote_cache"))]
@@ -5870,7 +8428,20 @@ impl Website {
                                 let pb_validator_ref = pb_validator_raw.clone();
                                 #[cfg(feature = "parallel_backends")]
                                 let pb_semaphore_ref = pb_semaphore_raw.clone();
+                                #[allow(unused_variables)]
+                                let retry_strategy_ref = retry_strategy_ref.clone();
+                                let engine_ref = engine_ref.clone();
+                                let engine_cfg = engine_cfg.clone();
                                 spawn_set("page_fetch", &mut set, async move {
+                                    // Per-task borrow-only engine context from the cloned
+                                    // handle + config snapshot (both task-local).
+                                    let engine_ctx = match (engine_ref.as_ref(), engine_cfg.as_ref())
+                                    {
+                                        (Some(e), Some(cfg)) => Some(
+                                            crate::fetch_engine::EngineFetchCtx::new(e, cfg.as_ref()),
+                                        ),
+                                        _ => None,
+                                    };
                                     let link_result = match &shared.9 {
                                         Some(cb) => cb(link, None),
                                         _ => (link, None),
@@ -5898,8 +8469,8 @@ impl Website {
                                     {
                                         use crate::utils::{cache_skip_browser, get_cached_url, build_cached_html_page_response};
                                         if cache_skip_browser(&cache_opts) {
-                                            if let Some(html) = get_cached_url(target_url, cache_opts.as_ref(), &cache_pol).await {
-                                                let mut page_response = build_cached_html_page_response(target_url, &html);
+                                            if let Some(html) = get_cached_url(target_url, cache_opts.as_ref(), &cache_pol, cache_ns.as_deref()).await {
+                                                let mut page_response = build_cached_html_page_response(target_url, html);
                                                 if page_response.anti_bot_tech == AntiBotTech::None {
                                                     if let Some(ref custom) = custom_antibot {
                                                         let body = page_response.content.as_deref().unwrap_or(&[]);
@@ -5925,19 +8496,25 @@ impl Website {
                                                     page.links(&shared.1, &page_base).await
                                                 };
                                                 page.base = None;
-                                                if normalize {
+                                                // Skip when signature is already set — e.g. a
+                                                // pre-spooled page carries a `hash_html`-equivalent
+                                                // signature computed against its normalised bytes
+                                                // inside the spool writer.  Calling `hash_html`
+                                                // here would return `hash_html(&[])` = 0 because
+                                                // spooled pages expose empty in-memory bytes.
+                                                if normalize && page.signature.is_none() {
                                                     page.signature.replace(crate::utils::hash_html(page.get_html_bytes_u8()).await);
                                                 }
                                                 if let Some(ref cb) = on_should_crawl_callback {
                                                     if !cb.call(&page) {
                                                         page.blocked_crawl = true;
-                                                        channel_send_page(&shared.2, page, &shared.4);
+                                                        channel_send_page(&shared.2, page, &shared.4).await;
                                                         drop(permit);
                                                         return Default::default();
                                                     }
                                                 }
                                                 let signature = page.signature;
-                                                channel_send_page(&shared.2, page, &shared.4);
+                                                channel_send_page(&shared.2, page, &shared.4).await;
                                                 drop(permit);
                                                 return (links, signature);
                                             }
@@ -5947,7 +8524,6 @@ impl Website {
                                     // ── Parallel backends: spawn alternatives NOW ──
                                     // These run concurrently with the primary fetch below.
                                     // Results are collected after the primary completes.
-                                    // Fully lock-free: JoinSet + atomics only, no mutexes.
                                     #[cfg(feature = "parallel_backends")]
                                     let mut pb_backend_set: Option<tokio::task::JoinSet<crate::utils::parallel_backends::BackendResult>> = {
                                         if let (Some(ref pb_cfg), Some(ref pb_trk)) =
@@ -5982,6 +8558,12 @@ impl Website {
 
                                     let external_domains_caseless = &shared.3;
 
+                                    // Track whether the select!-based race ran so the
+                                    // downstream collection phase can skip its redundant
+                                    // grace-period loop and stat recording.
+                                    #[allow(unused_mut, unused_assignments, unused_variables)]
+                                    let mut pb_race_active = false;
+
                                     // Hedge-enabled path: race primary vs delayed hedge on different proxy
                                     #[cfg(feature = "hedge")]
                                     let (mut page, mut links, mut links_pages) = {
@@ -6001,17 +8583,17 @@ impl Website {
                                                 let fetch_start = Instant::now();
 
                                                 let primary_fut = async {
-                                                    let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                                    let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                                    let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                                    let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                                     let mut selectors = shared.1.clone();
                                                     let mut r_settings = shared.7;
                                                     r_settings.ssg_build = true;
                                                     let mut domain_parsed = None;
-                                                    let page = Page::new_page_streaming(
+                                                    let page = Page::new_page_streaming_engine(
                                                         target_url, primary_client, only_html,
                                                         &mut selectors, external_domains_caseless,
                                                         &r_settings, &mut links, None, &shared.8,
-                                                        &mut domain_parsed, &mut links_pages).await;
+                                                        &mut domain_parsed, &mut links_pages, (None, None), engine_ctx).await;
                                                     (page, links, links_pages)
                                                 };
 
@@ -6027,17 +8609,17 @@ impl Website {
                                                             hedge_trk.hedge_win_rate_pct(), hedge_trk.consecutive_errors(), target_url);
 
                                                         let hedge_fut = async {
-                                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                                            let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                                            let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                                             let mut selectors = shared.1.clone();
                                                             let mut r_settings = shared.7;
                                                             r_settings.ssg_build = true;
                                                             let mut domain_parsed = None;
-                                                            let page = Page::new_page_streaming(
+                                                            let page = Page::new_page_streaming_engine(
                                                                 target_url, hedge_client, only_html,
                                                                 &mut selectors, external_domains_caseless,
                                                                 &r_settings, &mut links, None, &shared.8,
-                                                                &mut domain_parsed, &mut links_pages).await;
+                                                                &mut domain_parsed, &mut links_pages, (None, None), engine_ctx).await;
                                                             (page, links, links_pages)
                                                         };
 
@@ -6067,17 +8649,17 @@ impl Website {
                                                 result
                                             } else {
                                                 let fetch_start = Instant::now();
-                                                let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                                let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                                let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                                let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                                 let mut selectors = shared.1.clone();
                                                 let mut r_settings = shared.7;
                                                 r_settings.ssg_build = true;
                                                 let mut domain_parsed = None;
-                                                let page = Page::new_page_streaming(
+                                                let page = Page::new_page_streaming_engine(
                                                     target_url, primary_client, only_html,
                                                     &mut selectors, external_domains_caseless,
                                                     &r_settings, &mut links, None, &shared.8,
-                                                    &mut domain_parsed, &mut links_pages).await;
+                                                    &mut domain_parsed, &mut links_pages, (None, None), engine_ctx).await;
                                                 hedge_trk.record(fetch_start.elapsed());
                                                 if page.status_code.is_server_error() {
                                                     hedge_trk.record_error();
@@ -6092,17 +8674,17 @@ impl Website {
                                                 None => &shared.0,
                                             };
                                             let fetch_start = Instant::now();
-                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                            let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                            let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                             let mut selectors = shared.1.clone();
                                             let mut r_settings = shared.7;
                                             r_settings.ssg_build = true;
                                             let mut domain_parsed = None;
-                                            let page = Page::new_page_streaming(
+                                            let page = Page::new_page_streaming_engine(
                                                 target_url, client, only_html,
                                                 &mut selectors, external_domains_caseless,
                                                 &r_settings, &mut links, None, &shared.8,
-                                                &mut domain_parsed, &mut links_pages).await;
+                                                &mut domain_parsed, &mut links_pages, (None, None), engine_ctx).await;
                                             hedge_trk.record(fetch_start.elapsed());
                                             if page.status_code.is_server_error() {
                                                 hedge_trk.record_error();
@@ -6119,38 +8701,169 @@ impl Website {
                                             Some(r) => r.next(),
                                             None => &shared.0,
                                         };
-                                        let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                        let mut links_pages = if return_page_links {
-                                            Some(HashSet::new())
+
+                                        // When parallel_backends is enabled and we have spawned
+                                        // backends, race the primary fetch against them. A backend
+                                        // that finishes first with high quality wins immediately —
+                                        // this is the core hedging value (a slow primary no longer
+                                        // blocks the response).
+                                        #[cfg(feature = "parallel_backends")]
+                                        {
+                                            pb_race_active = pb_backend_set.is_some()
+                                                && pb_config_ref.as_ref().is_some_and(|c| c.enabled)
+                                                && pb_tracker_ref.is_some();
+                                        }
+
+                                        if pb_race_active {
+                                            #[cfg(feature = "parallel_backends")]
+                                            {
+                                                let mut pb_set = pb_backend_set.take().unwrap();
+                                                let pb_cfg = pb_config_ref.as_ref().unwrap();
+                                                let pb_trk = pb_tracker_ref.as_ref().unwrap();
+
+                                                let primary_fut = async {
+                                                    let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                                    let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
+                                                    let mut selectors = shared.1.clone();
+                                                    let mut r_settings = shared.7;
+                                                    r_settings.ssg_build = true;
+                                                    let mut domain_parsed = None;
+                                                    let page = Page::new_page_streaming_engine(
+                                                        target_url, client, only_html,
+                                                        &mut selectors, external_domains_caseless,
+                                                        &r_settings, &mut links, None, &shared.8,
+                                                        &mut domain_parsed, &mut links_pages, (None, None), engine_ctx).await;
+                                                    (page, links, links_pages)
+                                                };
+                                                tokio::pin!(primary_fut);
+
+                                                loop {
+                                                    tokio::select! {
+                                                        biased;
+                                                        result = &mut primary_fut => {
+                                                            pb_trk.record_race(0);
+                                                            pb_trk.record_success(0);
+                                                            // Put JoinSet back for post-primary collection.
+                                                            pb_backend_set = Some(pb_set);
+                                                            break result;
+                                                        }
+                                                        res = pb_set.join_next() => {
+                                                            match res {
+                                                                Some(Ok(br)) => {
+                                                                    let idx = br.backend_index;
+                                                                    if let Some(resp) = br.response {
+                                                                        pb_trk.record_race(idx);
+                                                                        pb_trk.record_duration(idx, resp.duration);
+                                                                        pb_trk.record_success(idx);
+                                                                        if resp.quality_score >= pb_cfg.fast_accept_threshold {
+                                                                            log::info!(
+                                                                                "[parallel_backends] backend {} won race for {} (score={})",
+                                                                                idx, target_url, resp.quality_score
+                                                                            );
+                                                                            pb_trk.record_win(idx);
+                                                                            pb_set.abort_all();
+                                                                            let mut page = resp.page;
+                                                                            page.set_url_parsed_direct();
+                                                                            let page_base = page.base.take().map(Box::new);
+                                                                            let new_links = if shared.6 {
+                                                                                page.links_full(&shared.1, &page_base).await
+                                                                            } else {
+                                                                                page.links(&shared.1, &page_base).await
+                                                                            };
+                                                                            page.base = page_base.map(|b| *b);
+                                                                            break (page, new_links, if return_page_links { Some(HashSet::with_capacity(32)) } else { None });
+                                                                        }
+                                                                    } else {
+                                                                        pb_trk.record_race(idx);
+                                                                        pb_trk.record_error(idx);
+                                                                    }
+                                                                }
+                                                                Some(Err(_)) => {} // JoinError
+                                                                None => {
+                                                                    // All backends done, none good — wait for primary.
+                                                                    let result = primary_fut.await;
+                                                                    pb_trk.record_race(0);
+                                                                    pb_trk.record_success(0);
+                                                                    break result;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            #[cfg(not(feature = "parallel_backends"))]
+                                            unreachable!()
                                         } else {
-                                            None
-                                        };
-                                        let mut relative_selectors = shared.1.clone();
-                                        let mut r_settings = shared.7;
-                                        r_settings.ssg_build = true;
-                                        let mut domain_parsed = None;
-                                        let page = Page::new_page_streaming(
-                                            target_url,
-                                            client, only_html,
-                                            &mut relative_selectors,
-                                            external_domains_caseless,
-                                            &r_settings,
-                                            &mut links,
-                                            None,
-                                            &shared.8,
-                                            &mut domain_parsed,
-                                            &mut links_pages).await;
-                                        (page, links, links_pages)
+                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                            let mut links_pages = if return_page_links {
+                                                Some(HashSet::with_capacity(32))
+                                            } else {
+                                                None
+                                            };
+                                            let mut relative_selectors = shared.1.clone();
+                                            let mut r_settings = shared.7;
+                                            r_settings.ssg_build = true;
+                                            let mut domain_parsed = None;
+                                            let page = Page::new_page_streaming_engine(
+                                                target_url,
+                                                client, only_html,
+                                                &mut relative_selectors,
+                                                external_domains_caseless,
+                                                &r_settings,
+                                                &mut links,
+                                                None,
+                                                &shared.8,
+                                                &mut domain_parsed,
+                                                &mut links_pages, (None, None), engine_ctx).await;
+                                            (page, links, links_pages)
+                                        }
                                     };
 
-                                    let mut retry_count = shared.5;
+                                    let mut retry_count: u32 = match &retry_strategy_ref {
+                                        Some(s) => s.max_retries(),
+                                        None => shared.5 as u32,
+                                    };
+                                    let mut attempt: u32 = 0;
 
                                     while page.needs_retry() && retry_count > 0 {
                                         retry_count -= 1;
+                                        attempt += 1;
 
-                                        if let Some(timeout) = page.get_timeout() {
-                                            tokio::time::sleep(timeout).await;
-                                        }
+                                        // Consult the retry strategy if set.
+                                        let (_directive_backoff, _directive_profile_key) = match &retry_strategy_ref {
+                                            Some(s) => {
+                                                let outcome = crate::retry_strategy::AttemptOutcome {
+                                                    attempt,
+                                                    status_code: page.status_code,
+                                                    should_retry: page.should_retry,
+                                                    content_truncated: page.content_truncated,
+                                                    waf_check: page.waf_check,
+                                                    anti_bot_tech: &page.anti_bot_tech,
+                                                    proxy_configured: page.proxy_configured,
+                                                    url: target_url,
+                                                    profile_key: page.profile_key.as_deref(),
+                                                    html_length: page.size(),
+                                                    bytes_transferred: page.bytes_transferred,
+                                                    #[cfg(not(feature = "page_error_status_details"))]
+                                                    error_status: page.error_status.as_deref(),
+                                                    #[cfg(feature = "page_error_status_details")]
+                                                    error_status: None,
+                                                    final_redirect_destination: page.final_redirect_destination.as_deref(),
+                                                };
+                                                let directive = s.on_retry(&outcome);
+                                                if !directive.should_retry {
+                                                    break;
+                                                }
+                                                (directive.backoff, directive.profile_key)
+                                            }
+                                            None => (None, None),
+                                        };
+
+                                        let status_delay = page.get_timeout().unwrap_or_default();
+                                        let backoff = _directive_backoff
+                                            .unwrap_or_else(|| crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000));
+                                        tokio::time::sleep(status_delay.max(backoff)).await;
 
                                         let retry_client = match &rotator {
                                             Some(r) => r.next(),
@@ -6162,7 +8875,7 @@ impl Website {
                                                 let mut domain_parsed = None;
                                                 let mut retry_r_settings = shared.7;
                                                 retry_r_settings.ssg_build = true;
-                                                let next_page = Page::new_page_streaming(
+                                                let next_page = Page::new_page_streaming_engine(
                                                     target_url,
                                                     retry_client, only_html,
                                                     &mut shared.1.clone(),
@@ -6172,7 +8885,7 @@ impl Website {
                                                     None,
                                                     &shared.8,
                                                     &mut domain_parsed,
-                                                    &mut links_pages).await;
+                                                    &mut links_pages, (None, None), engine_ctx).await;
 
                                                 page = next_page;
 
@@ -6185,7 +8898,7 @@ impl Website {
                                             let mut domain_parsed = None;
                                             let mut retry_r_settings = shared.7;
                                             retry_r_settings.ssg_build = true;
-                                            page = Page::new_page_streaming(
+                                            page = Page::new_page_streaming_engine(
                                                 target_url,
                                                 retry_client,
                                                 only_html,
@@ -6196,7 +8909,12 @@ impl Website {
                                                 None,
                                                 &shared.8,
                                                 &mut domain_parsed,
-                                                &mut links_pages).await;
+                                                &mut links_pages, (None, None), engine_ctx).await;
+                                        }
+
+                                        // Stamp profile key from strategy.
+                                        if let Some(ref pk) = _directive_profile_key {
+                                            page.profile_key = Some(pk.clone());
                                         }
                                     }
 
@@ -6224,99 +8942,128 @@ impl Website {
 
                                     // ── Parallel backends: collect concurrent results ──
                                     //
-                                    // Backend futures were spawned BEFORE the primary fetch
-                                    // (see pb_backend_set above) and ran concurrently. Now
-                                    // we check if any produced a higher-quality result.
-                                    // Fully lock-free: JoinSet + atomics only, zero mutexes.
+                                    // When the race loop already ran (pb_race_active), primary
+                                    // stats are recorded and backends below threshold were
+                                    // drained. Just abort stragglers and tag the page.
+                                    // When the race loop did NOT run (hedge path, or PB
+                                    // disabled at runtime), fall through to the legacy
+                                    // grace-period collection.
                                     #[cfg(feature = "parallel_backends")]
                                     if let Some(ref mut pb_set) = pb_backend_set {
                                         if let (Some(ref pb_cfg), Some(ref pb_trk)) =
                                             (&pb_config_ref, &pb_tracker_ref)
                                         {
-                                            let primary_score = crate::utils::parallel_backends::html_quality_score_validated(
-                                                page.get_bytes(),
-                                                page.status_code,
-                                                &page.anti_bot_tech,
-                                                target_url,
-                                                "primary",
-                                                pb_validator_ref.as_ref(),
-                                            );
-                                            pb_trk.record_race(0);
-                                            pb_trk.record_success(0);
-
-                                            if primary_score < pb_cfg.fast_accept_threshold {
-                                                let grace = std::time::Duration::from_millis(pb_cfg.grace_period_ms);
-                                                let deadline = tokio::time::Instant::now() + grace;
-                                                let mut best_alt: Option<crate::utils::parallel_backends::BackendResponse> = None;
-
-                                                loop {
-                                                    tokio::select! {
-                                                        biased;
-                                                        res = pb_set.join_next() => {
-                                                            match res {
-                                                                Some(Ok(br)) => {
-                                                                    let idx = br.backend_index;
-                                                                    match br.response {
-                                                                        Some(resp) => {
-                                                                            pb_trk.record_race(idx);
-                                                                            pb_trk.record_duration(idx, resp.duration);
-                                                                            pb_trk.record_success(idx);
-                                                                            if resp.quality_score > primary_score {
-                                                                                let better = match &best_alt {
-                                                                                    Some(b) => resp.quality_score > b.quality_score,
-                                                                                    None => true,
-                                                                                };
-                                                                                if better {
-                                                                                    best_alt = Some(resp);
-                                                                                }
-                                                                            }
-                                                                            if best_alt.as_ref().is_some_and(|b| {
-                                                                                b.quality_score >= pb_cfg.fast_accept_threshold
-                                                                            }) {
-                                                                                break;
-                                                                            }
-                                                                        }
-                                                                        None => {
-                                                                            pb_trk.record_race(idx);
-                                                                            pb_trk.record_error(idx);
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Some(Err(_)) => {}
-                                                                None => break,
-                                                            }
-                                                        }
-                                                        _ = tokio::time::sleep_until(deadline) => break,
-                                                    }
-                                                }
-
-                                                pb_set.abort_all();
-
-                                                if let Some(winner) = best_alt {
-                                                    log::info!("[parallel_backends] backend {} won for {} (score={}, primary_score={})",
-                                                        winner.backend_index, target_url, winner.quality_score, primary_score);
-                                                    pb_trk.record_win(winner.backend_index);
-                                                    page = winner.page;
-                                                    page.set_url_parsed_direct();
-                                                    let page_base = page.base.take().map(Box::new);
-                                                    let new_links = if shared.6 {
-                                                        page.links_full(&shared.1, &page_base).await
-                                                    } else {
-                                                        page.links(&shared.1, &page_base).await
-                                                    };
-                                                    page.base = page_base.map(|b| *b);
-                                                    links = new_links;
-                                                } else {
-                                                    pb_trk.record_win(0);
-                                                    crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
-                                                }
-                                            } else {
+                                            if pb_race_active {
+                                                // Race loop already handled stats + quality
+                                                // comparison. Just clean up remaining tasks.
                                                 pb_set.abort_all();
                                                 pb_trk.record_win(0);
                                                 crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
+                                            } else if crate::page::is_permanent_target_failure(page.status_code) {
+                                                // Permanent destination-side failure (525 DNS,
+                                                // 526 unreachable / SSL, 310 redirect cap):
+                                                // every backend would hit the same condition.
+                                                // Skip scoring + grace period entirely so a
+                                                // single NXDOMAIN doesn't burn the full grace
+                                                // window waiting for siblings that are
+                                                // guaranteed to fail the same way.
+                                                pb_set.abort_all();
+                                                pb_trk.record_race(0);
+                                                pb_trk.record_success(0);
+                                                pb_trk.record_win(0);
+                                                crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
+                                            } else {
+                                                // Legacy path (hedge feature or runtime-disabled
+                                                // race): score primary, grace-period collect.
+                                                let primary_score = crate::utils::parallel_backends::html_quality_score_validated(
+                                                    page.get_bytes(),
+                                                    page.status_code,
+                                                    &page.anti_bot_tech,
+                                                    target_url,
+                                                    "primary",
+                                                    pb_validator_ref.as_ref(),
+                                                );
+                                                pb_trk.record_race(0);
+                                                pb_trk.record_success(0);
+
+                                                if primary_score < pb_cfg.fast_accept_threshold {
+                                                    let grace = std::time::Duration::from_millis(pb_cfg.grace_period_ms);
+                                                    let deadline = tokio::time::Instant::now() + grace;
+                                                    let mut best_alt: Option<crate::utils::parallel_backends::BackendResponse> = None;
+
+                                                    loop {
+                                                        tokio::select! {
+                                                            biased;
+                                                            res = pb_set.join_next() => {
+                                                                match res {
+                                                                    Some(Ok(br)) => {
+                                                                        let idx = br.backend_index;
+                                                                        match br.response {
+                                                                            Some(resp) => {
+                                                                                pb_trk.record_race(idx);
+                                                                                pb_trk.record_duration(idx, resp.duration);
+                                                                                pb_trk.record_success(idx);
+                                                                                if resp.quality_score > primary_score {
+                                                                                    let better = match &best_alt {
+                                                                                        Some(b) => resp.quality_score > b.quality_score,
+                                                                                        None => true,
+                                                                                    };
+                                                                                    if better {
+                                                                                        best_alt = Some(resp);
+                                                                                    }
+                                                                                }
+                                                                                if best_alt.as_ref().is_some_and(|b| {
+                                                                                    b.quality_score >= pb_cfg.fast_accept_threshold
+                                                                                }) {
+                                                                                    break;
+                                                                                }
+                                                                            }
+                                                                            None => {
+                                                                                pb_trk.record_race(idx);
+                                                                                pb_trk.record_error(idx);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Some(Err(_)) => {}
+                                                                    None => break,
+                                                                }
+                                                            }
+                                                            _ = tokio::time::sleep_until(deadline) => break,
+                                                        }
+                                                    }
+
+                                                    pb_set.abort_all();
+
+                                                    if let Some(winner) = best_alt {
+                                                        log::info!("[parallel_backends] backend {} won for {} (score={}, primary_score={})",
+                                                            winner.backend_index, target_url, winner.quality_score, primary_score);
+                                                        pb_trk.record_win(winner.backend_index);
+                                                        page = winner.page;
+                                                        page.set_url_parsed_direct();
+                                                        let page_base = page.base.take().map(Box::new);
+                                                        let new_links = if shared.6 {
+                                                            page.links_full(&shared.1, &page_base).await
+                                                        } else {
+                                                            page.links(&shared.1, &page_base).await
+                                                        };
+                                                        page.base = page_base.map(|b| *b);
+                                                        links = new_links;
+                                                    } else {
+                                                        pb_trk.record_win(0);
+                                                        crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
+                                                    }
+                                                } else {
+                                                    pb_set.abort_all();
+                                                    pb_trk.record_win(0);
+                                                    crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
+                                                }
                                             }
                                         }
                                     }
+                                    // Drop the JoinSet so completed-but-unread backend
+                                    // responses are freed before downstream processing.
+                                    #[cfg(feature = "parallel_backends")]
+                                    drop(pb_backend_set);
 
                                     // Record latency for auto-throttle.
                                     #[cfg(feature = "auto_throttle")]
@@ -6374,7 +9121,7 @@ impl Website {
                                     if let Some(ref cb) = on_should_crawl_callback {
                                         if !cb.call(&page) {
                                             page.blocked_crawl = true;
-                                            channel_send_page(&shared.2, page, &shared.4);
+                                            channel_send_page(&shared.2, page, &shared.4).await;
                                             drop(permit);
                                             return Default::default()
                                         }
@@ -6382,12 +9129,16 @@ impl Website {
 
                                     let signature = page.signature;
 
-                                    channel_send_page(&shared.2, page, &shared.4);
+                                    channel_send_page(&shared.2, page, &shared.4).await;
 
                                     drop(permit);
 
                                     (links, signature)
                                 });
+                            } else {
+                                self.links_visited.remove(&link);
+                                self.extra_links_insert(link);
+                                break;
                             }
 
                             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
@@ -6418,11 +9169,11 @@ impl Website {
                         // await for all tasks to complete.
                         if exceeded_budget {
                             while let Some(links) = stream.next().await {
-                                self.extra_links.insert(links);
+                                self.extra_links_insert(links);
                             }
                             while let Some(links) = set.join_next().await {
                                 if let Ok(links) = links {
-                                    self.extra_links.extend(links.0);
+                                    self.extra_links_extend(links.0);
                                 }
                             }
                         }
@@ -6440,7 +9191,7 @@ impl Website {
 
             // store the extra links.
             if !links.is_empty() {
-                self.extra_links.extend(links);
+                self.extra_links_extend(links);
             }
         }
     }
@@ -6482,8 +9233,15 @@ impl Website {
                         let hedge_tracker = Arc::new(crate::utils::hedge::HedgeTracker::default());
 
                         if self.single_page() {
-                            self.crawl_establish(client, &mut selectors, false, &new_page)
-                                .await;
+                            self.crawl_establish(
+                                client,
+                                &mut selectors,
+                                false,
+                                &new_page,
+                                &b.browser.0,
+                                &b.browser_dead,
+                            )
+                            .await;
                             drop(new_page);
                             self.subscription_guard().await;
                             b.dispose();
@@ -6494,7 +9252,14 @@ impl Website {
                             let mut q = self.channel_queue.as_ref().map(|q| q.0.subscribe());
 
                             let base_links = self
-                                .crawl_establish(client, &mut selectors, false, &new_page)
+                                .crawl_establish(
+                                    client,
+                                    &mut selectors,
+                                    false,
+                                    &new_page,
+                                    &b.browser.0,
+                                    &b.browser_dead,
+                                )
                                 .await;
 
                             drop(new_page);
@@ -6522,12 +9287,18 @@ impl Website {
                                 self.domain_parsed.clone(),
                                 self.on_link_find_callback.clone(),
                                 b.browser_dead.clone(),
+                                b.connected_url.clone(),
                             ));
 
                             let add_external = !shared.3.is_empty();
                             let on_should_crawl_callback = self.on_should_crawl_callback.clone();
+                            let retry_strategy_ref = self.retry_strategy.clone();
                             let full_resources = self.configuration.full_resources;
                             let return_page_links = self.configuration.return_page_links;
+                            // Honor single-page mode: skip link extraction
+                            // entirely when no caller actually needs the links.
+                            // Same gate as the non-streaming initial-page paths.
+                            let skip_links = self.single_page() && !return_page_links;
                             #[cfg(any(
                                 feature = "cache",
                                 feature = "cache_mem",
@@ -6570,15 +9341,9 @@ impl Website {
                                 #[cfg(all(feature = "agent", feature = "serde"))]
                                 self.apply_url_prefilter(&mut links).await;
 
-                                let mut stream = tokio_stream::iter::<HashSet<CaseInsensitiveString>>(
-                                    links.drain().collect(),
-                                );
+                                let mut stream = tokio_stream::iter(std::mem::take(&mut links));
 
                                 loop {
-                                    if !concurrency {
-                                        tokio::time::sleep(*throttle).await;
-                                    }
-
                                     let semaphore =
                                         get_semaphore(&semaphore, !self.configuration.shared_queue)
                                             .await;
@@ -6592,9 +9357,7 @@ impl Website {
                                                     &mut interval,
                                                     async {
                                                         emit_log_shutdown(link.inner());
-                                                        let permits = set.len();
                                                         set.shutdown().await;
-                                                        semaphore.add_permits(permits);
                                                     },
                                                 )
                                                 .await
@@ -6616,7 +9379,13 @@ impl Website {
 
                                             emit_log(link.inner());
 
-                                            self.insert_link(link.clone()).await;
+                                            // `is_allowed` above already probed the visited
+                                            // set and nothing between the two can insert.
+                                            self.insert_link_unchecked(&link).await;
+
+                                            if !concurrency {
+                                                tokio::time::sleep(*throttle).await;
+                                            }
 
                                             if let Ok(permit) = semaphore.clone().acquire_owned().await {
                                                 let shared = shared.clone();
@@ -6636,9 +9405,12 @@ impl Website {
                                                 #[cfg(feature = "parallel_backends")]
                                                 let pb_crawl_config_ref = pb_crawl_config_chrome.clone();
                                                 #[cfg(feature = "parallel_backends")]
+                                                #[allow(unused_variables)]
                                                 let pb_validator_ref = pb_validator_chrome.clone();
                                                 #[cfg(feature = "parallel_backends")]
                                                 let pb_semaphore_ref = pb_semaphore_chrome.clone();
+                                                #[allow(unused_variables)]
+                                                let retry_strategy_ref = retry_strategy_ref.clone();
                                                 spawn_set("page_fetch", &mut set, async move {
                                                     let link_result =
                                                         match &shared.10 {
@@ -6646,7 +9418,8 @@ impl Website {
                                                             _ => (link, None),
                                                         };
 
-                                                    let target_url_string = link_result.0.as_ref().to_string();
+                                                    let target_url_string =
+                                                        link_result.0.into_string();
 
                                                     // Cache-first: skip tab creation entirely for cached pages
                                                     #[cfg(any(feature = "cache", feature = "cache_mem", feature = "chrome_remote_cache"))]
@@ -6654,8 +9427,8 @@ impl Website {
                                                         use crate::utils::{cache_skip_browser, get_cached_url, build_cached_html_page_response};
                                                         let cache_options = shared.6.get_cache_options();
                                                         if cache_skip_browser(&cache_options) {
-                                                            if let Some(html) = get_cached_url(&target_url_string, cache_options.as_ref(), &shared.6.cache_policy).await {
-                                                                let mut page_response = build_cached_html_page_response(&target_url_string, &html);
+                                                            if let Some(html) = get_cached_url(&target_url_string, cache_options.as_ref(), &shared.6.cache_policy, shared.6.cache_namespace_str()).await {
+                                                                let mut page_response = build_cached_html_page_response(&target_url_string, html);
                                                                 if page_response.anti_bot_tech == AntiBotTech::None {
                                                                     if let Some(ref compiled) = compiled_custom_antibot {
                                                                         let body = page_response.content.as_deref().unwrap_or(&[]);
@@ -6680,19 +9453,22 @@ impl Website {
                                                                     page.links(&shared.1, &page_base).await
                                                                 };
                                                                 page.base = None;
-                                                                if shared.6.normalize {
+                                                                // See comment on the sibling site: pre-spooled pages
+                                                                // already carry their signature; re-hashing the empty
+                                                                // in-memory buffer would clobber it with 0.
+                                                                if shared.6.normalize && page.signature.is_none() {
                                                                     page.signature.replace(crate::utils::hash_html(page.get_html_bytes_u8()).await);
                                                                 }
                                                                 if let Some(ref cb) = on_should_crawl_callback {
                                                                     if !cb.call(&page) {
                                                                         page.blocked_crawl = true;
-                                                                        channel_send_page(&shared.2, page, &shared.4);
+                                                                        channel_send_page(&shared.2, page, &shared.4).await;
                                                                         drop(permit);
                                                                         return Default::default();
                                                                     }
                                                                 }
                                                                 let signature = page.signature;
-                                                                channel_send_page(&shared.2, page, &shared.4);
+                                                                channel_send_page(&shared.2, page, &shared.4).await;
                                                                 drop(permit);
                                                                 return (links, signature);
                                                             }
@@ -6733,7 +9509,7 @@ impl Website {
                                                         }
                                                     };
 
-                                                    // Hedge-enabled Chrome path: race primary tab vs hedge tab
+                                                    // Hedge-enabled Chrome path: race primary tab vs hedge tab (new WS connection)
                                                     #[cfg(feature = "hedge")]
                                                     if shared.11.load(std::sync::atomic::Ordering::Acquire) {
                                                         log::warn!("{target_url_string} skipping fetch: browser is dead");
@@ -6746,10 +9522,15 @@ impl Website {
                                                         let target_url = target_url_string.as_str();
                                                         let fetch_start = Instant::now();
 
-                                                        let page_opt: Option<Page> = if should_hedge {
+                                                        let page_opt: Option<(
+                                                            Page,
+                                                            hashbrown::HashSet<CaseInsensitiveString>,
+                                                            Option<hashbrown::HashSet<CaseInsensitiveString>>,
+                                                            bool,
+                                                        )> = if should_hedge {
                                                             let base_delay = hedge_cfg.as_ref().unwrap().delay;
                                                             let delay = hedge_trk.adaptive_delay(base_delay);
-                                                            let primary_fut = async { chrome_page_fetch!(shared, target_url) };
+                                                            let primary_fut = async { chrome_page_fetch!(shared, target_url, retry_strategy_ref, full_resources, return_page_links, skip_links) };
                                                             tokio::pin!(primary_fut);
 
                                                             let result = tokio::select! {
@@ -6760,34 +9541,70 @@ impl Website {
                                                                     log::info!("[hedge-chrome] fired after {}ms (ema={}ms, stddev={}ms, win={}%, errs={}) url={}",
                                                                         delay.as_millis(), hedge_trk.ema_ms(), hedge_trk.stddev_ms(),
                                                                         hedge_trk.hedge_win_rate_pct(), hedge_trk.consecutive_errors(), target_url);
-                                                                    let hedge_fut = async { chrome_page_fetch!(shared, target_url) };
-                                                                    tokio::pin!(hedge_fut);
-                                                                    tokio::select! {
-                                                                        biased;
-                                                                        result = &mut primary_fut => {
-                                                                            log::info!("[hedge-chrome] winner: primary url={}", target_url);
-                                                                            hedge_trk.record_outcome(false);
-                                                                            result
+
+                                                                    // Decide based on already-collected signals whether
+                                                                    // to escalate to a new WS connection (zero latency
+                                                                    // check — pure atomic reads, no CDP round-trip).
+                                                                    let hedge_browser = if crate::features::chrome::HedgeBrowser::should_new_connection(
+                                                                        &hedge_trk, &shared.11,
+                                                                    ) {
+                                                                        log::info!("[hedge-chrome] signals indicate connection-level issue, opening new WS");
+                                                                        crate::features::chrome::HedgeBrowser::connect(
+                                                                            &shared.5, &shared.6,
+                                                                        ).await
+                                                                    } else {
+                                                                        None
+                                                                    };
+
+                                                                    // Scope hedge_fut to release its borrow on
+                                                                    // hedge_browser before we move it into close().
+                                                                    let race_result = {
+                                                                        let hedge_fut = async {
+                                                                            match &hedge_browser {
+                                                                                Some(hb) => {
+                                                                                    log::info!("[hedge-chrome] using new WS connection url={}", target_url);
+                                                                                    chrome_page_fetch_on!(shared, target_url, hb, full_resources, return_page_links, skip_links)
+                                                                                }
+                                                                                None => {
+                                                                                    chrome_page_fetch!(shared, target_url, retry_strategy_ref, full_resources, return_page_links, skip_links)
+                                                                                }
+                                                                            }
+                                                                        };
+                                                                        tokio::pin!(hedge_fut);
+
+                                                                        tokio::select! {
+                                                                            biased;
+                                                                            result = &mut primary_fut => {
+                                                                                log::info!("[hedge-chrome] winner: primary url={}", target_url);
+                                                                                hedge_trk.record_outcome(false);
+                                                                                result
+                                                                            }
+                                                                            result = &mut hedge_fut => {
+                                                                                log::info!("[hedge-chrome] winner: hedge url={}", target_url);
+                                                                                hedge_trk.record_outcome(true);
+                                                                                result
+                                                                            }
                                                                         }
-                                                                        result = &mut hedge_fut => {
-                                                                            log::info!("[hedge-chrome] winner: hedge url={}", target_url);
-                                                                            hedge_trk.record_outcome(true);
-                                                                            result
-                                                                        }
+                                                                    };
+                                                                    // Explicitly dispose the isolated remote context
+                                                                    // via CDP before the websocket drops.
+                                                                    if let Some(hb) = hedge_browser {
+                                                                        hb.close().await;
                                                                     }
+                                                                    race_result
                                                                 }
                                                             };
                                                             hedge_trk.record(fetch_start.elapsed());
-                                                            if result.as_ref().is_some_and(|p| p.status_code.is_server_error()) {
+                                                            if result.as_ref().is_some_and(|t| t.0.status_code.is_server_error()) {
                                                                 hedge_trk.record_error();
                                                             } else if result.is_some() {
                                                                 hedge_trk.record_success();
                                                             }
                                                             result
                                                         } else {
-                                                            let result = chrome_page_fetch!(shared, target_url);
+                                                            let result = chrome_page_fetch!(shared, target_url, retry_strategy_ref, full_resources, return_page_links, skip_links);
                                                             hedge_trk.record(fetch_start.elapsed());
-                                                            if result.as_ref().is_some_and(|p| p.status_code.is_server_error()) {
+                                                            if result.as_ref().is_some_and(|t| t.0.status_code.is_server_error()) {
                                                                 hedge_trk.record_error();
                                                             } else if result.is_some() {
                                                                 hedge_trk.record_success();
@@ -6795,9 +9612,15 @@ impl Website {
                                                             result
                                                         };
 
+                                                        #[allow(unused_assignments)]
                                                         match page_opt {
-                                                            Some(page) => chrome_page_post_process!(page, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit),
-                                                            None => Default::default(),
+                                                            Some((page, pre_links, pre_links_pages, extract_succeeded)) => chrome_page_post_process!(page, pre_links, pre_links_pages, extract_succeeded, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit, pb_backend_set, pb_config_ref, pb_tracker_ref),
+                                                            None => {
+                                                                // Abort any spawned parallel backend tasks on primary failure.
+                                                                #[cfg(feature = "parallel_backends")]
+                                                                drop(pb_backend_set);
+                                                                Default::default()
+                                                            },
                                                         }
                                                     };
 
@@ -6812,6 +9635,12 @@ impl Website {
                                                     } else {
                                                         match attempt_navigation("about:blank", &shared.5, &shared.6.request_timeout, &shared.8, &shared.6.viewport).await {
                                                         Ok(new_page) => {
+                                                            // Guard closes the tab if this task is aborted (e.g. budget exceeded).
+                                                            // `mut` so the retry loop can swap a fresh tab into the
+                                                            // guard (and dispose the prior one) without ever letting
+                                                            // the active tab go unprotected. See `TabCloseGuard::swap`.
+                                                            let mut _tab_guard = crate::features::chrome::TabCloseGuard::new(new_page.clone());
+
                                                             let (_, intercept_handle) = tokio::join!(
                                                                 crate::features::chrome::setup_chrome_events(&new_page, &shared.6),
                                                                 crate::features::chrome::setup_chrome_interception_base(
@@ -6825,47 +9654,84 @@ impl Website {
 
                                                             let target_url = target_url_string.as_str();
 
-                                                            let mut page = Page::new(
+                                                            let mut links: hashbrown::HashSet<CaseInsensitiveString> =
+                                                                hashbrown::HashSet::with_capacity(crate::page::link_set_capacity());
+                                                            let mut links_pages: Option<hashbrown::HashSet<CaseInsensitiveString>> =
+                                                                if return_page_links { Some(Default::default()) } else { None };
+
+                                                            let (mut page, mut extract_succeeded) = Page::new_streaming(
                                                                 target_url,
                                                                 &shared.0,
                                                                 &new_page,
-                                                                &shared.6.wait_for,
-                                                                &shared.6.screenshot,
                                                                 false,
-                                                                &shared.6.openai_config,
-                                                                &shared.6.execution_scripts,
-                                                                &shared.6.automation_scripts,
-                                                                &shared.6.viewport,
-                                                                &shared.6.request_timeout,
-                                                                &shared.6.track_events,
                                                                 shared.6.referer.clone(),
                                                                 shared.6.max_page_bytes,
                                                                 shared.6.get_cache_options(),
-                                                                &shared.6.cache_policy,
-                                                                &shared.6.remote_multimodal,
+                                                                shared.6.cache_namespace_str(),
+                                                                &shared.6.chrome_fetch_params(),
+                                                                &shared.1,
+                                                                &shared.3,
+                                                                &mut links,
+                                                                &mut links_pages,
+                                                                full_resources,
+                                                                skip_links,
+                                                                false,
                                                             )
                                                             .await;
 
                                                             // Chrome requests are prone to transient tab/CDP failures.
-                                                            // Ensure at least 2 retries even when the user left retry at 0.
-                                                            let mut retry_count = shared.6.retry.max(CHROME_MIN_RETRY);
+                                                            let mut retry_count: u32 = match &retry_strategy_ref {
+                                                                Some(s) => s.max_retries(),
+                                                                None => shared.6.retry as u32,
+                                                            };
                                                             let mut attempt: u32 = 0;
 
                                                             while page.needs_retry() && retry_count > 0 {
                                                                 retry_count -= 1;
+                                                                attempt += 1;
+
+                                                                // Consult the retry strategy if set.
+                                                                let (_directive_backoff, _directive_profile_key) = match &retry_strategy_ref {
+                                                                    Some(s) => {
+                                                                        let outcome = crate::retry_strategy::AttemptOutcome {
+                                                                            attempt,
+                                                                            status_code: page.status_code,
+                                                                            should_retry: page.should_retry,
+                                                                            content_truncated: page.content_truncated,
+                                                                            waf_check: page.waf_check,
+                                                                            anti_bot_tech: &page.anti_bot_tech,
+                                                                            proxy_configured: page.proxy_configured,
+                                                                            url: target_url,
+                                                                            profile_key: page.profile_key.as_deref(),
+                                                                            html_length: page.size(),
+                                                                            bytes_transferred: page.bytes_transferred,
+                                                                            #[cfg(not(feature = "page_error_status_details"))]
+                                                                            error_status: page.error_status.as_deref(),
+                                                                            #[cfg(feature = "page_error_status_details")]
+                                                                            error_status: None,
+                                                                            final_redirect_destination: page.final_redirect_destination.as_deref(),
+                                                                        };
+                                                                        let directive = s.on_retry(&outcome);
+                                                                        if !directive.should_retry {
+                                                                            break;
+                                                                        }
+                                                                        (directive.backoff, directive.profile_key)
+                                                                    }
+                                                                    None => (None, None),
+                                                                };
 
                                                                 // Exponential backoff with jitter between retries.
-                                                                // get_timeout() covers 429/504/598-599 specific delays;
-                                                                // backoff_delay covers everything else with increasing waits.
                                                                 let status_delay = page.get_timeout().unwrap_or_default();
-                                                                let backoff = crate::utils::backoff::backoff_delay(attempt, 200, 15_000);
+                                                                let backoff = _directive_backoff
+                                                                    .unwrap_or_else(|| crate::utils::backoff::backoff_delay(attempt - 1, 200, 15_000));
                                                                 tokio::time::sleep(status_delay.max(backoff)).await;
-                                                                attempt += 1;
 
                                                                 // Create a fresh tab for the retry to avoid reusing a
                                                                 // potentially corrupted tab (stale CDP session, bloated
                                                                 // memory, stuck navigation).
                                                                 if let Ok(retry_page) = attempt_navigation("about:blank", &shared.5, &shared.6.request_timeout, &shared.8, &shared.6.viewport).await {
+                                                                    let _retry_guard = crate::features::chrome::TabCloseGuard::new(retry_page.clone());
+
                                                                     let _ = tokio::join!(
                                                                         crate::features::chrome::setup_chrome_events(&retry_page, &shared.6),
                                                                         crate::features::chrome::setup_chrome_interception_base(
@@ -6877,29 +9743,63 @@ impl Website {
                                                                         )
                                                                     );
 
-                                                                    if let Err(_elapsed) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
-                                                                        let p = Page::new(
-                                                                            target_url,
-                                                                            &shared.0,
-                                                                            &retry_page,
-                                                                            &shared.6.wait_for,
-                                                                            &shared.6.screenshot,
-                                                                            false,
-                                                                            &shared.6.openai_config,
-                                                                            &shared.6.execution_scripts,
-                                                                            &shared.6.automation_scripts,
-                                                                            &shared.6.viewport,
-                                                                            &shared.6.request_timeout,
-                                                                            &shared.6.track_events,
-                                                                            shared.6.referer.clone(),
-                                                                            shared.6.max_page_bytes,
-                                                                            shared.6.get_cache_options(),
-                                                                            &shared.6.cache_policy,
-                                                                            &shared.6.remote_multimodal,
-                                                                        ).await;
-                                                                        page = p;
-                                                                    }).await {
-                                                                        log::info!("{target_url} chrome retry backoff timeout exceeded {_elapsed}");
+                                                                    // Drop prior attempt's extracted state so only the
+                                                                    // final attempt's links flow downstream.
+                                                                    links.clear();
+                                                                    if let Some(ref mut lp) = links_pages { lp.clear(); }
+
+                                                                    // Run the retry fetch under a backoff timeout. The
+                                                                    // assignment to `page` happens *outside* the timeout —
+                                                                    // so on `Err` the future is cancelled before `page` is
+                                                                    // touched and `_retry_guard`'s Drop disposes
+                                                                    // `retry_page` safely. On `Ok` we commit the swap below,
+                                                                    // moving `retry_page` into the outer `_tab_guard` so
+                                                                    // cancellation safety follows the tab whose clone is
+                                                                    // now on `page.chrome_page`.
+                                                                    match tokio::time::timeout(BACKOFF_MAX_DURATION, Page::new_streaming(
+                                                                        target_url,
+                                                                        &shared.0,
+                                                                        &retry_page,
+                                                                        false,
+                                                                        shared.6.referer.clone(),
+                                                                        shared.6.max_page_bytes,
+                                                                        shared.6.get_cache_options(),
+                                                                        shared.6.cache_namespace_str(),
+                                                                        &shared.6.chrome_fetch_params(),
+                                                                        &shared.1,
+                                                                        &shared.3,
+                                                                        &mut links,
+                                                                        &mut links_pages,
+                                                                        full_resources,
+                                                                        skip_links,
+                                                                        false,
+                                                                    )).await {
+                                                                        Ok((p, succ)) => {
+                                                                            page = p;
+                                                                            extract_succeeded = succ;
+                                                                        }
+                                                                        Err(_elapsed) => {
+                                                                            log::info!("{target_url} chrome retry backoff timeout exceeded {_elapsed}");
+                                                                            page.should_retry = false;
+                                                                            break;
+                                                                        }
+                                                                    }
+
+                                                                    // Stamp profile key from strategy.
+                                                                    if let Some(ref pk) = _directive_profile_key {
+                                                                        page.profile_key = Some(pk.clone());
+                                                                    }
+
+                                                                    // `page.chrome_page` now holds a clone of `retry_page`
+                                                                    // (when `chrome_store_page` is enabled). Move it into
+                                                                    // the outer guard so the tab the subscriber owns is
+                                                                    // the one being protected from now on. The prior tab
+                                                                    // (initial `new_page` or a superseded retry) is no
+                                                                    // longer referenced — close it now to free chrome
+                                                                    // resources.
+                                                                    _retry_guard.defuse();
+                                                                    if let Some(prior) = _tab_guard.swap(retry_page.clone()) {
+                                                                        let _ = prior.close().await;
                                                                     }
                                                                 } else {
                                                                     log::warn!("{target_url} chrome retry tab creation failed, attempt {attempt}");
@@ -6912,6 +9812,17 @@ impl Website {
                                                                     log::warn!("Handler timeout exceeded {elasped}");
                                                                     abort_handle.abort();
                                                                 }
+                                                            }
+
+                                                            // Final tab disposition. With `chrome_store_page` enabled the
+                                                            // subscriber owns the live tab via `Page::chrome_page` and is
+                                                            // expected to call `Page::close_page()` when done — leave the
+                                                            // guard disarmed so the tab stays open. Without the feature,
+                                                            // close the tab now (legacy behavior).
+                                                            if cfg!(feature = "chrome_store_page") {
+                                                                _tab_guard.defuse();
+                                                            } else if let Some(active) = _tab_guard.into_inner() {
+                                                                let _ = active.close().await;
                                                             }
 
                                                             // ── Parallel backends: binary content-type early-out (Chrome non-hedge) ──
@@ -6937,6 +9848,16 @@ impl Website {
                                                             #[cfg(feature = "parallel_backends")]
                                                             if let Some(ref mut pb_set) = pb_backend_set {
                                                                 if let (Some(ref pb_cfg), Some(ref pb_trk)) = (&pb_config_ref, &pb_tracker_ref) {
+                                                                if crate::page::is_permanent_target_failure(page.status_code) {
+                                                                    // Permanent destination-side failure — every backend
+                                                                    // would hit the same DNS/network/redirect condition.
+                                                                    // Skip scoring + grace period entirely.
+                                                                    pb_set.abort_all();
+                                                                    pb_trk.record_race(0);
+                                                                    pb_trk.record_success(0);
+                                                                    pb_trk.record_win(0);
+                                                                    crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
+                                                                } else {
                                                                     let primary_score = crate::utils::parallel_backends::html_quality_score_validated(
                                                                         page.get_bytes(),
                                                                         page.status_code,
@@ -6987,6 +9908,8 @@ impl Website {
                                                                             log::info!("[parallel_backends] backend {} won for {} (score={}, primary={})", winner.backend_index, page.get_url(), winner.quality_score, primary_score);
                                                                             pb_trk.record_win(winner.backend_index);
                                                                             page = winner.page;
+                                                                            // Body changed — invalidate streamed extraction.
+                                                                            extract_succeeded = false;
                                                                         } else {
                                                                             pb_trk.record_win(0);
                                                                             crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
@@ -6997,9 +9920,14 @@ impl Website {
                                                                         crate::utils::parallel_backends::tag_page_source(&mut page, "primary");
                                                                     }
                                                                 }
+                                                                }
                                                             }
+                                                            // Drop the JoinSet so completed-but-unread backend
+                                                            // responses are freed before downstream processing.
+                                                            #[cfg(feature = "parallel_backends")]
+                                                            drop(pb_backend_set);
 
-                                                            chrome_page_post_process!(page, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit)
+                                                            chrome_page_post_process!(page, links, links_pages, extract_succeeded, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit)
                                                         }
                                                         _ => Default::default(),
                                                     }
@@ -7010,6 +9938,10 @@ impl Website {
 
                                                     results
                                                 });
+                                            } else {
+                                                self.links_visited.remove(&link);
+                                                self.extra_links_insert(link);
+                                                break;
                                             }
 
                                             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
@@ -7053,7 +9985,7 @@ impl Website {
                             b.dispose();
                             // store the extra links.
                             if !links.is_empty() {
-                                self.extra_links.extend(links);
+                                self.extra_links_extend(links);
                             }
                         }
                     }
@@ -7154,6 +10086,7 @@ impl Website {
             ));
 
             let mut set: JoinSet<(HashSet<CaseInsensitiveString>, Option<u64>)> = JoinSet::new();
+            let retry_strategy_ref = self.retry_strategy.clone();
 
             // track budgeting one time.
             let mut exceeded_budget = false;
@@ -7180,10 +10113,6 @@ impl Website {
                 let mut stream = tokio_stream::iter(std::mem::take(&mut links));
 
                 loop {
-                    if !concurrency {
-                        tokio::time::sleep(*throttle).await;
-                    }
-
                     let semaphore =
                         get_semaphore(&semaphore, !self.configuration.shared_queue).await;
 
@@ -7192,9 +10121,7 @@ impl Website {
                         Some(link) = stream.next(), if semaphore.available_permits() > 0 && !crawl_duration_expired(&self.configuration.crawl_timeout, &crawl_breaker)   => {
                             if !self.handle_process(handle, &mut interval, async {
                                 emit_log_shutdown(link.inner());
-                                let permits = set.len();
                                 set.shutdown().await;
-                                semaphore.add_permits(permits);
                             }).await {
                                 break 'outer;
                             }
@@ -7211,12 +10138,18 @@ impl Website {
 
                             emit_log(link.inner());
 
-                            website.insert_link(link.clone()).await;
+                            website.insert_link(&link).await;
+
+                            if !concurrency {
+                                tokio::time::sleep(*throttle).await;
+                            }
 
                             if let Ok(permit) = semaphore.clone().acquire_owned().await {
                                 let shared = shared.clone();
                                 let on_should_crawl_callback = on_should_crawl_callback.clone();
                                 let rotator = client_rotator.clone();
+                                #[allow(unused_variables)]
+                                let retry_strategy_ref = retry_strategy_ref.clone();
                                 #[cfg(feature = "hedge")]
                                 let hedge_cfg = hedge_config.clone();
                                 #[cfg(feature = "hedge")]
@@ -7249,8 +10182,8 @@ impl Website {
                                                 let fetch_start = Instant::now();
 
                                                 let primary_fut = async {
-                                                    let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                                    let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                                    let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                                    let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                                     let mut selectors = shared.1.clone();
                                                     let mut r_settings = shared.7;
                                                     r_settings.ssg_build = true;
@@ -7259,7 +10192,7 @@ impl Website {
                                                         target_url, primary_client, only_html,
                                                         &mut selectors, external_domains_caseless,
                                                         &r_settings, &mut links, None, &shared.8,
-                                                        &mut domain_parsed, &mut links_pages).await;
+                                                        &mut domain_parsed, &mut links_pages, (None, None)).await;
                                                     (page, links, links_pages)
                                                 };
 
@@ -7275,8 +10208,8 @@ impl Website {
                                                             hedge_trk.hedge_win_rate_pct(), hedge_trk.consecutive_errors(), target_url);
 
                                                         let hedge_fut = async {
-                                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                                            let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                                            let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                                             let mut selectors = shared.1.clone();
                                                             let mut r_settings = shared.7;
                                                             r_settings.ssg_build = true;
@@ -7285,7 +10218,7 @@ impl Website {
                                                                 target_url, hedge_client, only_html,
                                                                 &mut selectors, external_domains_caseless,
                                                                 &r_settings, &mut links, None, &shared.8,
-                                                                &mut domain_parsed, &mut links_pages).await;
+                                                                &mut domain_parsed, &mut links_pages, (None, None)).await;
                                                             (page, links, links_pages)
                                                         };
 
@@ -7315,8 +10248,8 @@ impl Website {
                                                 result
                                             } else {
                                                 let fetch_start = Instant::now();
-                                                let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                                let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                                let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                                let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                                 let mut selectors = shared.1.clone();
                                                 let mut r_settings = shared.7;
                                                 r_settings.ssg_build = true;
@@ -7325,7 +10258,7 @@ impl Website {
                                                     target_url, primary_client, only_html,
                                                     &mut selectors, external_domains_caseless,
                                                     &r_settings, &mut links, None, &shared.8,
-                                                    &mut domain_parsed, &mut links_pages).await;
+                                                    &mut domain_parsed, &mut links_pages, (None, None)).await;
                                                 hedge_trk.record(fetch_start.elapsed());
                                                 if page.status_code.is_server_error() {
                                                     hedge_trk.record_error();
@@ -7340,8 +10273,8 @@ impl Website {
                                                 None => &shared.0,
                                             };
                                             let fetch_start = Instant::now();
-                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
-                                            let mut links_pages = if return_page_links { Some(HashSet::new()) } else { None };
+                                            let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
+                                            let mut links_pages = if return_page_links { Some(HashSet::with_capacity(32)) } else { None };
                                             let mut selectors = shared.1.clone();
                                             let mut r_settings = shared.7;
                                             r_settings.ssg_build = true;
@@ -7350,7 +10283,7 @@ impl Website {
                                                 target_url, client, only_html,
                                                 &mut selectors, external_domains_caseless,
                                                 &r_settings, &mut links, None, &shared.8,
-                                                &mut domain_parsed, &mut links_pages).await;
+                                                &mut domain_parsed, &mut links_pages, (None, None)).await;
                                             hedge_trk.record(fetch_start.elapsed());
                                             if page.status_code.is_server_error() {
                                                 hedge_trk.record_error();
@@ -7367,9 +10300,9 @@ impl Website {
                                             Some(r) => r.next(),
                                             None => &shared.0,
                                         };
-                                        let mut links: HashSet<CaseInsensitiveString> = HashSet::new();
+                                        let mut links: HashSet<CaseInsensitiveString> = HashSet::with_capacity(32);
                                         let mut links_pages = if return_page_links {
-                                            Some(HashSet::new())
+                                            Some(HashSet::with_capacity(32))
                                         } else {
                                             None
                                         };
@@ -7387,18 +10320,54 @@ impl Website {
                                             None,
                                             &shared.8,
                                             &mut domain_parsed,
-                                            &mut links_pages).await;
+                                            &mut links_pages, (None, None)).await;
                                         (page, links, links_pages)
                                     };
 
-                                    let mut retry_count = shared.5;
+                                    let mut retry_count: u32 = match &retry_strategy_ref {
+                                        Some(s) => s.max_retries(),
+                                        None => shared.5 as u32,
+                                    };
+                                    let mut attempt: u32 = 0;
 
                                     while page.needs_retry() && retry_count > 0 {
                                         retry_count -= 1;
+                                        attempt += 1;
 
-                                        if let Some(timeout) = page.get_timeout() {
-                                            tokio::time::sleep(timeout).await;
-                                        }
+                                        // Consult the retry strategy if set.
+                                        let (_directive_backoff, _directive_profile_key) = match &retry_strategy_ref {
+                                            Some(s) => {
+                                                let outcome = crate::retry_strategy::AttemptOutcome {
+                                                    attempt,
+                                                    status_code: page.status_code,
+                                                    should_retry: page.should_retry,
+                                                    content_truncated: page.content_truncated,
+                                                    waf_check: page.waf_check,
+                                                    anti_bot_tech: &page.anti_bot_tech,
+                                                    proxy_configured: page.proxy_configured,
+                                                    url: target_url,
+                                                    profile_key: page.profile_key.as_deref(),
+                                                    html_length: page.size(),
+                                                    bytes_transferred: page.bytes_transferred,
+                                                    #[cfg(not(feature = "page_error_status_details"))]
+                                                    error_status: page.error_status.as_deref(),
+                                                    #[cfg(feature = "page_error_status_details")]
+                                                    error_status: None,
+                                                    final_redirect_destination: page.final_redirect_destination.as_deref(),
+                                                };
+                                                let directive = s.on_retry(&outcome);
+                                                if !directive.should_retry {
+                                                    break;
+                                                }
+                                                (directive.backoff, directive.profile_key)
+                                            }
+                                            None => (None, None),
+                                        };
+
+                                        let status_delay = page.get_timeout().unwrap_or_default();
+                                        let backoff = _directive_backoff
+                                            .unwrap_or_else(|| crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000));
+                                        tokio::time::sleep(status_delay.max(backoff)).await;
 
                                         let retry_client = match &rotator {
                                             Some(r) => r.next(),
@@ -7420,7 +10389,7 @@ impl Website {
                                                     None,
                                                     &shared.8,
                                                     &mut domain_parsed,
-                                                    &mut links_pages).await;
+                                                    &mut links_pages, (None, None)).await;
 
                                                 page = next_page;
 
@@ -7444,7 +10413,12 @@ impl Website {
                                                 None,
                                                 &shared.8,
                                                 &mut domain_parsed,
-                                                &mut links_pages).await;
+                                                &mut links_pages, (None, None)).await;
+                                        }
+
+                                        // Stamp profile key from strategy.
+                                        if let Some(ref pk) = _directive_profile_key {
+                                            page.profile_key = Some(pk.clone());
                                         }
                                     }
 
@@ -7485,7 +10459,7 @@ impl Website {
                                     if let Some(ref cb) = on_should_crawl_callback {
                                         if !cb.call(&page) {
                                             page.blocked_crawl = true;
-                                            channel_send_page(&shared.2, page, &shared.4);
+                                            channel_send_page(&shared.2, page, &shared.4).await;
                                             drop(permit);
                                             return Default::default()
                                         }
@@ -7493,12 +10467,16 @@ impl Website {
 
                                     let signature = page.signature;
 
-                                    channel_send_page(&shared.2, page, &shared.4);
+                                    channel_send_page(&shared.2, page, &shared.4).await;
 
                                     drop(permit);
 
                                     (links, signature)
                                 });
+                            } else {
+                                website.links_visited.remove(&link);
+                                website.extra_links_insert(link);
+                                break;
                             }
 
                             website.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
@@ -7595,7 +10573,14 @@ impl Website {
                         }
 
                         let base_links = website
-                            .crawl_establish(client, &mut selectors, false, &new_page)
+                            .crawl_establish(
+                                client,
+                                &mut selectors,
+                                false,
+                                &new_page,
+                                &b.browser.0,
+                                &b.browser_dead,
+                            )
                             .await;
 
                         drop(new_page);
@@ -7611,7 +10596,7 @@ impl Website {
                             let mut q = self.channel_queue.as_ref().map(|q| q.0.subscribe());
 
                             let mut links: HashSet<CaseInsensitiveString> =
-                                *self.extra_links.clone();
+                                (*self.extra_links).clone();
 
                             links.extend(base_links);
 
@@ -7631,12 +10616,17 @@ impl Website {
                                 self.domain_parsed.clone(),
                                 self.on_link_find_callback.clone(),
                                 b.browser_dead.clone(),
+                                b.connected_url.clone(),
                             ));
 
                             let add_external = !shared.3.is_empty();
                             let on_should_crawl_callback = self.on_should_crawl_callback.clone();
+                            let retry_strategy_ref = self.retry_strategy.clone();
                             let full_resources = self.configuration.full_resources;
                             let return_page_links = self.configuration.return_page_links;
+                            // Honor single-page mode: skip link extraction
+                            // entirely when no caller actually needs the links.
+                            let skip_links = self.single_page() && !return_page_links;
                             #[cfg(feature = "hedge")]
                             let hedge_config = self.configuration.hedge.clone();
                             #[cfg(feature = "hedge")]
@@ -7663,15 +10653,9 @@ impl Website {
                                 #[cfg(all(feature = "agent", feature = "serde"))]
                                 self.apply_url_prefilter(&mut links).await;
 
-                                let mut stream = tokio_stream::iter::<HashSet<CaseInsensitiveString>>(
-                                    links.drain().collect(),
-                                );
+                                let mut stream = tokio_stream::iter(std::mem::take(&mut links));
 
                                 loop {
-                                    if !concurrency {
-                                        tokio::time::sleep(*throttle).await;
-                                    }
-
                                     let semaphore =
                                         get_semaphore(&semaphore, !self.configuration.shared_queue)
                                             .await;
@@ -7685,9 +10669,7 @@ impl Website {
                                                     &mut interval,
                                                     async {
                                                         emit_log_shutdown(link.inner());
-                                                        let permits = set.len();
                                                         set.shutdown().await;
-                                                        semaphore.add_permits(permits);
                                                     },
                                                 )
                                                 .await
@@ -7709,11 +10691,17 @@ impl Website {
 
                                             emit_log(link.inner());
 
-                                            website.insert_link(link.clone()).await;
+                                            website.insert_link(&link).await;
+
+                                            if !concurrency {
+                                                tokio::time::sleep(*throttle).await;
+                                            }
 
                                             if let Ok(permit) = semaphore.clone().acquire_owned().await {
                                                 let shared = shared.clone();
                                                 let on_should_crawl_callback = on_should_crawl_callback.clone();
+                                                #[allow(unused_variables)]
+                                                let retry_strategy_ref = retry_strategy_ref.clone();
                                                 #[cfg(feature = "hedge")]
                                                 let hedge_cfg = hedge_config.clone();
                                                 #[cfg(feature = "hedge")]
@@ -7725,9 +10713,10 @@ impl Website {
                                                             Some(cb) => cb(link, None),
                                                             _ => (link, None),
                                                         };
-                                                    let target_url_string = link_result.0.as_ref().to_string();
+                                                    let target_url_string =
+                                                        link_result.0.into_string();
 
-                                                    // Hedge-enabled Chrome path: race primary tab vs hedge tab
+                                                    // Hedge-enabled Chrome path: race primary tab vs hedge tab (new WS connection)
                                                     #[cfg(feature = "hedge")]
                                                     if shared.11.load(std::sync::atomic::Ordering::Acquire) {
                                                         log::warn!("{target_url_string} skipping fetch: browser is dead");
@@ -7740,10 +10729,15 @@ impl Website {
                                                         let target_url = target_url_string.as_str();
                                                         let fetch_start = Instant::now();
 
-                                                        let page_opt: Option<Page> = if should_hedge {
+                                                        let page_opt: Option<(
+                                                            Page,
+                                                            hashbrown::HashSet<CaseInsensitiveString>,
+                                                            Option<hashbrown::HashSet<CaseInsensitiveString>>,
+                                                            bool,
+                                                        )> = if should_hedge {
                                                             let base_delay = hedge_cfg.as_ref().unwrap().delay;
                                                             let delay = hedge_trk.adaptive_delay(base_delay);
-                                                            let primary_fut = async { chrome_page_fetch!(shared, target_url) };
+                                                            let primary_fut = async { chrome_page_fetch!(shared, target_url, retry_strategy_ref, full_resources, return_page_links, skip_links) };
                                                             tokio::pin!(primary_fut);
 
                                                             let result = tokio::select! {
@@ -7754,34 +10748,70 @@ impl Website {
                                                                     log::info!("[hedge-chrome] fired after {}ms (ema={}ms, stddev={}ms, win={}%, errs={}) url={}",
                                                                         delay.as_millis(), hedge_trk.ema_ms(), hedge_trk.stddev_ms(),
                                                                         hedge_trk.hedge_win_rate_pct(), hedge_trk.consecutive_errors(), target_url);
-                                                                    let hedge_fut = async { chrome_page_fetch!(shared, target_url) };
-                                                                    tokio::pin!(hedge_fut);
-                                                                    tokio::select! {
-                                                                        biased;
-                                                                        result = &mut primary_fut => {
-                                                                            log::info!("[hedge-chrome] winner: primary url={}", target_url);
-                                                                            hedge_trk.record_outcome(false);
-                                                                            result
+
+                                                                    // Decide based on already-collected signals whether
+                                                                    // to escalate to a new WS connection (zero latency
+                                                                    // check — pure atomic reads, no CDP round-trip).
+                                                                    let hedge_browser = if crate::features::chrome::HedgeBrowser::should_new_connection(
+                                                                        &hedge_trk, &shared.11,
+                                                                    ) {
+                                                                        log::info!("[hedge-chrome] signals indicate connection-level issue, opening new WS");
+                                                                        crate::features::chrome::HedgeBrowser::connect(
+                                                                            &shared.5, &shared.6,
+                                                                        ).await
+                                                                    } else {
+                                                                        None
+                                                                    };
+
+                                                                    // Scope hedge_fut to release its borrow on
+                                                                    // hedge_browser before we move it into close().
+                                                                    let race_result = {
+                                                                        let hedge_fut = async {
+                                                                            match &hedge_browser {
+                                                                                Some(hb) => {
+                                                                                    log::info!("[hedge-chrome] using new WS connection url={}", target_url);
+                                                                                    chrome_page_fetch_on!(shared, target_url, hb, full_resources, return_page_links, skip_links)
+                                                                                }
+                                                                                None => {
+                                                                                    chrome_page_fetch!(shared, target_url, retry_strategy_ref, full_resources, return_page_links, skip_links)
+                                                                                }
+                                                                            }
+                                                                        };
+                                                                        tokio::pin!(hedge_fut);
+
+                                                                        tokio::select! {
+                                                                            biased;
+                                                                            result = &mut primary_fut => {
+                                                                                log::info!("[hedge-chrome] winner: primary url={}", target_url);
+                                                                                hedge_trk.record_outcome(false);
+                                                                                result
+                                                                            }
+                                                                            result = &mut hedge_fut => {
+                                                                                log::info!("[hedge-chrome] winner: hedge url={}", target_url);
+                                                                                hedge_trk.record_outcome(true);
+                                                                                result
+                                                                            }
                                                                         }
-                                                                        result = &mut hedge_fut => {
-                                                                            log::info!("[hedge-chrome] winner: hedge url={}", target_url);
-                                                                            hedge_trk.record_outcome(true);
-                                                                            result
-                                                                        }
+                                                                    };
+                                                                    // Explicitly dispose the isolated remote context
+                                                                    // via CDP before the websocket drops.
+                                                                    if let Some(hb) = hedge_browser {
+                                                                        hb.close().await;
                                                                     }
+                                                                    race_result
                                                                 }
                                                             };
                                                             hedge_trk.record(fetch_start.elapsed());
-                                                            if result.as_ref().is_some_and(|p| p.status_code.is_server_error()) {
+                                                            if result.as_ref().is_some_and(|t| t.0.status_code.is_server_error()) {
                                                                 hedge_trk.record_error();
                                                             } else if result.is_some() {
                                                                 hedge_trk.record_success();
                                                             }
                                                             result
                                                         } else {
-                                                            let result = chrome_page_fetch!(shared, target_url);
+                                                            let result = chrome_page_fetch!(shared, target_url, retry_strategy_ref, full_resources, return_page_links, skip_links);
                                                             hedge_trk.record(fetch_start.elapsed());
-                                                            if result.as_ref().is_some_and(|p| p.status_code.is_server_error()) {
+                                                            if result.as_ref().is_some_and(|t| t.0.status_code.is_server_error()) {
                                                                 hedge_trk.record_error();
                                                             } else if result.is_some() {
                                                                 hedge_trk.record_success();
@@ -7790,7 +10820,7 @@ impl Website {
                                                         };
 
                                                         match page_opt {
-                                                            Some(page) => chrome_page_post_process!(page, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit),
+                                                            Some((page, pre_links, pre_links_pages, extract_succeeded)) => chrome_page_post_process!(page, pre_links, pre_links_pages, extract_succeeded, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit),
                                                             None => Default::default(),
                                                         }
                                                     };
@@ -7807,6 +10837,11 @@ impl Website {
                                                         let target_url = target_url_string.as_str();
                                                         match attempt_navigation("about:blank", &shared.5, &shared.6.request_timeout, &shared.8, &shared.6.viewport).await {
                                                             Ok(new_page) => {
+                                                                // `mut` so the retry loop can swap a fresh tab into the
+                                                                // guard (and dispose the prior one). See
+                                                                // `TabCloseGuard::swap`.
+                                                                let mut _tab_guard = crate::features::chrome::TabCloseGuard::new(new_page.clone());
+
                                                                 let (_, intercept_handle) = tokio::join!(
                                                                     crate::features::chrome::setup_chrome_events(&new_page, &shared.6),
                                                                     crate::features::chrome::setup_chrome_interception_base(
@@ -7818,38 +10853,79 @@ impl Website {
                                                                     )
                                                                 );
 
-                                                                let mut page = Page::new(
+                                                                let mut links: hashbrown::HashSet<CaseInsensitiveString> =
+                                                                    hashbrown::HashSet::with_capacity(crate::page::link_set_capacity());
+                                                                let mut links_pages: Option<hashbrown::HashSet<CaseInsensitiveString>> =
+                                                                    if return_page_links { Some(Default::default()) } else { None };
+
+                                                                let (mut page, mut extract_succeeded) = Page::new_streaming(
                                                                     target_url,
                                                                     &shared.0,
                                                                     &new_page,
-                                                                    &shared.6.wait_for,
-                                                                    &shared.6.screenshot,
                                                                     false,
-                                                                    &shared.6.openai_config,
-                                                                    &shared.6.execution_scripts,
-                                                                    &shared.6.automation_scripts,
-                                                                    &shared.6.viewport,
-                                                                    &shared.6.request_timeout,
-                                                                    &shared.6.track_events,
                                                                     shared.6.referer.clone(),
                                                                     shared.6.max_page_bytes,
                                                                     shared.6.get_cache_options(),
-                                                                    &shared.6.cache_policy,
-                                                                    &shared.6.remote_multimodal,
+                                                                    shared.6.cache_namespace_str(),
+                                                                    &shared.6.chrome_fetch_params(),
+                                                                    &shared.1,
+                                                                    &shared.3,
+                                                                    &mut links,
+                                                                    &mut links_pages,
+                                                                    full_resources,
+                                                                    skip_links,
+                                                                    false,
                                                                 )
                                                                 .await;
 
-                                                                let mut retry_count = shared.6.retry.max(CHROME_MIN_RETRY);
+                                                                let mut retry_count: u32 = match &retry_strategy_ref {
+                                                                    Some(s) => s.max_retries(),
+                                                                    None => shared.6.retry as u32,
+                                                                };
                                                                 let mut attempt: u32 = 0;
 
                                                                 while page.needs_retry() && retry_count > 0 {
                                                                     retry_count -= 1;
-                                                                    let status_delay = page.get_timeout().unwrap_or_default();
-                                                                    let backoff = crate::utils::backoff::backoff_delay(attempt, 200, 15_000);
-                                                                    tokio::time::sleep(status_delay.max(backoff)).await;
                                                                     attempt += 1;
 
+                                                                    // Consult the retry strategy if set.
+                                                                    let (_directive_backoff, _directive_profile_key) = match &retry_strategy_ref {
+                                                                        Some(s) => {
+                                                                            let outcome = crate::retry_strategy::AttemptOutcome {
+                                                                                attempt,
+                                                                                status_code: page.status_code,
+                                                                                should_retry: page.should_retry,
+                                                                                content_truncated: page.content_truncated,
+                                                                                waf_check: page.waf_check,
+                                                                                anti_bot_tech: &page.anti_bot_tech,
+                                                                                proxy_configured: page.proxy_configured,
+                                                                                url: target_url,
+                                                                                profile_key: page.profile_key.as_deref(),
+                                                                                html_length: page.size(),
+                                                                                bytes_transferred: page.bytes_transferred,
+                                                                                #[cfg(not(feature = "page_error_status_details"))]
+                                                                                error_status: page.error_status.as_deref(),
+                                                                                #[cfg(feature = "page_error_status_details")]
+                                                                                error_status: None,
+                                                                                final_redirect_destination: page.final_redirect_destination.as_deref(),
+                                                                            };
+                                                                            let directive = s.on_retry(&outcome);
+                                                                            if !directive.should_retry {
+                                                                                break;
+                                                                            }
+                                                                            (directive.backoff, directive.profile_key)
+                                                                        }
+                                                                        None => (None, None),
+                                                                    };
+
+                                                                    let status_delay = page.get_timeout().unwrap_or_default();
+                                                                    let backoff = _directive_backoff
+                                                                        .unwrap_or_else(|| crate::utils::backoff::backoff_delay(attempt - 1, 200, 15_000));
+                                                                    tokio::time::sleep(status_delay.max(backoff)).await;
+
                                                                     if let Ok(retry_page) = attempt_navigation("about:blank", &shared.5, &shared.6.request_timeout, &shared.8, &shared.6.viewport).await {
+                                                                        let _retry_guard = crate::features::chrome::TabCloseGuard::new(retry_page.clone());
+
                                                                         let _ = tokio::join!(
                                                                             crate::features::chrome::setup_chrome_events(&retry_page, &shared.6),
                                                                             crate::features::chrome::setup_chrome_interception_base(
@@ -7861,29 +10937,53 @@ impl Website {
                                                                             )
                                                                         );
 
-                                                                        if let Err(_elapsed) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
-                                                                            let p = Page::new(
-                                                                                target_url,
-                                                                                &shared.0,
-                                                                                &retry_page,
-                                                                                &shared.6.wait_for,
-                                                                                &shared.6.screenshot,
-                                                                                false,
-                                                                                &shared.6.openai_config,
-                                                                                &shared.6.execution_scripts,
-                                                                                &shared.6.automation_scripts,
-                                                                                &shared.6.viewport,
-                                                                                &shared.6.request_timeout,
-                                                                                &shared.6.track_events,
-                                                                                shared.6.referer.clone(),
-                                                                                shared.6.max_page_bytes,
-                                                                                shared.6.get_cache_options(),
-                                                                                &shared.6.cache_policy,
-                                                                                &shared.6.remote_multimodal,
-                                                                            ).await;
-                                                                            page = p;
-                                                                        }).await {
-                                                                            log::info!("{target_url} chrome retry backoff timeout exceeded {_elapsed}");
+                                                                        // Drop prior attempt's extracted state.
+                                                                        links.clear();
+                                                                        if let Some(ref mut lp) = links_pages { lp.clear(); }
+
+                                                                        // Run the retry fetch under a backoff timeout — see
+                                                                        // matching block above for the rationale.
+                                                                        match tokio::time::timeout(BACKOFF_MAX_DURATION, Page::new_streaming(
+                                                                            target_url,
+                                                                            &shared.0,
+                                                                            &retry_page,
+                                                                            false,
+                                                                            shared.6.referer.clone(),
+                                                                            shared.6.max_page_bytes,
+                                                                            shared.6.get_cache_options(),
+                                                                            shared.6.cache_namespace_str(),
+                                                                            &shared.6.chrome_fetch_params(),
+                                                                            &shared.1,
+                                                                            &shared.3,
+                                                                            &mut links,
+                                                                            &mut links_pages,
+                                                                            full_resources,
+                                                                            skip_links,
+                                                                            false,
+                                                                        )).await {
+                                                                            Ok((p, succ)) => {
+                                                                                page = p;
+                                                                                extract_succeeded = succ;
+                                                                            }
+                                                                            Err(_elapsed) => {
+                                                                                log::info!("{target_url} chrome retry backoff timeout exceeded {_elapsed}");
+                                                                                page.should_retry = false;
+                                                                                break;
+                                                                            }
+                                                                        }
+
+                                                                        // Stamp profile key from strategy.
+                                                                        if let Some(ref pk) = _directive_profile_key {
+                                                                            page.profile_key = Some(pk.clone());
+                                                                        }
+
+                                                                        // Move retry_page into the outer guard — the
+                                                                        // subscriber-visible `page.chrome_page` now holds
+                                                                        // its clone, so it must be the one being
+                                                                        // protected. Close the prior tab.
+                                                                        _retry_guard.defuse();
+                                                                        if let Some(prior) = _tab_guard.swap(retry_page.clone()) {
+                                                                            let _ = prior.close().await;
                                                                         }
                                                                     } else {
                                                                         log::warn!("{target_url} chrome retry tab creation failed, attempt {attempt}");
@@ -7898,7 +10998,14 @@ impl Website {
                                                                     }
                                                                 }
 
-                                                                chrome_page_post_process!(page, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit)
+                                                                // Final tab disposition — see matching block above.
+                                                                if cfg!(feature = "chrome_store_page") {
+                                                                    _tab_guard.defuse();
+                                                                } else if let Some(active) = _tab_guard.into_inner() {
+                                                                    let _ = active.close().await;
+                                                                }
+
+                                                                chrome_page_post_process!(page, links, links_pages, extract_succeeded, shared, add_external, full_resources, return_page_links, on_should_crawl_callback, permit)
                                                             }
                                                             _ => Default::default(),
                                                         }
@@ -7908,6 +11015,10 @@ impl Website {
 
                                                     results
                                                 });
+                                            } else {
+                                                website.links_visited.remove(&link);
+                                                website.extra_links_insert(link);
+                                                break;
                                             }
 
                                             website.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
@@ -7988,8 +11099,15 @@ impl Website {
                 {
                     Ok(new_page) => {
                         let mut selectors = self.setup_selectors();
-                        self.crawl_establish_chrome_one(client, &mut selectors, url, &new_page)
-                            .await;
+                        self.crawl_establish_chrome_one(
+                            client,
+                            &mut selectors,
+                            url,
+                            &new_page,
+                            &b.browser.0,
+                            &b.browser_dead,
+                        )
+                        .await;
                         self.subscription_guard().await;
                         b.dispose();
                     }
@@ -8026,8 +11144,15 @@ impl Website {
         {
             Ok(new_page) => {
                 let mut selectors = self.setup_selectors();
-                self.crawl_establish_chrome_one(client, &mut selectors, url, &new_page)
-                    .await;
+                self.crawl_establish_chrome_one(
+                    client,
+                    &mut selectors,
+                    url,
+                    &new_page,
+                    &b.browser.0,
+                    &b.browser_dead,
+                )
+                .await;
                 self.subscription_guard().await;
             }
             Err(err) => {
@@ -8103,6 +11228,7 @@ impl Website {
 
                     let add_external = !shared.3.is_empty();
                     let on_should_crawl_callback = self.on_should_crawl_callback.clone();
+                    let retry_strategy_ref = self.retry_strategy.clone();
                     let full_resources = self.configuration.full_resources;
                     let return_page_links = self.configuration.return_page_links;
                     let mut exceeded_budget = false;
@@ -8124,15 +11250,9 @@ impl Website {
                         #[cfg(all(feature = "agent", feature = "serde"))]
                         self.apply_url_prefilter(&mut links).await;
 
-                        let mut stream = tokio_stream::iter::<HashSet<CaseInsensitiveString>>(
-                            links.drain().collect(),
-                        );
+                        let mut stream = tokio_stream::iter(std::mem::take(&mut links));
 
                         loop {
-                            if !concurrency {
-                                tokio::time::sleep(*throttle).await;
-                            }
-
                             let semaphore =
                                 get_semaphore(&semaphore, !self.configuration.shared_queue).await;
 
@@ -8145,9 +11265,7 @@ impl Website {
                                             &mut interval,
                                             async {
                                                 emit_log_shutdown(link.inner());
-                                                let permits = set.len();
                                                 set.shutdown().await;
-                                                semaphore.add_permits(permits);
                                             },
                                         )
                                         .await
@@ -8167,11 +11285,16 @@ impl Website {
 
                                     emit_log(link.inner());
 
-                                    self.insert_link(link.clone()).await;
+                                    self.insert_link(&link).await;
+
+                                    if !concurrency {
+                                        tokio::time::sleep(*throttle).await;
+                                    }
 
                                     if let Ok(permit) = semaphore.clone().acquire_owned().await {
                                         let shared = shared.clone();
                                         let on_should_crawl_callback = on_should_crawl_callback.clone();
+                                        let retry_strategy_ref = retry_strategy_ref.clone();
 
                                         spawn_set("page_fetch_webdriver", &mut set, async move {
                                             let link_result = match &shared.9 {
@@ -8191,13 +11314,50 @@ impl Website {
                                             )
                                             .await;
 
-                                            let mut retry_count = shared.6.retry;
+                                            let mut retry_count: u32 = match &retry_strategy_ref {
+                                                Some(s) => s.max_retries(),
+                                                None => shared.6.retry as u32,
+                                            };
+                                            let mut attempt: u32 = 0;
 
                                             while page.needs_retry() && retry_count > 0 {
                                                 retry_count -= 1;
-                                                if let Some(timeout_duration) = page.get_timeout() {
-                                                    tokio::time::sleep(timeout_duration).await;
-                                                }
+                                                attempt += 1;
+
+                                                // Consult the retry strategy if set.
+                                                let (_directive_backoff, _directive_profile_key) = match &retry_strategy_ref {
+                                                    Some(s) => {
+                                                        let outcome = crate::retry_strategy::AttemptOutcome {
+                                                            attempt,
+                                                            status_code: page.status_code,
+                                                            should_retry: page.should_retry,
+                                                            content_truncated: page.content_truncated,
+                                                            waf_check: page.waf_check,
+                                                            anti_bot_tech: &page.anti_bot_tech,
+                                                            proxy_configured: page.proxy_configured,
+                                                            url: target_url,
+                                                            profile_key: page.profile_key.as_deref(),
+                                                            html_length: page.size(),
+                                                            bytes_transferred: page.bytes_transferred,
+                                                            #[cfg(not(feature = "page_error_status_details"))]
+                                                            error_status: page.error_status.as_deref(),
+                                                            #[cfg(feature = "page_error_status_details")]
+                                                            error_status: None,
+                                                            final_redirect_destination: page.final_redirect_destination.as_deref(),
+                                                        };
+                                                        let directive = s.on_retry(&outcome);
+                                                        if !directive.should_retry {
+                                                            break;
+                                                        }
+                                                        (directive.backoff, directive.profile_key)
+                                                    }
+                                                    None => (None, None),
+                                                };
+
+                                                let status_delay = page.get_timeout().unwrap_or_default();
+                                                let backoff = _directive_backoff
+                                                    .unwrap_or_else(|| crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000));
+                                                tokio::time::sleep(status_delay.max(backoff)).await;
                                                 if page.status_code == StatusCode::GATEWAY_TIMEOUT {
                                                     if let Err(elapsed) = tokio::time::timeout(BACKOFF_MAX_DURATION, async {
                                                         let p = Page::new_page_webdriver(
@@ -8208,6 +11368,8 @@ impl Website {
                                                         page = p;
                                                     }).await {
                                                         log::info!("{target_url} backoff gateway timeout exceeded {elapsed}");
+                                                        page.should_retry = false;
+                                                        break;
                                                     }
                                                 } else {
                                                     page = Page::new_page_webdriver(
@@ -8216,6 +11378,11 @@ impl Website {
                                                             shared.10,
                                                         )
                                                         .await;
+                                                }
+
+                                                // Stamp profile key from strategy.
+                                                if let Some(ref pk) = _directive_profile_key {
+                                                    page.profile_key = Some(pk.clone());
                                                 }
                                             }
 
@@ -8242,14 +11409,17 @@ impl Website {
 
                                             page.base = prev_domain;
 
-                                            if shared.6.normalize {
+                                            // See comment on the sibling site: pre-spooled pages
+                                            // already carry their signature; re-hashing the empty
+                                            // in-memory buffer would clobber it with 0.
+                                            if shared.6.normalize && page.signature.is_none() {
                                                 page.signature.replace(crate::utils::hash_html(page.get_html_bytes_u8()).await);
                                             }
 
                                             if let Some(ref cb) = on_should_crawl_callback {
                                                 if !cb.call(&page) {
                                                     page.blocked_crawl = true;
-                                                    channel_send_page(&shared.2, page, &shared.4);
+                                                    channel_send_page(&shared.2, page, &shared.4).await;
                                                     drop(permit);
                                                     return Default::default();
                                                 }
@@ -8257,12 +11427,16 @@ impl Website {
 
                                             let signature = page.signature;
 
-                                            channel_send_page(&shared.2, page, &shared.4);
+                                            channel_send_page(&shared.2, page, &shared.4).await;
 
                                             drop(permit);
 
                                             (links, signature)
                                         });
+                                    } else {
+                                        self.links_visited.remove(&link);
+                                        self.extra_links_insert(link);
+                                        break;
                                     }
 
                                     self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
@@ -8313,7 +11487,7 @@ impl Website {
                     controller.dispose();
 
                     if !links.is_empty() {
-                        self.extra_links.extend(links);
+                        self.extra_links_extend(links);
                     }
                 }
             }
@@ -8359,10 +11533,11 @@ impl Website {
         let mut interval = Box::pin(tokio::time::interval(Duration::from_millis(10)));
         let throttle = Box::pin(self.get_delay());
         let on_link_find_callback = self.on_link_find_callback.clone();
-        // http worker verify
-        let http_worker = std::env::var("SPIDER_WORKER")
-            .unwrap_or_else(|_| "http:".to_string())
-            .starts_with("http:");
+        // http worker verify — honors per-website override; falls back to env.
+        let http_worker = self.http_worker_active();
+        // Per-website override semaphore (None ⇒ use the legacy process-wide
+        // `SEM` for byte-identical behavior with pre-override builds).
+        let override_sem = self.override_worker_semaphore();
 
         let mut links: HashSet<CaseInsensitiveString> = self
             .crawl_establish(client, &(domain.into(), Default::default()), http_worker)
@@ -8405,21 +11580,29 @@ impl Website {
 
                         emit_log(link.inner());
 
-                        self.insert_link(link.clone()).await;
+                        self.insert_link(&link).await;
 
-                        if let Ok(permit) = SEM.acquire().await {
+                        let permit_result = match override_sem.as_ref() {
+                            Some(sem) => sem
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .map(WebsiteWorkerPermit::Owned),
+                            None => SEM.acquire().await.map(WebsiteWorkerPermit::Borrowed),
+                        };
+                        if let Ok(permit) = permit_result {
                             let client = client.clone();
                             let on_link_find_callback = on_link_find_callback.clone();
 
                             spawn_set("page_fetch", &mut set, async move {
-                                let link_results = match &on_link_find_callback.clone() {
+                                let link_results = match &on_link_find_callback {
                                     Some(cb) => cb(link, None),
                                     _ => (link, None),
                                 };
                                 let link_results = link_results.0.as_ref();
                                 let page = Page::new_links_only(
                                     &if http_worker && link_results.starts_with("https") {
-                                        link_results.replacen("https", "http", 1).to_string()
+                                        link_results.replacen("https", "http", 1)
                                     } else {
                                         link_results.to_string()
                                     },
@@ -8433,6 +11616,10 @@ impl Website {
                             });
 
                             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
+                        } else {
+                            self.links_visited.remove(&link);
+                            self.extra_links_insert(link);
+                            break;
                         }
                     }
                     _ => break,
@@ -8456,7 +11643,7 @@ impl Website {
         }
 
         if !links.is_empty() {
-            self.extra_links.extend(links);
+            self.extra_links_extend(links);
         }
     }
 
@@ -8502,7 +11689,7 @@ impl Website {
         ) = self.setup_selectors();
 
         if self.single_page() {
-            self.crawl_establish_smart(&client, &mut selectors, &browser)
+            self.crawl_establish_smart(client, &mut selectors, &browser)
                 .await;
             self.subscription_guard().await;
         } else {
@@ -8515,7 +11702,7 @@ impl Website {
             let return_page_links = self.configuration.return_page_links;
 
             links.extend(
-                self.crawl_establish_smart(&client, &mut selectors, &browser)
+                self.crawl_establish_smart(client, &mut selectors, &browser)
                     .await,
             );
 
@@ -8536,7 +11723,16 @@ impl Website {
                 self.cookie_jar.clone(),
             ));
 
-            let add_external = self.configuration.external_domains_caseless.len() > 0;
+            let add_external = !self.configuration.external_domains_caseless.is_empty();
+            let retry_strategy_ref = self.retry_strategy.clone();
+            // In-process HTTP fetch engine, cloned once per crawl. The full
+            // configuration is snapshotted into an `Arc` only when an engine
+            // is installed, so each spawned task can borrow it to build an
+            // `EngineFetchCtx` for parity with the reqwest path.
+            let engine_ref = self.fetch_engine.clone();
+            let engine_cfg = engine_ref
+                .as_ref()
+                .map(|_| std::sync::Arc::new((*self.configuration).clone()));
             let mut exceeded_budget = false;
             let concurrency = throttle.is_zero();
 
@@ -8559,10 +11755,6 @@ impl Website {
                 let mut stream = tokio_stream::iter(std::mem::take(&mut links));
 
                 loop {
-                    if !concurrency {
-                        tokio::time::sleep(*throttle).await;
-                    }
-
                     let semaphore =
                         get_semaphore(&semaphore, !self.configuration.shared_queue).await;
 
@@ -8574,10 +11766,8 @@ impl Website {
                                     handle,
                                     &mut interval,
                                     async {
-                                        emit_log_shutdown(&link.inner());
-                                        let permits = set.len();
+                                        emit_log_shutdown(link.inner());
                                         set.shutdown().await;
-                                        semaphore.add_permits(permits);
 
                                     },
                                 )
@@ -8596,35 +11786,93 @@ impl Website {
                                 continue;
                             }
 
-                            emit_log(&link.inner());
-                            self.insert_link(link.clone()).await;
+                            emit_log(link.inner());
+                            self.insert_link(&link).await;
+
+                            if !concurrency {
+                                tokio::time::sleep(*throttle).await;
+                            }
 
                             if let Ok(permit) = semaphore.clone().acquire_owned().await {
                                 let shared = shared.clone();
                                 let on_should_crawl_callback = on_should_crawl_callback.clone();
+                                let retry_strategy_ref = retry_strategy_ref.clone();
+                                let engine_ref = engine_ref.clone();
+                                let engine_cfg = engine_cfg.clone();
                                 spawn_set("page_fetch", &mut set, async move {
+                                    // Build a borrow-only engine context for this task from
+                                    // the cloned handle + config snapshot (both task-local).
+                                    let engine_ctx = match (engine_ref.as_ref(), engine_cfg.as_ref())
+                                    {
+                                        (Some(e), Some(cfg)) => Some(
+                                            crate::fetch_engine::EngineFetchCtx::new(e, cfg.as_ref()),
+                                        ),
+                                        _ => None,
+                                    };
                                     let link_result = match &shared.7 {
                                         Some(cb) => cb(link, None),
                                         _ => (link, None),
                                     };
 
                                     let url = link_result.0.as_ref();
-                                    let mut page = Page::new_page_with_cache(
-                                        &url,
+                                    let mut page = Page::new_page_with_cache_engine(
+                                        url,
                                         &shared.0,
                                         shared.4.get_cache_options(),
                                         &shared.4.cache_policy,
+                                        shared.4.cache_namespace_str(),
+                                        engine_ctx,
                                     )
                                     .await;
 
-                                    let mut retry_count = shared.4.retry;
+                                    let mut retry_count: u32 = match &retry_strategy_ref {
+                                        Some(s) => s.max_retries(),
+                                        None => shared.4.retry as u32,
+                                    };
+                                    let mut attempt: u32 = 0;
+                                    // Mirror of the establish-smart guard: track loop chrome
+                                    // invocations so the post-loop transport-failure fallback
+                                    // doesn't duplicate work the retry budget already covered.
+                                    let mut chrome_attempted = false;
 
                                     while page.needs_retry() && retry_count > 0 {
                                         retry_count -= 1;
+                                        attempt += 1;
 
-                                        if let Some(timeout) = page.get_timeout() {
-                                            tokio::time::sleep(timeout).await;
-                                        }
+                                        // Consult the retry strategy if set.
+                                        let (_directive_backoff, _directive_profile_key) = match &retry_strategy_ref {
+                                            Some(s) => {
+                                                let outcome = crate::retry_strategy::AttemptOutcome {
+                                                    attempt,
+                                                    status_code: page.status_code,
+                                                    should_retry: page.should_retry,
+                                                    content_truncated: page.content_truncated,
+                                                    waf_check: page.waf_check,
+                                                    anti_bot_tech: &page.anti_bot_tech,
+                                                    proxy_configured: page.proxy_configured,
+                                                    url,
+                                                    profile_key: page.profile_key.as_deref(),
+                                                    html_length: page.size(),
+                                                    bytes_transferred: page.bytes_transferred,
+                                                    #[cfg(not(feature = "page_error_status_details"))]
+                                                    error_status: page.error_status.as_deref(),
+                                                    #[cfg(feature = "page_error_status_details")]
+                                                    error_status: None,
+                                                    final_redirect_destination: page.final_redirect_destination.as_deref(),
+                                                };
+                                                let directive = s.on_retry(&outcome);
+                                                if !directive.should_retry {
+                                                    break;
+                                                }
+                                                (directive.backoff, directive.profile_key)
+                                            }
+                                            None => (None, None),
+                                        };
+
+                                        let status_delay = page.get_timeout().unwrap_or_default();
+                                        let backoff = _directive_backoff
+                                            .unwrap_or_else(|| crate::utils::backoff::backoff_delay(attempt - 1, 1_000, 60_000));
+                                        tokio::time::sleep(status_delay.max(backoff)).await;
 
                                         if page.status_code == StatusCode::GATEWAY_TIMEOUT {
 
@@ -8637,12 +11885,15 @@ impl Website {
                                                          &shared.6,
                                                     )
                                                     .await;
+                                                    chrome_attempted = true;
                                                 } else {
-                                                    let next_page = Page::new_page_with_cache(
+                                                    let next_page = Page::new_page_with_cache_engine(
                                                         url,
                                                         &shared.0,
                                                         shared.4.get_cache_options(),
                                                         &shared.4.cache_policy,
+                                            shared.4.cache_namespace_str(),
+                                                        engine_ctx,
                                                     )
                                                     .await;
 
@@ -8652,28 +11903,55 @@ impl Website {
                                             }).await
                                         {
                                             log::info!("backoff gateway timeout exceeded {elasped}");
+                                            page.should_retry = false;
+                                            break;
                                         }
 
+                                        } else if retry_count.is_power_of_two() {
+                                            Website::render_chrome_page(
+                                                &shared.4, &shared.0,
+                                                &mut page, url,
+                                                &shared.5,
+                                                &shared.6,
+                                            )
+                                            .await;
+                                            chrome_attempted = true;
                                         } else {
-
-                                            if retry_count.is_power_of_two() {
-                                                Website::render_chrome_page(
-                                                    &shared.4, &shared.0,
-                                                    &mut page, url,
-                                                    &shared.5,
-                                                    &shared.6,
+                                            page = Page::new_page_with_cache_engine(
+                                                    url,
+                                                    &shared.0,
+                                                    shared.4.get_cache_options(),
+                                                    &shared.4.cache_policy,
+                                            shared.4.cache_namespace_str(),
+                                                    engine_ctx,
                                                 )
-                                                .await;
-                                            } else {
-                                                page = Page::new_page_with_cache(
-                                                        url,
-                                                        &shared.0,
-                                                        shared.4.get_cache_options(),
-                                                        &shared.4.cache_policy,
-                                                    )
-                                                        .await;
-                                            }
+                                                    .await;
                                         }
+
+                                        // Stamp profile key from strategy.
+                                        if let Some(ref pk) = _directive_profile_key {
+                                            page.profile_key = Some(pk.clone());
+                                        }
+                                    }
+
+                                    // Smart-mode chrome fallback for transport-level
+                                    // HTTP failures on sub-pages. Mirrors the same
+                                    // guard from `crawl_establish_smart`. See that
+                                    // site for the full rationale — `www`-cert
+                                    // mismatches that 301 to the bare host, etc.
+                                    // The `needs_retry` gate ensures legitimate
+                                    // empty 200s don't trigger an unnecessary
+                                    // chrome navigation.
+                                    if !chrome_attempted && page.needs_retry() && page.is_empty() {
+                                        Website::render_chrome_page(
+                                            &shared.4,
+                                            &shared.0,
+                                            &mut page,
+                                            url,
+                                            &shared.5,
+                                            &shared.6,
+                                        )
+                                        .await;
                                     }
 
                                     if add_external {
@@ -8705,8 +11983,11 @@ impl Website {
                                     page.base = prev_domain;
                                     page.bytes_transferred = bytes_transferred;
 
-                                    if shared.4.normalize {
-                                        page.signature.replace(crate::utils::hash_html(&page.get_html_bytes_u8()).await);
+                                    // See comment on the sibling site: pre-spooled pages
+                                    // already carry their signature; re-hashing the empty
+                                    // in-memory buffer would clobber it with 0.
+                                    if shared.4.normalize && page.signature.is_none() {
+                                        page.signature.replace(crate::utils::hash_html(page.get_html_bytes_u8()).await);
                                     }
 
                                     // Run remote multimodal extraction if configured (smart HTTP path)
@@ -8742,7 +12023,7 @@ impl Website {
                                     if let Some(ref cb) = on_should_crawl_callback {
                                         if !cb.call(&page) {
                                             page.blocked_crawl = true;
-                                            channel_send_page(&shared.2, page, &shared.3);
+                                            channel_send_page(&shared.2, page, &shared.3).await;
                                             drop(permit);
                                             return Default::default()
                                         }
@@ -8750,12 +12031,16 @@ impl Website {
 
                                     let signature = page.signature;
 
-                                    channel_send_page(&shared.2, page, &shared.3);
+                                    channel_send_page(&shared.2, page, &shared.3).await;
 
                                     drop(permit);
 
                                     (links, signature)
                                 });
+                            } else {
+                                self.links_visited.remove(&link);
+                                self.extra_links_insert(link);
+                                break;
                             }
 
                             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
@@ -8797,7 +12082,7 @@ impl Website {
             }
 
             if !links.is_empty() {
-                self.extra_links.extend(links);
+                self.extra_links_extend(links);
             }
         }
     }
@@ -8865,6 +12150,8 @@ impl Website {
 
             let persist_links = self.status == CrawlStatus::Start;
 
+            let semaphore = self.setup_semaphore();
+
             let mut interval: Interval = tokio::time::interval(Duration::from_millis(15));
 
             let (sitemap_path, needs_trailing) = self.get_sitemap_setup(domain);
@@ -8890,10 +12177,13 @@ impl Website {
 
             let return_page_links = self.configuration.return_page_links;
 
-            let mut extra_links = self.extra_links.clone();
+            // `dequeue` needs `&mut self` alongside the frontier set, so the set has
+            // to be detached from `self` first. Taking it moves the allocation out
+            // and back instead of deep-copying the `HashSet` twice.
+            let mut extra_links = std::mem::take(&mut *self.extra_links);
             self.dequeue(&mut q, &mut extra_links, &mut exceeded_budget)
                 .await;
-            self.extra_links.clone_from(&extra_links);
+            *self.extra_links = extra_links;
 
             let whitelist_changes = self.configuration.add_sitemap_to_whitelist();
 
@@ -8902,27 +12192,31 @@ impl Website {
             }
 
             'outer: loop {
-                let stream =
-                    tokio_stream::iter::<Vec<Box<CompactString>>>(sitemaps.drain(..).collect());
-                tokio::pin!(stream);
+                let drained: Vec<Box<CompactString>> = sitemaps.drain(..).collect();
 
                 let mut first_request = false;
                 let mut attempted_correct = false;
 
-                while let Some(mut sitemap_url) = stream.next().await {
+                for mut sitemap_url in drained {
                     if !self.handle_process(handle, &mut interval, async {}).await {
                         break 'outer;
                     }
 
                     let link = <CompactString as Clone>::clone(&(*sitemap_url)).into();
 
-                    let allowed = self.is_allowed_budgetless(&link);
+                    let allowed = self.is_allowed_sitemap(&link);
 
                     if allowed.eq(&ProcessLinkStatus::Blocked) {
                         continue;
                     }
 
-                    self.insert_link(link).await;
+                    // Gated: only reachable when SPIDER_SITEMAP_RESPECT_BUDGET is
+                    // on (otherwise the check is budgetless and never returns this).
+                    if allowed.eq(&ProcessLinkStatus::BudgetExceeded) {
+                        break 'outer;
+                    }
+
+                    self.insert_link(&link).await;
 
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Page>(100);
 
@@ -8937,17 +12231,17 @@ impl Website {
                                 page.page_links = Some(links.into());
                             }
 
-                            if scrape || persist_links {
-                                pages.push(page.clone());
-                            };
-
                             // reset the page links before sending to the main subscriber.
                             if !return_page_links {
                                 page.page_links = None;
                             }
 
+                            if scrape || persist_links {
+                                pages.push(page.clone());
+                            };
+
                             if shared.0.is_some() {
-                                channel_send_page(&shared.0, page, &shared.1);
+                                channel_send_page(&shared.0, page, &shared.1).await;
                             }
                         }
 
@@ -8998,6 +12292,7 @@ impl Website {
                                                 &tx,
                                                 &mut sitemaps,
                                                 true,
+                                                &semaphore,
                                             )
                                             .await;
                                         }
@@ -9038,12 +12333,12 @@ impl Website {
                         for page in handle.iter_mut() {
                             if let Some(mut links) = page.page_links.clone() {
                                 self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
-                                self.extra_links.extend(*links)
+                                self.extra_links_extend(*links)
                             }
                         }
                         if scrape {
                             if let Some(p) = self.pages.as_mut() {
-                                p.extend(handle);
+                                extend_pages_capped(p, handle);
                             }
                         }
                     }
@@ -9141,8 +12436,8 @@ impl Website {
                 }
 
                 'outer: loop {
-                    let stream: tokio_stream::Iter<std::vec::IntoIter<Box<CompactString>>> =
-                        tokio_stream::iter::<Vec<Box<CompactString>>>(sitemaps.drain(..).collect());
+                    let drained: Vec<Box<CompactString>> = sitemaps.drain(..).collect();
+                    let stream = tokio_stream::iter(drained);
                     tokio::pin!(stream);
 
                     tokio::select! {
@@ -9154,13 +12449,19 @@ impl Website {
 
                             let link = <CompactString as Clone>::clone(&(*sitemap_url)).into();
 
-                            let allowed = self.is_allowed_budgetless(&link);
+                            let allowed = self.is_allowed_sitemap(&link);
 
                             if allowed.eq(&ProcessLinkStatus::Blocked) {
                                 continue;
                             }
 
-                            self.insert_link(link).await;
+                            // Gated: only reachable when SPIDER_SITEMAP_RESPECT_BUDGET
+                            // is on (otherwise budgetless never returns this).
+                            if allowed.eq(&ProcessLinkStatus::BudgetExceeded) {
+                                break 'outer;
+                            }
+
+                            self.insert_link(&link).await;
 
                             match attempt_navigation(
                                 "about:blank",
@@ -9183,20 +12484,12 @@ impl Website {
                                         &sitemap_url,
                                         &client,
                                         &new_page,
-                                        &self.configuration.wait_for,
-                                        &self.configuration.screenshot,
                                         false, // we use the initial about:blank page.
-                                        &self.configuration.openai_config,
-                                        &self.configuration.execution_scripts,
-                                        &self.configuration.automation_scripts,
-                                        &self.configuration.viewport,
-                                        &self.configuration.request_timeout,
-                                        &self.configuration.track_events,
                                         self.configuration.referer.clone(),
                                         self.configuration.max_page_bytes,
                                         self.configuration.get_cache_options(),
-                                        &self.configuration.cache_policy,
-                                        &self.configuration.remote_multimodal,
+                                        self.configuration.cache_namespace_str(),
+                                        &self.configuration.chrome_fetch_params(),
                                     )
                                     .await;
 
@@ -9212,15 +12505,14 @@ impl Website {
 
                                     drop(new_page);
 
-                                    let is_xml_entry = page.get_html_bytes_u8().starts_with(b"<?xml");
+                                    let is_xml_entry = page.is_xml;
                                     let is_xml = is_xml_entry
                                         && !page.get_html_bytes_u8().ends_with(b"</html>");
 
                                     if is_xml {
                                         let reader = SiteMapReader::new(&*page.get_html_bytes_u8());
-                                        let mut stream = tokio_stream::iter(reader);
 
-                                        while let Some(entity) = stream.next().await {
+                                        for entity in reader {
                                             if !self.handle_process(handle, &mut interval, async {}).await {
                                                 break;
                                             }
@@ -9239,7 +12531,7 @@ impl Website {
                                                             break;
                                                         }
 
-                                                        self.insert_link(link.clone()).await;
+                                                        self.insert_link(&link).await;
 
                                                         let client = client.clone();
                                                         let shared = shared.clone();
@@ -9254,6 +12546,8 @@ impl Website {
                                                             )
                                                             .await
                                                             {
+                                                                let _tab_guard = crate::features::chrome::TabCloseGuard::new(new_page.clone());
+
                                                                 let (_, intercept_handle) = tokio::join!(
                                                                     crate::features::chrome::setup_chrome_events(
                                                                         &new_page, &shared.3,
@@ -9267,26 +12561,37 @@ impl Website {
                                                                     )
                                                                 );
 
-                                                                let mut page = Page::new(
-                                                                    &link.inner(),
-                                                                    &client,
-                                                                    &new_page,
-                                                                    &shared.3.wait_for,
-                                                                    &shared.3.screenshot,
-                                                                    false,
-                                                                    &shared.3.openai_config,
-                                                                    &shared.3.execution_scripts,
-                                                                    &shared.3.automation_scripts,
-                                                                    &shared.3.viewport,
-                                                                    &shared.3.request_timeout,
-                                                                    &shared.3.track_events,
-                                                                    shared.3.referer.clone(),
-                                                                    shared.3.max_page_bytes,
-                                                                    shared.3.get_cache_options(),
-                                                                    &shared.3.cache_policy,
-                                                                    &shared.3.remote_multimodal,
-                                                                )
-                                                                .await;
+                                                                // Streaming pump populates `page_links_buf`
+                                                                // during fetch — same handler vector as
+                                                                // `page.links()` would have run after.
+                                                                let mut page_links_buf: HashSet<
+                                                                    CaseInsensitiveString,
+                                                                > = HashSet::with_capacity(
+                                                                    crate::page::link_set_capacity(),
+                                                                );
+                                                                let mut _placeholder_links_pages: Option<
+                                                                    HashSet<CaseInsensitiveString>,
+                                                                > = None;
+                                                                let (mut page, succeeded) =
+                                                                    Page::new_streaming(
+                                                                        &link.inner(),
+                                                                        &client,
+                                                                        &new_page,
+                                                                        false,
+                                                                        shared.3.referer.clone(),
+                                                                        shared.3.max_page_bytes,
+                                                                        shared.3.get_cache_options(),
+                                                                        shared.3.cache_namespace_str(),
+                                                                        &shared.3.chrome_fetch_params(),
+                                                                        &shared.6,
+                                                                        &shared.3.external_domains_caseless,
+                                                                        &mut page_links_buf,
+                                                                        &mut _placeholder_links_pages,
+                                                                        shared.3.full_resources,
+                                                                        false, // sitemap fetch always needs links
+                                                                        false, // recursive fetch — no SSG
+                                                                    )
+                                                                    .await;
 
                                                                 if let Some(intercept_handle) = intercept_handle
                                                                 {
@@ -9304,9 +12609,31 @@ impl Website {
                                                                     }
                                                                 }
 
+                                                                // Final tab disposition. With `chrome_store_page`
+                                                                // enabled the subscriber owns the live tab via
+                                                                // `Page::chrome_page` and is expected to call
+                                                                // `Page::close_page()` when done — leave the guard
+                                                                // disarmed so the tab stays open. Without the
+                                                                // feature, close it explicitly (legacy behavior).
+                                                                if cfg!(feature = "chrome_store_page") {
+                                                                    _tab_guard.defuse();
+                                                                } else {
+                                                                    _tab_guard.defuse();
+                                                                    let _ = new_page.close().await;
+                                                                }
+
                                                                 if page.page_links.is_none() {
-                                                                    let links =
-                                                                        page.links(&shared.6, &shared.7).await;
+                                                                    let links: HashSet<
+                                                                        CaseInsensitiveString,
+                                                                    > = if succeeded {
+                                                                        page_links_buf
+                                                                    } else {
+                                                                        // Streaming declined — fall back to
+                                                                        // the legacy second-pass walk so the
+                                                                        // sitemap downstream gets populated
+                                                                        // links exactly as before.
+                                                                        page.links(&shared.6, &shared.7).await
+                                                                    };
                                                                     page.page_links = Some(links.into());
                                                                 }
 
@@ -9345,15 +12672,13 @@ impl Website {
 
                                         let links = page.links(&shared.6, &shared.7).await;
 
-                                        let mut stream = tokio_stream::iter(links);
-
-                                        while let Some(link) = stream.next().await {
+                                        for link in links {
                                             if !self.handle_process(handle, &mut interval, async {}).await {
                                                 break;
                                             }
 
                                             if link.ends_with(".xml") {
-                                                sitemaps.push(Box::new(link.inner().clone()));
+                                                sitemaps.push(Box::new(link.into_string().into()));
                                                 continue;
                                             }
 
@@ -9367,7 +12692,7 @@ impl Website {
                                                 continue;
                                             }
 
-                                            self.insert_link(link.clone()).await;
+                                            self.insert_link(&link).await;
 
                                             let client = client.clone();
                                             let shared = shared.clone();
@@ -9382,6 +12707,8 @@ impl Website {
                                                 )
                                                 .await {
                                                     Ok(new_page) => {
+                                                        let _tab_guard = crate::features::chrome::TabCloseGuard::new(new_page.clone());
+
                                                         let (_, intercept_handle) = tokio::join!(
                                                             crate::features::chrome::setup_chrome_events(
                                                                 &new_page, &shared.3,
@@ -9395,24 +12722,34 @@ impl Website {
                                                             )
                                                         );
 
-                                                        let mut page = Page::new(
+                                                        // Streaming pump populates `page_links_buf`
+                                                        // during fetch — same handler vector as
+                                                        // `page.links()` would have run after.
+                                                        let mut page_links_buf: HashSet<
+                                                            CaseInsensitiveString,
+                                                        > = HashSet::with_capacity(
+                                                            crate::page::link_set_capacity(),
+                                                        );
+                                                        let mut _placeholder_links_pages: Option<
+                                                            HashSet<CaseInsensitiveString>,
+                                                        > = None;
+                                                        let (mut page, succeeded) = Page::new_streaming(
                                                             &link.inner(),
                                                             &client,
                                                             &new_page,
-                                                            &shared.3.wait_for,
-                                                            &shared.3.screenshot,
                                                             false,
-                                                            &shared.3.openai_config,
-                                                            &shared.3.execution_scripts,
-                                                            &shared.3.automation_scripts,
-                                                            &shared.3.viewport,
-                                                            &shared.3.request_timeout,
-                                                            &shared.3.track_events,
                                                             shared.3.referer.clone(),
                                                             shared.3.max_page_bytes,
                                                             shared.3.get_cache_options(),
-                                                            &shared.3.cache_policy,
-                                                            &shared.3.remote_multimodal,
+                                                            shared.3.cache_namespace_str(),
+                                                            &shared.3.chrome_fetch_params(),
+                                                            &shared.6,
+                                                            &shared.3.external_domains_caseless,
+                                                            &mut page_links_buf,
+                                                            &mut _placeholder_links_pages,
+                                                            shared.3.full_resources,
+                                                            false,
+                                                            false,
                                                         )
                                                         .await;
 
@@ -9430,8 +12767,25 @@ impl Website {
                                                             }
                                                         }
 
+                                                        // Final tab disposition. With `chrome_store_page` the
+                                                        // subscriber owns the live tab via `Page::chrome_page` and
+                                                        // is expected to call `Page::close_page()`. Otherwise close
+                                                        // the tab explicitly (legacy behavior).
+                                                        if cfg!(feature = "chrome_store_page") {
+                                                            _tab_guard.defuse();
+                                                        } else {
+                                                            _tab_guard.defuse();
+                                                            let _ = new_page.close().await;
+                                                        }
+
                                                         if page.page_links.is_none() {
-                                                            let links = page.links(&shared.6, &shared.7).await;
+                                                            let links: HashSet<CaseInsensitiveString> =
+                                                                if succeeded {
+                                                                    page_links_buf
+                                                                } else {
+                                                                    page.links(&shared.6, &shared.7)
+                                                                        .await
+                                                                };
                                                             page.page_links = Some(links.into());
                                                         }
 
@@ -9465,31 +12819,32 @@ impl Website {
                                             if self.is_signature_allowed(signature).await {
                                                 if let Some(mut links) = page.page_links.clone() {
                                                     self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
-                                                    self.extra_links.extend(*links)
+                                                    self.extra_links_extend(*links)
                                                 }
                                                 self.insert_signature(signature).await;
 
                                                 channel_send_page(
                                                     &shared.0, page.clone(), &shared.1,
-                                                );
-
+                                                )
+                                                .await;
                                                 if scrape || persist_links {
                                                     if let Some(p) = self.pages.as_mut() {
-                                                        p.push(page);
+                                                        push_page_capped(p, page);
                                                     }
                                                 }
                                             }
                                         } else {
                                             if let Some(mut links) = page.page_links.clone() {
                                                 self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
-                                                self.extra_links.extend(*links)
+                                                self.extra_links_extend(*links)
                                             }
                                             channel_send_page(
                                                 &shared.0, page.clone(), &shared.1,
-                                            );
+                                            )
+                                            .await;
                                             if scrape || persist_links {
                                                 if let Some(p) = self.pages.as_mut() {
-                                                    p.push(page);
+                                                    push_page_capped(p, page);
                                                 }
                                             }
                                         }
@@ -9517,13 +12872,13 @@ impl Website {
                                         if let Some(mut links) = page.page_links.clone() {
                                             self.dequeue(&mut q, &mut links, &mut exceeded_budget)
                                                 .await;
-                                            self.extra_links.extend(*links)
+                                            self.extra_links_extend(*links)
                                         }
                                         self.insert_signature(signature).await;
-                                        channel_send_page(&shared.0, page.clone(), &shared.1);
+                                        channel_send_page(&shared.0, page.clone(), &shared.1).await;
                                         if scrape || persist_links {
                                             if let Some(p) = self.pages.as_mut() {
-                                                p.push(page);
+                                                push_page_capped(p, page);
                                             }
                                         }
                                     }
@@ -9531,12 +12886,12 @@ impl Website {
                                     if let Some(mut links) = page.page_links.clone() {
                                         self.dequeue(&mut q, &mut links, &mut exceeded_budget)
                                             .await;
-                                        self.extra_links.extend(*links)
+                                        self.extra_links_extend(*links)
                                     }
-                                    channel_send_page(&shared.0, page.clone(), &shared.1);
+                                    channel_send_page(&shared.0, page.clone(), &shared.1).await;
                                     if scrape || persist_links {
                                         if let Some(p) = self.pages.as_mut() {
-                                            p.push(page);
+                                            push_page_capped(p, page);
                                         }
                                     }
                                 }
@@ -9594,6 +12949,34 @@ impl Website {
         if !self.configuration.ignore_sitemap {
             self.sitemap_crawl_chrome(client, handle, scrape).await
         }
+    }
+
+    /// Sitemap crawl chain that always uses the plain-HTTP path, regardless of
+    /// whether the `chrome` feature is enabled. `crawl_raw` uses this so an
+    /// HTTP-only crawl never launches a browser for the sitemap pass. Without
+    /// it, `crawl_raw` would fall through to `sitemap_crawl_chain`, which spins
+    /// up Chrome on a chrome-enabled build. This does nothing without the
+    /// `sitemap` flag.
+    #[cfg(feature = "sitemap")]
+    async fn sitemap_crawl_chain_raw(
+        &mut self,
+        client: &Client,
+        handle: &Option<Arc<AtomicI8>>,
+        scrape: bool,
+    ) {
+        if !self.configuration.ignore_sitemap {
+            self.sitemap_crawl_raw(client, handle, scrape).await
+        }
+    }
+
+    /// No-op `sitemap_crawl_chain_raw` for builds without the `sitemap` flag.
+    #[cfg(not(feature = "sitemap"))]
+    async fn sitemap_crawl_chain_raw(
+        &mut self,
+        _client: &Client,
+        _handle: &Option<Arc<AtomicI8>>,
+        _scrape: bool,
+    ) {
     }
 
     /// Sitemap parse entire lists. Note: this method does not re-crawl the links of the pages found on the sitemap. This does nothing without the `sitemap` flag.
@@ -9706,16 +13089,26 @@ impl Website {
         tx: &tokio::sync::mpsc::Sender<Page>,
         sitemaps: &mut Vec<Box<CompactString>>,
         crawl: bool,
+        semaphore: &Arc<Semaphore>,
     ) {
         use sitemap::reader::{SiteMapEntity, SiteMapReader};
         use sitemap::structs::Location;
 
         if !b.is_empty() && b.starts_with(b"<?xml") {
-            let mut stream = tokio_stream::iter(SiteMapReader::new(&*b));
+            let reader = SiteMapReader::new(&*b);
 
             let retry = self.configuration.retry;
+            let retry_strategy_ref = self.retry_strategy.clone();
+            let cache_policy = self.configuration.cache_policy.clone();
+            let cache_ns = self
+                .configuration
+                .cache_namespace
+                .as_ref()
+                .map(|s| s.as_str().to_string());
 
-            while let Some(entity) = stream.next().await {
+            let mut set: JoinSet<()> = JoinSet::new();
+
+            for entity in reader {
                 if !self.handle_process(handle, interval, async {}).await {
                     break;
                 }
@@ -9735,37 +13128,118 @@ impl Website {
                                 break;
                             }
 
-                            self.insert_link(link.clone()).await;
+                            self.insert_link(&link).await;
 
                             if crawl {
+                                // Wait for a permit before spawning (respects concurrency_limit)
+                                let permit = match crate::utils::get_semaphore(
+                                    semaphore,
+                                    !self.configuration.shared_queue,
+                                )
+                                .await
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                };
+
                                 let client = client.clone();
                                 let tx = tx.clone();
-                                let cache_options = self.configuration.get_cache_options();
-                                let cache_policy = self.configuration.cache_policy.clone();
+                                let cache_options_init = self.configuration.get_cache_options();
+                                let cache_policy = cache_policy.clone();
+                                let cache_ns = cache_ns.clone();
+                                let retry_strategy_ref = retry_strategy_ref.clone();
 
-                                crate::utils::spawn_task("page_fetch", async move {
+                                set.spawn(async move {
+                                    let _permit = permit; // Held for duration of task
+
                                     let mut page = Page::new_page_with_cache(
                                         link.inner(),
                                         &client,
-                                        cache_options.clone(),
+                                        cache_options_init.clone(),
                                         &cache_policy,
+                                        cache_ns.as_deref(),
                                     )
                                     .await;
 
-                                    let mut retry_count = retry;
+                                    let mut retry_count: u32 = match &retry_strategy_ref {
+                                        Some(s) => s.max_retries(),
+                                        None => retry as u32,
+                                    };
+                                    let mut attempt: u32 = 0;
 
                                     while page.needs_retry() && retry_count > 0 {
-                                        if let Some(timeout) = page.get_timeout() {
-                                            tokio::time::sleep(timeout).await;
-                                        }
+                                        retry_count -= 1;
+                                        attempt += 1;
+
+                                        // Consult the retry strategy if set.
+                                        let (_directive_backoff, _directive_profile_key) =
+                                            match &retry_strategy_ref {
+                                                Some(s) => {
+                                                    let outcome =
+                                                        crate::retry_strategy::AttemptOutcome {
+                                                            attempt,
+                                                            status_code: page.status_code,
+                                                            should_retry: page.should_retry,
+                                                            content_truncated: page
+                                                                .content_truncated,
+                                                            waf_check: page.waf_check,
+                                                            anti_bot_tech: &page.anti_bot_tech,
+                                                            proxy_configured: page.proxy_configured,
+                                                            url: link.inner(),
+                                                            profile_key: page
+                                                                .profile_key
+                                                                .as_deref(),
+                                                            html_length: page.size(),
+                                                            bytes_transferred: page
+                                                                .bytes_transferred,
+                                                            #[cfg(not(
+                                                                feature = "page_error_status_details"
+                                                            ))]
+                                                            error_status: page
+                                                                .error_status
+                                                                .as_deref(),
+                                                            #[cfg(
+                                                                feature = "page_error_status_details"
+                                                            )]
+                                                            error_status: None,
+                                                            final_redirect_destination: page
+                                                                .final_redirect_destination
+                                                                .as_deref(),
+                                                        };
+                                                    let directive = s.on_retry(&outcome);
+                                                    if !directive.should_retry {
+                                                        break;
+                                                    }
+                                                    (directive.backoff, directive.profile_key)
+                                                }
+                                                None => (None, None),
+                                            };
+
+                                        let status_delay = page.get_timeout().unwrap_or_default();
+                                        let backoff = _directive_backoff.unwrap_or_else(|| {
+                                            crate::utils::backoff::backoff_delay(
+                                                attempt - 1,
+                                                1_000,
+                                                60_000,
+                                            )
+                                        });
+                                        tokio::time::sleep(status_delay.max(backoff)).await;
                                         page = Page::new_page_with_cache(
                                             link.inner(),
                                             &client,
-                                            cache_options.clone(),
+                                            cache_options_init.clone(),
                                             &cache_policy,
+                                            cache_ns.as_deref(),
                                         )
                                         .await;
-                                        retry_count -= 1;
+
+                                        // Stamp profile key from strategy.
+                                        if let Some(ref pk) = _directive_profile_key {
+                                            page.profile_key = Some(pk.clone());
+                                        }
                                     }
 
                                     if let Ok(permit) = tx.reserve().await {
@@ -9791,6 +13265,9 @@ impl Website {
                     break;
                 }
             }
+
+            // Wait for all spawned tasks to complete
+            while set.join_next().await.is_some() {}
         }
     }
 
@@ -9809,7 +13286,10 @@ impl Website {
     /// Guard the channel from closing until all subscription events complete.
     pub async fn subscription_guard(&self) {
         if let Some(channel) = &self.channel {
-            if !channel.1.is_empty() {
+            // Only wait if the broadcast channel still has active receivers.
+            // receiver_count() == 1 means only our internal Arc<Receiver>
+            // remains — no user subscribers are alive to call inc().
+            if channel.0.receiver_count() > 1 {
                 if let Some(guard_counter) = &self.channel_guard {
                     guard_counter.lock().await
                 }
@@ -9825,13 +13305,14 @@ impl Website {
         jar: Option<&Arc<crate::client::cookie::Jar>>,
     ) -> Option<crate::features::chrome::BrowserController> {
         match crate::features::chrome::launch_browser_cookies(config, url_parsed, jar).await {
-            Some((browser, browser_handle, context_id, browser_dead)) => {
+            Some((browser, browser_handle, context_id, browser_dead, connected_url)) => {
                 let browser: Arc<chromiumoxide::Browser> = Arc::new(browser);
                 let b = (browser, Some(browser_handle), context_id);
 
                 Some(crate::features::chrome::BrowserController::new(
                     b,
                     browser_dead,
+                    connected_url,
                 ))
             }
             _ => None,
@@ -9904,9 +13385,50 @@ impl Website {
         self
     }
 
+    /// Force a single crawl enhancement on or off for this crawl, overriding its
+    /// process-global `SPIDER_CHROME_*` env default. See
+    /// [`crate::configuration::CrawlEnhancement`].
+    pub fn with_enhancement(
+        &mut self,
+        section: crate::configuration::CrawlEnhancement,
+        enabled: bool,
+    ) -> &mut Self {
+        self.configuration.with_enhancement(section, enabled);
+        self
+    }
+
+    /// Force every crawl enhancement on or off at once (off-complete /
+    /// on-complete).
+    pub fn with_all_enhancements(&mut self, enabled: bool) -> &mut Self {
+        self.configuration.with_all_enhancements(enabled);
+        self
+    }
+
+    /// Replace the full per-crawl enhancement map.
+    pub fn with_enhancements(
+        &mut self,
+        enhancements: crate::configuration::EnhancementSettings,
+    ) -> &mut Self {
+        self.configuration.with_enhancements(enhancements);
+        self
+    }
+
+    /// Disable every enhancement a browser with these behaviours built in would
+    /// duplicate. Use when fronting the crawl with such a browser.
+    pub fn for_builtin_browser(&mut self) -> &mut Self {
+        self.configuration.for_builtin_browser();
+        self
+    }
+
     /// Bypass CSP protection detection. This does nothing without the feat flag `chrome` enabled.
     pub fn with_csp_bypass(&mut self, enabled: bool) -> &mut Self {
         self.configuration.with_csp_bypass(enabled);
+        self
+    }
+
+    /// Disable JavaScript execution on the page. This does nothing without the feat flag `chrome` enabled.
+    pub fn with_disable_javascript(&mut self, disabled: bool) -> &mut Self {
+        self.configuration.with_disable_javascript(disabled);
         self
     }
 
@@ -10024,9 +13546,80 @@ impl Website {
         self
     }
 
-    /// Set the concurrency limits. If you set the value to None to use the default limits using the system CPU cors * n.
+    /// Set the static concurrency limit. `None` falls back to
+    /// `DEFAULT_PERMITS` (system CPU cores × n). Mutually exclusive with
+    /// the adaptive path: if you also call
+    /// [`Self::with_adaptive_concurrency`] /
+    /// [`Self::with_concurrency_semaphore`] the adaptive handle wins at
+    /// crawl time, and this static value is ignored. Calling only this
+    /// method preserves the pre-adaptive behavior byte-for-byte.
     pub fn with_concurrency_limit(&mut self, limit: Option<usize>) -> &mut Self {
         self.configuration.with_concurrency_limit(limit);
+        self
+    }
+
+    /// Plumb an externally-owned `Semaphore` into the crawler. When set,
+    /// [`Self::setup_semaphore`] returns this handle instead of building
+    /// one from `configuration.concurrency_limit` — so an admission
+    /// controller holding a clone of the same `Arc<Semaphore>` can
+    /// resize the crawler's effective concurrency mid-flight by calling
+    /// `add_permits` / `forget_permits` on it.
+    ///
+    /// Resolution rules (one or the other; never both):
+    ///
+    /// - `Some(sem)` here → crawl gates on this `sem`. The static
+    ///   `concurrency_limit` is *ignored*, even if set, because a
+    ///   live-tuned permit pool would be inconsistent with a fixed
+    ///   cap. Mixing the two is therefore not "merged" — the adaptive
+    ///   handle always wins, by design.
+    /// - `None` here (default) → fall back to the static path:
+    ///   `concurrency_limit` if set, else `DEFAULT_PERMITS`. Identical
+    ///   behavior to crates that don't know this API exists.
+    ///
+    /// For most callers, [`Self::with_adaptive_concurrency`] is the
+    /// higher-level helper — it accepts an
+    /// [`crate::utils::adaptive_concurrency::AdaptiveSemaphore`] and
+    /// wires the semaphore in for you.
+    pub fn with_concurrency_semaphore(
+        &mut self,
+        semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> &mut Self {
+        self.adaptive_concurrency_semaphore = semaphore;
+        self
+    }
+
+    /// Convenience wrapper around [`Self::with_concurrency_semaphore`]
+    /// that takes an [`crate::utils::adaptive_concurrency::AdaptiveSemaphore`]
+    /// handle directly. The crawler will gate worker concurrency
+    /// through `handle.semaphore()`; the caller can resize via
+    /// `handle.set_target(n)` from any task, any time, without
+    /// rebuilding the `Website`.
+    ///
+    /// Mutually exclusive with [`Self::with_concurrency_limit`] in the
+    /// same sense — the adaptive handle takes precedence at crawl time
+    /// and the static cap is ignored when this is set. Calling this on
+    /// a `Website` that never used the static API is a strict
+    /// superset, not a behavior change for anyone else.
+    ///
+    /// Requires the `adaptive_concurrency` feature (on by default via
+    /// `__basic`). Without it the higher-level helper isn't built; use
+    /// the unconditional [`Self::with_concurrency_semaphore`] with a
+    /// raw `Arc<tokio::sync::Semaphore>` instead.
+    #[cfg(feature = "adaptive_concurrency")]
+    pub fn with_adaptive_concurrency(
+        &mut self,
+        handle: &crate::utils::adaptive_concurrency::AdaptiveSemaphore,
+    ) -> &mut Self {
+        self.adaptive_concurrency_semaphore = Some(handle.semaphore());
+        self
+    }
+
+    /// `adaptive_concurrency`-disabled stub. Keeps the symbol present so
+    /// downstream callers compile on all feature combos; collapses to a
+    /// no-op when the feature isn't available. Pass the same arguments
+    /// as the enabled version — `handle` is intentionally ignored here.
+    #[cfg(not(feature = "adaptive_concurrency"))]
+    pub fn with_adaptive_concurrency<T>(&mut self, _handle: &T) -> &mut Self {
         self
     }
 
@@ -10154,6 +13747,18 @@ impl Website {
         self.on_link_find_callback = Some(Arc::new(f));
     }
 
+    /// Set a callback fired when a link is blocked by robots.txt.
+    pub fn with_on_link_blocked_callback<F: Fn(String) + Send + Sync + 'static>(
+        &mut self,
+        callback: Option<F>,
+    ) -> &mut Self {
+        match callback {
+            Some(cb) => self.on_link_blocked_callback = Some(Arc::new(cb)),
+            None => self.on_link_blocked_callback = None,
+        };
+        self
+    }
+
     /// Use a callback to determine if a page should be ignored. Return false to ensure that the discovered links are not crawled.
     pub fn with_on_should_crawl_callback(
         &mut self,
@@ -10182,6 +13787,89 @@ impl Website {
             }
             _ => self.on_should_crawl_callback = None,
         };
+        self
+    }
+
+    /// Set a custom retry strategy that controls retry behavior per attempt.
+    /// When set, this replaces the simple `Configuration::retry` counter.
+    pub fn with_retry_strategy(
+        &mut self,
+        strategy: crate::retry_strategy::SharedRetryStrategy,
+    ) -> &mut Self {
+        self.retry_strategy = Some(strategy);
+        self
+    }
+
+    /// Install a user-supplied transport that replaces spider's built-in
+    /// per-URL fetch in HTTP crawl mode.
+    ///
+    /// See [`crate::fetcher::RemoteFetcher`] for the full contract. The
+    /// fetcher is invoked on every URL that passes the
+    /// [`is_allowed`](Self::is_allowed) gate — spider continues to drive
+    /// visited tracking, depth, allow/deny, robots, link extraction, and
+    /// the subscription channel; only the network round-trip is
+    /// delegated.
+    ///
+    /// Calling without `with_remote_fetcher` leaves the field as `None`
+    /// — every existing fetch site keeps its current behavior verbatim
+    /// (the addition is opt-in and zero-cost when unused).
+    pub fn with_remote_fetcher<F: crate::fetcher::RemoteFetcher>(
+        &mut self,
+        fetcher: F,
+    ) -> &mut Self {
+        self.remote_fetcher = Some(std::sync::Arc::new(fetcher));
+        self
+    }
+
+    /// Install a pre-`Arc`d fetcher — handy when sharing one
+    /// implementation across multiple `Website` instances.
+    pub fn with_shared_remote_fetcher(
+        &mut self,
+        fetcher: crate::fetcher::SharedRemoteFetcher,
+    ) -> &mut Self {
+        self.remote_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Install an in-process HTTP fetch engine
+    /// ([`crate::fetch_engine::HttpFetchEngine`]). On the HTTP crawl paths
+    /// spider will call the engine in place of its inner
+    /// `client.get(url).send()` for every URL where
+    /// [`should_fetch`](crate::fetch_engine::HttpFetchEngine::should_fetch)
+    /// returns `true`, while keeping its retry / cache / watchdog / hedge
+    /// machinery wrapped around the call. Zero-cost and behavior-identical
+    /// when unset.
+    pub fn with_fetch_engine<F: crate::fetch_engine::HttpFetchEngine>(
+        &mut self,
+        engine: F,
+    ) -> &mut Self {
+        self.fetch_engine = Some(std::sync::Arc::new(engine));
+        self
+    }
+
+    /// Install a pre-`Arc`d fetch engine — handy when sharing one engine
+    /// across multiple `Website` instances (the common case, since the
+    /// engine's own state / connection pool is shared).
+    pub fn with_shared_fetch_engine(
+        &mut self,
+        engine: crate::fetch_engine::SharedHttpFetchEngine,
+    ) -> &mut Self {
+        self.fetch_engine = Some(engine);
+        self
+    }
+
+    /// Set a per-request [`crate::proxy_strategy::ProxyStrategy`].
+    ///
+    /// When set together with kind-specific proxy lists configured via
+    /// [`crate::configuration::Configuration::with_proxies_for_kind`],
+    /// callers can route specific requests through a non-default proxy
+    /// list using [`Self::secondary_http_client_for`]. Default `None`
+    /// keeps every existing call site identical to today.
+    pub fn with_proxy_strategy(
+        &mut self,
+        strategy: crate::proxy_strategy::SharedProxyStrategy,
+    ) -> &mut Self {
+        self.proxy_strategy = Some(strategy);
         self
     }
 
@@ -10337,9 +14025,29 @@ impl Website {
         self
     }
 
+    /// Partition the cache by an opaque namespace (e.g. country, proxy pool,
+    /// tenant, A/B bucket, device profile, …). Cached bytes are never shared
+    /// across namespaces. `None` uses the default (empty) namespace. This
+    /// method does nothing without any of the `cache_request`, `chrome`, or
+    /// `chrome_remote_cache` features.
+    pub fn with_cache_namespace<S: Into<String>>(&mut self, namespace: Option<S>) -> &mut Self {
+        self.configuration.with_cache_namespace(namespace);
+        self
+    }
+
     /// Enable or disable Service Workers. This method does nothing if the `chrome` feature is not enabled.
     pub fn with_service_worker_enabled(&mut self, enabled: bool) -> &mut Self {
         self.configuration.with_service_worker_enabled(enabled);
+        self
+    }
+
+    /// Prefer engine-native Markdown for the page content when the connected
+    /// browser supports server-side conversion; engines without the
+    /// capability fall back to the standard HTML extraction path. This
+    /// method does nothing if the `chrome` feature is not enabled.
+    pub fn with_prefer_native_markdown(&mut self, prefer_native_markdown: bool) -> &mut Self {
+        self.configuration
+            .with_prefer_native_markdown(prefer_native_markdown);
         self
     }
 
@@ -10462,6 +14170,17 @@ impl Website {
         self
     }
 
+    /// Cap the number of main-frame cross-document navigations per Chrome
+    /// `goto`. `None` disables the guard (default).
+    ///
+    /// Complements `with_redirect_limit`: catches JS / meta-refresh /
+    /// `Refresh:` header loops which appear as fresh documents to Chromium
+    /// rather than 3xx redirects, and therefore bypass the HTTP redirect cap.
+    pub fn with_max_main_frame_navigations(&mut self, cap: Option<u32>) -> &mut Self {
+        self.configuration.with_max_main_frame_navigations(cap);
+        self
+    }
+
     /// Use request intercept for the request to only allow content that matches the host. If the content is from a 3rd party it needs to be part of our include list. This method does nothing if the `chrome_intercept` flag is not enabled.
     pub fn with_chrome_intercept(
         &mut self,
@@ -10469,6 +14188,17 @@ impl Website {
     ) -> &mut Self {
         self.configuration
             .with_chrome_intercept(chrome_intercept, &self.domain_parsed);
+        self
+    }
+
+    /// Push the request-interception policy to a capable remote rendering
+    /// engine once per navigation so it resolves block/allow decisions locally
+    /// (the firewall/adblock lists stay baked into the engine; only the small
+    /// per-job flags + blacklist/whitelist travel, once), eliminating the
+    /// per-request round-trip. Enables request interception. No-op against a
+    /// normal Chrome target. Does nothing without the `chrome_intercept` flag.
+    pub fn with_remote_local_policy(&mut self, enabled: bool) -> &mut Self {
+        self.configuration.with_remote_local_policy(enabled);
         self
     }
 
@@ -10550,8 +14280,8 @@ impl Website {
     ///     if content.map_or(true, |b| b.len() < 1024) {
     ///         result.reject = true;
     ///     }
-    ///     // Boost LightPanda by 10 points
-    ///     if source == "lightpanda" {
+    ///     // Boost CDP backend by 10 points
+    ///     if source == "cdp" {
     ///         result.score_adjust = 10;
     ///     }
     ///     result
@@ -10604,6 +14334,67 @@ impl Website {
         self
     }
 
+    /// Set multiple remote Chrome connection URLs for failover. This method does nothing if the `chrome` is not enabled.
+    pub fn with_chrome_connections(&mut self, urls: Vec<String>) -> &mut Self {
+        self.configuration.with_chrome_connections(urls);
+        self
+    }
+
+    /// Set the Spider worker URL for crawl requests. `None` falls back to the
+    /// process-wide `SPIDER_WORKER` env var. Empty/whitespace disables the
+    /// crawl worker pool for this `Website` only. No-op without
+    /// `decentralized`.
+    pub fn with_worker_connection(&mut self, worker_connection_url: Option<String>) -> &mut Self {
+        self.configuration
+            .with_worker_connection(worker_connection_url);
+        #[cfg(feature = "decentralized")]
+        {
+            self.client = None;
+        }
+        self
+    }
+
+    /// Set multiple Spider worker URLs for crawl requests. Empty list
+    /// disables the crawl worker pool for this `Website` only. No-op without
+    /// `decentralized`.
+    pub fn with_worker_connections(&mut self, urls: Vec<String>) -> &mut Self {
+        self.configuration.with_worker_connections(urls);
+        #[cfg(feature = "decentralized")]
+        {
+            self.client = None;
+        }
+        self
+    }
+
+    /// Set the Spider scraper worker URL for scrape requests. `None` falls
+    /// back to the process-wide `SPIDER_WORKER_SCRAPER` env var.
+    /// Empty/whitespace disables the scraper worker pool for this `Website`
+    /// only. No-op without `decentralized`.
+    pub fn with_scraper_worker_connection(
+        &mut self,
+        scraper_worker_connection_url: Option<String>,
+    ) -> &mut Self {
+        self.configuration
+            .with_scraper_worker_connection(scraper_worker_connection_url);
+        #[cfg(feature = "decentralized")]
+        {
+            self.client = None;
+        }
+        self
+    }
+
+    /// Set multiple Spider scraper worker URLs for scrape requests. Empty
+    /// list disables the scraper worker pool for this `Website` only. No-op
+    /// without `decentralized`.
+    pub fn with_scraper_worker_connections(&mut self, urls: Vec<String>) -> &mut Self {
+        self.configuration.with_scraper_worker_connections(urls);
+        #[cfg(feature = "decentralized")]
+        {
+            self.client = None;
+        }
+        self
+    }
+
     /// Set JS to run on certain pages. This method does nothing if the `chrome` is not enabled.
     pub fn with_execution_scripts(
         &mut self,
@@ -10638,6 +14429,94 @@ impl Website {
     /// Block assets from loading from the network. Focus primarly on HTML documents.
     pub fn with_block_assets(&mut self, only_html: bool) -> &mut Self {
         self.configuration.with_block_assets(only_html);
+        self
+    }
+
+    /// When `block_stylesheets` is on, allow first-party CSS through.
+    /// Default `true` so SPAs that load their own stylesheets via dynamic
+    /// imports (React, Next.js, AppFabric, requirejs-style loaders) still
+    /// hydrate. Set `false` for strict block-all-CSS bandwidth crawls.
+    /// First-party means the request URL's registrable domain matches the
+    /// page's primary frame. No-op without the `chrome` feature.
+    #[cfg(feature = "chrome")]
+    pub fn with_allow_first_party_stylesheets(&mut self, allow: bool) -> &mut Self {
+        self.configuration
+            .chrome_intercept
+            .set_allow_first_party_stylesheets(allow);
+        self
+    }
+
+    /// No-op stub when `chrome` is disabled.
+    #[cfg(not(feature = "chrome"))]
+    pub fn with_allow_first_party_stylesheets(&mut self, _allow: bool) -> &mut Self {
+        self
+    }
+
+    /// Allow first-party JS through downstream blockers (intercept manager,
+    /// adblock, blocklists). Default `true` so SPA bootloaders are not
+    /// collateral damage from third-party tracker rules. Set `false` to
+    /// strictly enforce all blocklists, even on first-party scripts. No-op
+    /// without the `chrome` feature.
+    #[cfg(feature = "chrome")]
+    pub fn with_allow_first_party_javascript(&mut self, allow: bool) -> &mut Self {
+        self.configuration
+            .chrome_intercept
+            .set_allow_first_party_javascript(allow);
+        self
+    }
+
+    /// No-op stub when `chrome` is disabled.
+    #[cfg(not(feature = "chrome"))]
+    pub fn with_allow_first_party_javascript(&mut self, _allow: bool) -> &mut Self {
+        self
+    }
+
+    /// When `block_visuals` is on, allow first-party images/media/fonts
+    /// through. Default `true`. Set `false` for strictly bandwidth-minimal
+    /// crawls that drop ALL visuals regardless of origin. No-op without
+    /// the `chrome` feature.
+    #[cfg(feature = "chrome")]
+    pub fn with_allow_first_party_visuals(&mut self, allow: bool) -> &mut Self {
+        self.configuration
+            .chrome_intercept
+            .set_allow_first_party_visuals(allow);
+        self
+    }
+
+    /// No-op stub when `chrome` is disabled.
+    #[cfg(not(feature = "chrome"))]
+    pub fn with_allow_first_party_visuals(&mut self, _allow: bool) -> &mut Self {
+        self
+    }
+
+    /// Set all three first-party allow flags at once.
+    ///
+    /// Defaults are `(true, true, true)` — first-party stylesheets / JS /
+    /// visuals all bypass the corresponding `block_*` flag. Pass
+    /// `(false, false, false)` for a strictly bandwidth-minimal HTML-only
+    /// crawl that blocks every non-document subresource regardless of
+    /// origin. No-op without the `chrome` feature.
+    #[cfg(feature = "chrome")]
+    pub fn with_allow_first_party(
+        &mut self,
+        stylesheets: bool,
+        javascript: bool,
+        visuals: bool,
+    ) -> &mut Self {
+        self.configuration
+            .chrome_intercept
+            .set_allow_first_party(stylesheets, javascript, visuals);
+        self
+    }
+
+    /// No-op stub when `chrome` is disabled.
+    #[cfg(not(feature = "chrome"))]
+    pub fn with_allow_first_party(
+        &mut self,
+        _stylesheets: bool,
+        _javascript: bool,
+        _visuals: bool,
+    ) -> &mut Self {
         self
     }
 
@@ -10786,10 +14665,9 @@ impl Website {
         }
     }
 
-    #[cfg(not(feature = "sync"))]
     /// Sets up a subscription to receive concurrent data. This will panic if it is larger than `usize::MAX / 2`.
     /// Set the value to `0` to use the semaphore permits. If the subscription is going to block or use async methods,
-    /// make sure to spawn a task to avoid losing messages. This does nothing unless the `sync` flag is enabled.
+    /// make sure to spawn a task to avoid losing messages.
     ///
     /// # Examples
     ///
@@ -10801,7 +14679,7 @@ impl Website {
     /// #[tokio::main]
     /// async fn main() {
     ///     let mut website = Website::new("http://example.com");
-    ///     let mut rx = website.subscribe(0).unwrap();
+    ///     let mut rx = website.subscribe(0);
     ///
     ///     tokio::spawn(async move {
     ///         while let Ok(page) = rx.recv().await {
@@ -10815,40 +14693,7 @@ impl Website {
     ///     website.crawl().await;
     /// }
     /// ```
-    pub fn subscribe(&mut self, _capacity: usize) -> Option<broadcast::Receiver<Page>> {
-        None
-    }
-
-    /// Sets up a subscription to receive concurrent data. This will panic if it is larger than `usize::MAX / 2`.
-    /// Set the value to `0` to use the semaphore permits. If the subscription is going to block or use async methods,
-    /// make sure to spawn a task to avoid losing messages. This does nothing unless the `sync` flag is enabled.
-    ///
-    /// # Examples
-    ///
-    /// Subscribe and receive messages using an async tokio environment:
-    ///
-    /// ```rust
-    /// use spider::{tokio, website::Website};
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let mut website = Website::new("http://example.com");
-    ///     let mut rx = website.subscribe(0).unwrap();
-    ///
-    ///     tokio::spawn(async move {
-    ///         while let Ok(page) = rx.recv().await {
-    ///             tokio::spawn(async move {
-    ///                 // Process the received page.
-    ///                 // If performing non-blocking tasks or managing a high subscription count, configure accordingly.
-    ///             });
-    ///         }
-    ///     });
-    ///
-    ///     website.crawl().await;
-    /// }
-    /// ```
-    #[cfg(feature = "sync")]
-    pub fn subscribe(&mut self, capacity: usize) -> Option<broadcast::Receiver<Page>> {
+    pub fn subscribe(&mut self, capacity: usize) -> broadcast::Receiver<Page> {
         let channel = self.channel.get_or_insert_with(|| {
             let (tx, rx) = broadcast::channel(
                 (if capacity == 0 {
@@ -10861,16 +14706,14 @@ impl Website {
             (tx, Arc::new(rx))
         });
 
-        let rx2 = channel.0.subscribe();
-
-        Some(rx2)
+        channel.0.subscribe()
     }
 
     /// Get a sender for queueing extra links mid crawl. This does nothing unless the `sync` flag is enabled.
     #[cfg(feature = "sync")]
     pub fn queue(&mut self, capacity: usize) -> Option<broadcast::Sender<String>> {
         let channel = self.channel_queue.get_or_insert_with(|| {
-            let (tx, rx) = broadcast::channel(capacity);
+            let (tx, rx) = broadcast::channel(capacity.max(1));
             (tx, Arc::new(rx))
         });
 
@@ -10922,7 +14765,7 @@ impl Website {
     ///
     /// async fn main() {
     ///     let mut website: Website = Website::new("http://example.com");
-    ///     let mut rx2 = website.subscribe(18).unwrap();
+    ///     let mut rx2 = website.subscribe(18);
     ///     let mut rxg = website.subscribe_guard().unwrap();
     ///
     ///     tokio::spawn(async move {
@@ -10963,7 +14806,7 @@ impl Website {
     /// #[tokio::main]
     /// async fn main() {
     ///     let mut website: Website = Website::new("http://example.com");
-    ///     let mut rx2 = website.subscribe(18).unwrap();
+    ///     let mut rx2 = website.subscribe(18);
     ///     let mut rxg = website.subscribe_guard().unwrap();
     ///
     ///     tokio::spawn(async move {
@@ -11118,9 +14961,10 @@ impl Website {
         // Limits
         if let Some(v) = config.redirect_limit {
             self.configuration.redirect_limit = v;
+            self.configuration.redirect_limit_set = true;
         }
         if let Some(ref budget_map) = config.budget {
-            let mut budget = hashbrown::HashMap::new();
+            let mut budget = hashbrown::HashMap::with_capacity(budget_map.len());
             for (k, v) in budget_map {
                 budget.insert(case_insensitive_string::CaseInsensitiveString::new(k), *v);
             }
@@ -11246,74 +15090,175 @@ impl Website {
 }
 
 /// Channel broadcast send the Page to receivers.
-pub fn channel_send_page(
+///
+/// When the `balance` feature is active and memory pressure is detected,
+/// the page's HTML is spooled to a temporary file before broadcasting.
+/// This prevents large responses (including parallel_backends winners)
+/// from accumulating in memory across all channel subscribers.
+/// Receivers can transparently access the content via `page.get_html()`,
+/// `page.stream_html_bytes()`, or `page.ensure_html_loaded()`.
+pub async fn channel_send_page(
     channel: &Option<(
         tokio::sync::broadcast::Sender<Page>,
         std::sync::Arc<tokio::sync::broadcast::Receiver<Page>>,
     )>,
-    page: Page,
+    #[cfg(all(feature = "balance", not(feature = "decentralized")))] mut page: Page,
+    #[cfg(any(not(feature = "balance"), feature = "decentralized"))] page: Page,
     channel_guard: &Option<ChannelGuard>,
 ) {
+    // When `balance` is enabled: large pages, high memory load, or system
+    // pressure → spool to disk automatically.  Small pages stay in memory.
+    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+    {
+        let html_len = page.html.as_ref().map_or(0, |b| b.len());
+        if html_len > 0 && crate::utils::html_spool::should_spool(html_len) {
+            // spool_html_to_disk_async calls track_bytes_sub internally.
+            page.spool_html_to_disk_async().await;
+        }
+    }
+
+    // Subtract non-spooled HTML bytes from the budget.  After this point
+    // the page is either broadcast to subscribers (who own their clone) or
+    // dropped — either way the crawler no longer holds the bytes.
+    // Spooled pages already had their bytes subtracted above.
+    #[cfg(all(feature = "balance", not(feature = "decentralized")))]
+    {
+        let remaining = page.html.as_ref().map_or(0, |b| b.len());
+        if remaining > 0 {
+            crate::utils::html_spool::track_bytes_sub(remaining);
+        }
+        // Clear the tracking flag so the Page::Drop impl does not
+        // double-subtract these bytes when the page (or its broadcast
+        // clones) is eventually dropped.
+        page.balance_bytes_tracked = false;
+    }
+
     if let Some(c) = channel {
         if c.0.send(page).is_ok() {
             if let Some(guard) = channel_guard {
-                ChannelGuard::inc_guard(&guard.0 .1)
+                ChannelGuard::inc_guard(&guard.0)
             }
         }
     }
 }
 
 /// Guard a channel from closing until all concurrent operations are done.
-#[derive(Debug, Clone)]
-pub struct ChannelGuard(Arc<(AtomicBool, AtomicUsize, AtomicUsize)>);
+#[derive(Clone)]
+pub struct ChannelGuard(Arc<ChannelGuardInner>);
+
+/// Inner state for [`ChannelGuard`].
+pub(crate) struct ChannelGuardInner {
+    /// Whether the guard is active. When `false`, `lock()` returns immediately.
+    active: AtomicBool,
+    /// Monotonically increasing count of pages sent into the channel.
+    sent: AtomicUsize,
+    /// Monotonically increasing count of pages consumed by subscribers.
+    consumed: AtomicUsize,
+    /// Notifies waiters in `lock()` whenever `consumed` is incremented,
+    /// replacing the previous `yield_now()` spin-loop with event-driven wakeup.
+    notify: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for ChannelGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelGuard")
+            .field("active", &self.0.active.load(Ordering::Relaxed))
+            .field("sent", &self.0.sent.load(Ordering::Relaxed))
+            .field("consumed", &self.0.consumed.load(Ordering::Relaxed))
+            .finish()
+    }
+}
 
 impl ChannelGuard {
-    /// Create a new channel guard. The tuple has the guard control and the counter.
+    /// Create a new channel guard.
     #[cfg(feature = "sync")]
     pub(crate) fn new() -> ChannelGuard {
-        ChannelGuard(Arc::new((
-            AtomicBool::new(true),
-            AtomicUsize::new(0),
-            AtomicUsize::new(0),
-        )))
+        ChannelGuard(Arc::new(ChannelGuardInner {
+            active: AtomicBool::new(true),
+            sent: AtomicUsize::new(0),
+            consumed: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        }))
     }
-    /// Lock the channel until complete. This is only used for when storing the chrome page outside.
-    pub(crate) async fn lock(&self) {
-        if self.0 .0.load(Ordering::Relaxed) {
-            let old = self.0 .1.load(Ordering::Relaxed);
 
-            while self
-                .0
-                 .2
-                .compare_exchange_weak(old, 0, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                tokio::task::yield_now().await;
-            }
-            std::sync::atomic::fence(Ordering::Acquire);
+    /// Lock the channel until complete. This is only used for when storing the chrome page outside.
+    ///
+    /// Waits until consumed count has caught up to sent count.
+    /// Both counters grow monotonically so this is safe to call repeatedly
+    /// across multiple crawl iterations.
+    ///
+    /// Uses `Notify` for event-driven wakeup (zero CPU when idle) with a
+    /// short safety timeout to prevent stalls if all subscribers drop
+    /// without consuming (e.g. subscription_guard race).
+    ///
+    /// The timeout is deliberately short (250ms) because this sits in the
+    /// hot crawl loop — called after every page send.  In healthy flow the
+    /// Notify fires in microseconds.  If it hasn't fired after 250ms the
+    /// subscribers are gone and waiting longer just stalls the crawl.
+    pub(crate) async fn lock(&self) {
+        if !self.0.active.load(Ordering::Relaxed) {
+            return;
         }
+        let sent = self.0.sent.load(Ordering::Acquire);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(250);
+
+        loop {
+            // Create the notified future *before* checking the condition so we
+            // never miss a notify_one() that fires between check and wait.
+            let notified = self.0.notify.notified();
+
+            if self.0.consumed.load(Ordering::Acquire) >= sent {
+                break;
+            }
+
+            // Guard deactivated (e.g. all subscribers dropped).
+            if !self.0.active.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Safety deadline — if subscribers vanished without consuming,
+            // bail quickly rather than stalling the crawl.  250ms total is
+            // generous for the normal notify path (µs-scale) while keeping
+            // the hot loop responsive.
+            tokio::select! {
+                biased;
+                _ = notified => {},
+                _ = tokio::time::sleep_until(deadline) => {
+                    break;
+                },
+            }
+        }
+
+        std::sync::atomic::fence(Ordering::Acquire);
     }
 
     /// Set the guard control manually. If this is set to false the loop will not enter.
     pub fn guard(&mut self, guard: bool) {
-        self.0 .0.store(guard, Ordering::Release);
+        self.0.active.store(guard, Ordering::Release);
+        if !guard {
+            // Wake any waiter so it can observe the deactivation and exit.
+            self.0.notify.notify_waiters();
+        }
     }
 
     /// Increment the guard channel completions.
     // rename on next major since logic is now flow-controlled.
     pub fn inc(&mut self) {
-        self.0 .2.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.0.consumed.fetch_add(1, Ordering::Release);
+        self.0.notify.notify_one();
     }
 
-    /// Increment a guard channel completions.
-    pub(crate) fn inc_guard(guard: &AtomicUsize) {
-        guard.fetch_add(1, std::sync::atomic::Ordering::Release);
+    /// Increment the sent counter on a guard.
+    pub(crate) fn inc_guard(inner: &ChannelGuardInner) {
+        inner.sent.fetch_add(1, Ordering::Release);
     }
 }
 
 impl Drop for ChannelGuard {
     fn drop(&mut self) {
-        self.0 .0.store(false, Ordering::Release);
+        self.0.active.store(false, Ordering::Release);
+        // Wake any waiter blocked in lock() so it can exit immediately.
+        self.0.notify.notify_waiters();
     }
 }
 
@@ -11386,7 +15331,7 @@ async fn crawl_cron() {
         .with_cron("1/5 * * * * *", Default::default())
         .build()
         .unwrap();
-    let mut rx2 = website.subscribe(16).unwrap();
+    let mut rx2 = website.subscribe(16);
 
     // handle an event on every cron
     let join_handle = tokio::spawn(async move {
@@ -11420,7 +15365,7 @@ async fn crawl_cron_own() {
         .with_cron("1/5 * * * * *", Default::default())
         .build()
         .unwrap();
-    let mut rx2 = website.subscribe(16).unwrap();
+    let mut rx2 = website.subscribe(16);
 
     // handle an event on every cron
     let join_handle = tokio::spawn(async move {
@@ -11444,6 +15389,14 @@ async fn crawl_cron_own() {
     let _ = tokio::join!(runner.stop(), join_handle);
 }
 
+// Stack-frame regression sentinel: under `--features chrome` the crawl
+// page-fetch future folds new_streaming -> new_base ->
+// chrome_navigation_with_dns_hedge inline. If any of those frames regrow
+// and aren't heap-pinned at their boundary (see the Box::pin around the
+// hedge in page.rs), this overflows the 2MB default test/worker stack
+// and SIGABRTs — exactly the v2.51.188 regression. Must be run with
+// `cargo test -p spider --features chrome`; default-feature CI does NOT
+// compile the chrome paths and so cannot catch this.
 #[tokio::test]
 #[cfg(not(feature = "decentralized"))]
 async fn scrape() {
@@ -11492,6 +15445,104 @@ async fn crawl_invalid() {
     {
         assert_eq!(links.len(), 1, "{:?}", links);
     }
+}
+
+#[test]
+#[cfg(feature = "decentralized")]
+fn worker_override_dedups_trims_and_orders_scraper_first() {
+    let mut website = Website::new("https://example.com");
+
+    website
+        .with_worker_connections(vec![
+            "http://worker-1:3030".into(),
+            "http://worker-1:3030".into(),
+            " http://worker-2:3030 ".into(),
+            "   ".into(),
+        ])
+        .with_scraper_worker_connections(vec![
+            "http://scraper-1:3031".into(),
+            "".into(),
+            "http://scraper-1:3031".into(),
+        ]);
+
+    assert!(website.has_worker_override());
+    assert!(website.http_worker_active());
+    assert_eq!(
+        website.override_proxy_urls(),
+        vec![
+            "http://scraper-1:3031".to_string(),
+            "http://worker-1:3030".to_string(),
+            "http://worker-2:3030".to_string(),
+        ],
+        "override_proxy_urls must put scraper first, then crawl, deduped + trimmed"
+    );
+}
+
+#[test]
+#[cfg(feature = "decentralized")]
+fn worker_override_disabled_when_unset() {
+    let website = Website::new("https://example.com");
+    assert!(
+        !website.has_worker_override(),
+        "fresh Website must not flag a worker override"
+    );
+    assert!(
+        website.override_worker_semaphore().is_none(),
+        "no override ⇒ no per-website semaphore ⇒ global SEM path stays hot"
+    );
+    assert!(
+        website.override_proxy_urls().is_empty(),
+        "no override ⇒ no per-website proxy URLs"
+    );
+}
+
+#[test]
+#[cfg(feature = "decentralized")]
+fn worker_override_explicit_empty_disables_pool() {
+    let mut website = Website::new("https://example.com");
+
+    website
+        .with_worker_connection(None)
+        .with_scraper_worker_connection(None);
+
+    assert!(
+        !website.has_worker_override(),
+        "None ⇒ no override (env fallback)"
+    );
+
+    website
+        .with_worker_connections(Vec::new())
+        .with_scraper_worker_connections(Vec::new());
+
+    assert!(
+        website.has_worker_override(),
+        "Some(empty) ⇒ explicit override (pool disabled)"
+    );
+    assert!(website.override_proxy_urls().is_empty());
+    let sem = website
+        .override_worker_semaphore()
+        .expect("explicit override must build a semaphore");
+    assert!(
+        sem.available_permits() >= 1,
+        "override semaphore must clamp to >= 1 permit even with empty pool"
+    );
+}
+
+#[test]
+#[cfg(feature = "decentralized")]
+fn worker_override_http_worker_flag_tracks_crawl_scheme() {
+    let mut website = Website::new("https://example.com");
+    website.with_worker_connection(Some("https://secure-worker:3030".into()));
+    assert!(
+        !website.http_worker_active(),
+        "https worker URL must not flip the http_worker flag"
+    );
+
+    website.with_worker_connection(Some("http://insecure-worker:3030".into()));
+    assert!(
+        website.http_worker_active(),
+        "http worker URL must flip the http_worker flag"
+    );
 }
 
 #[tokio::test]
@@ -11656,7 +15707,7 @@ async fn test_crawl_tld() {
 #[cfg(all(feature = "sync", not(feature = "decentralized")))]
 async fn test_crawl_subscription() {
     let mut website: Website = Website::new("https://choosealicense.com");
-    let mut rx2 = website.subscribe(100).unwrap();
+    let mut rx2 = website.subscribe(100);
 
     let join_handle = tokio::spawn(async move {
         let mut count = 0;
@@ -11782,6 +15833,40 @@ async fn test_crawl_shutdown() {
 
 #[tokio::test]
 #[cfg(all(feature = "cache_request", not(feature = "decentralized")))]
+async fn test_no_cache_does_not_wrap_transport_errors() {
+    // Regression test for the cache-middleware-gate fix in
+    // `Website::configure_http_client`: when `configuration.cache=false`,
+    // the http-cache-reqwest middleware MUST NOT be attached. Otherwise
+    // every transport error gets wrapped as
+    // `HttpCacheError::Cache(err.to_string())` which destroys the source
+    // chain and forces `status_code_from_reqwest_error` to bucket every
+    // failure as 526 ADDRESS_UNREACHABLE.
+    //
+    // We trigger a fast TCP-refused error against a port nothing's
+    // listening on (127.0.0.1:1) and assert the error string does NOT
+    // start with the "Cache error:" prefix that the middleware adds.
+    let mut website: Website = Website::new("http://127.0.0.1:1/");
+    website.configuration.cache = false;
+
+    let client = website.configure_http_client();
+    let resp = client.get("http://127.0.0.1:1/").send().await;
+
+    // We expect a transport error (not a successful response), and the
+    // error MUST be the raw reqwest error — no cache-middleware wrap.
+    match resp {
+        Err(err) => {
+            let err_str = err.to_string();
+            assert!(
+                !err_str.starts_with("Cache error:"),
+                "cache=false client wrapped transport error: {err_str}"
+            );
+        }
+        Ok(_) => panic!("expected transport error against 127.0.0.1:1, got Ok"),
+    }
+}
+
+#[tokio::test]
+#[cfg(all(feature = "cache_request", not(feature = "decentralized")))]
 async fn test_cache() {
     let domain = "https://choosealicense.com/";
     let mut website: Website = Website::new(&domain);
@@ -11814,7 +15899,7 @@ async fn test_crawl_smart_uses_seeded_cache_with_skip_browser() {
     use std::collections::HashMap as StdHashMap;
 
     let target_url = "http://localhost:9/cache-smart-test";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -11864,7 +15949,7 @@ async fn test_cache_shortcircuit_single_page() {
     use std::collections::HashMap as StdHashMap;
 
     let target_url = "http://localhost:9/shortcircuit-test";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -11893,7 +15978,7 @@ async fn test_cache_shortcircuit_single_page() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 1)])));
 
-    let mut rx = website.subscribe(4).unwrap();
+    let mut rx = website.subscribe(4);
     let handle = tokio::spawn(async move { rx.recv().await.ok() });
 
     let start = tokio::time::Instant::now();
@@ -11938,7 +16023,7 @@ async fn test_cache_shortcircuit_not_without_skip_browser() {
     use std::collections::HashMap as StdHashMap;
 
     let target_url = "http://localhost:9/no-skip-shortcircuit";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -11983,7 +16068,7 @@ async fn test_cache_shortcircuit_not_for_multi_page() {
     use std::collections::HashMap as StdHashMap;
 
     let target_url = "http://localhost:9/multi-page-shortcircuit";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -12026,7 +16111,7 @@ async fn test_cache_shortcircuit_crawl_smart() {
     use std::collections::HashMap as StdHashMap;
 
     let target_url = "http://localhost:9/smart-shortcircuit-test";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -12055,7 +16140,7 @@ async fn test_cache_shortcircuit_crawl_smart() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 1)])));
 
-    let mut rx = website.subscribe(4).unwrap();
+    let mut rx = website.subscribe(4);
     let handle = tokio::spawn(async move { rx.recv().await.ok() });
 
     let start = tokio::time::Instant::now();
@@ -12081,6 +16166,54 @@ async fn test_cache_shortcircuit_crawl_smart() {
 
 #[cfg(test)]
 mod tests {
+
+    /// Redirect SSRF guard must refuse loopback, link-local (cloud
+    /// metadata), private, unique-local, reserved, IPv6 / IPv4-mapped,
+    /// localhost variants and non-HTTP schemes, while still allowing
+    /// ordinary public hosts so legitimate cross-site redirects keep
+    /// working.
+    #[test]
+    fn test_is_ssrf_redirect_blocks_internal() {
+        use url::Url;
+        for blocked in [
+            "http://127.0.0.1/",
+            "http://localhost/admin",
+            "http://sub.localhost/",
+            "http://0.0.0.0/",
+            // 0.0.0.0/8 past the unspecified address itself.
+            "http://0.0.0.1/",
+            "http://0.1.2.3/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:255.255.255.255]/",
+            "http://[fc00::1]/",
+            // IPv6 endpoint of the cloud metadata service.
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://[fe80::1]/",
+            "ftp://127.0.0.1/",
+        ] {
+            assert!(
+                super::Website::is_ssrf_redirect(&Url::parse(blocked).unwrap()),
+                "should block {blocked}"
+            );
+        }
+        for allowed in [
+            "http://example.com/",
+            "https://api.github.com/repos",
+            "http://93.184.216.34/",
+            "http://[2606:4700:4700::1111]/",
+        ] {
+            assert!(
+                !super::Website::is_ssrf_redirect(&Url::parse(allowed).unwrap()),
+                "should allow {allowed}"
+            );
+        }
+    }
 
     #[cfg(not(feature = "decentralized"))]
     #[test]
@@ -12184,6 +16317,7 @@ mod tests {
         assert_eq!(*website.get_status(), super::CrawlStatus::ConnectError);
     }
 
+    #[cfg(not(feature = "page_error_status_details"))]
     #[test]
     fn test_crawl_status_598_with_error_status_and_content_is_server_error() {
         let mut website = crate::website::Website::new("http://example.com");
@@ -12195,6 +16329,7 @@ mod tests {
         assert_eq!(*website.get_status(), super::CrawlStatus::ServerError);
     }
 
+    #[cfg(not(feature = "page_error_status_details"))]
     #[test]
     fn test_crawl_status_598_with_error_status_empty_is_connect_error() {
         let mut website = crate::website::Website::new("http://example.com");
@@ -12205,6 +16340,7 @@ mod tests {
         assert_eq!(*website.get_status(), super::CrawlStatus::ConnectError);
     }
 
+    #[cfg(not(feature = "page_error_status_details"))]
     #[test]
     fn test_crawl_status_599_with_content_and_error_status_is_server_error() {
         let mut website = crate::website::Website::new("http://example.com");
@@ -12270,6 +16406,29 @@ mod tests {
     }
 
     #[test]
+    fn test_crawl_status_dns_error_is_connect_error() {
+        let mut website = crate::website::Website::new("http://www.a.com");
+        let page = make_page(*crate::page::DNS_RESOLVE_ERROR);
+        let links = hashbrown::HashSet::new();
+        website.set_crawl_initial_status(&page, &links);
+        assert_eq!(
+            *website.get_status(),
+            super::CrawlStatus::ConnectError,
+            "DNS resolve errors should map to ConnectError, not ServerError"
+        );
+        assert!(
+            !page.needs_retry(),
+            "DNS errors are permanent and must not trigger retry"
+        );
+        // Simulate what crawl_establish does: set initial_page_should_retry from needs_retry()
+        website.set_initial_page_should_retry(page.needs_retry());
+        assert!(
+            !website.get_initial_page_should_retry(),
+            "website.initial_page_should_retry must be false for DNS errors"
+        );
+    }
+
+    #[test]
     fn test_single_page_with_limit_1() {
         let mut website = crate::website::Website::new("http://example.com");
         website.configuration.with_limit(1);
@@ -12316,9 +16475,7 @@ mod tests {
     async fn test_crawl_single_page_subscription_receives_page() {
         let mut website = crate::website::Website::new("https://example.com");
         website.configuration.with_limit(1);
-        let mut rx = website
-            .subscribe(10)
-            .expect("sync feature must enable subscribe");
+        let mut rx = website.subscribe(10);
         let crawl = async {
             website.crawl_raw().await;
             website.unsubscribe();
@@ -12339,6 +16496,173 @@ mod tests {
             received[0].get_url().contains("example.com"),
             "received page url must match target"
         );
+    }
+
+    // =========================================================
+    // ProxyStrategy / proxies_by_kind / lazy secondary client.
+    // =========================================================
+
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    #[test]
+    fn proxy_strategy_default_none_secondary_returns_none() {
+        // No strategy, no kind map → secondary returns None for any kind.
+        let website = crate::website::Website::new("http://example.com");
+        assert!(website
+            .secondary_http_client_for(&crate::configuration::ProxyKind::MediaAsset)
+            .is_none());
+        assert!(website
+            .secondary_http_client_for(&crate::configuration::ProxyKind::Default)
+            .is_none());
+    }
+
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    #[test]
+    fn proxy_strategy_no_kind_map_returns_none() {
+        // Strategy is set but proxies_by_kind isn't — still None.
+        use crate::configuration::ProxyKind;
+        use crate::proxy_strategy::{ProxyRouteContext, ProxyStrategy, SharedProxyStrategy};
+        struct AlwaysMedia;
+        impl ProxyStrategy for AlwaysMedia {
+            fn route(&self, _: &ProxyRouteContext) -> ProxyKind {
+                ProxyKind::MediaAsset
+            }
+        }
+
+        let mut website = crate::website::Website::new("http://example.com");
+        let strategy: SharedProxyStrategy = std::sync::Arc::new(AlwaysMedia);
+        website.with_proxy_strategy(strategy);
+        assert!(website
+            .secondary_http_client_for(&ProxyKind::MediaAsset)
+            .is_none());
+    }
+
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    #[test]
+    fn proxy_strategy_lazy_builds_media_client_and_reuses() {
+        use crate::configuration::{ProxyKind, RequestProxy};
+        use crate::proxy_strategy::{ProxyRouteContext, ProxyStrategy};
+
+        struct AlwaysMedia;
+        impl ProxyStrategy for AlwaysMedia {
+            fn route(&self, _: &ProxyRouteContext) -> ProxyKind {
+                ProxyKind::MediaAsset
+            }
+        }
+
+        let mut website = crate::website::Website::new("http://example.com");
+        website.configuration.with_proxies_for_kind(
+            ProxyKind::MediaAsset,
+            Some(vec![RequestProxy {
+                addr: "http://media-proxy.example:8080".into(),
+                ..Default::default()
+            }]),
+        );
+        website.with_proxy_strategy(std::sync::Arc::new(AlwaysMedia));
+
+        let a = website
+            .secondary_http_client_for(&ProxyKind::MediaAsset)
+            .expect("secondary client built");
+        let b = website
+            .secondary_http_client_for(&ProxyKind::MediaAsset)
+            .expect("secondary client cached");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "second call must reuse the same lazy Arc<Client>"
+        );
+    }
+
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    #[test]
+    fn proxy_strategy_default_kind_returns_none_v1() {
+        // Kind::Default never produces a secondary — primary is canonical.
+        use crate::configuration::{ProxyKind, RequestProxy};
+        let mut website = crate::website::Website::new("http://example.com");
+        website.configuration.with_proxies_for_kind(
+            ProxyKind::Default,
+            Some(vec![RequestProxy {
+                addr: "http://primary.example:8080".into(),
+                ..Default::default()
+            }]),
+        );
+        assert!(website
+            .secondary_http_client_for(&ProxyKind::Default)
+            .is_none());
+    }
+
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    #[test]
+    fn proxy_strategy_custom_kind_returns_none_v1() {
+        // Custom kinds are not auto-routed in V1.
+        use crate::compact_str::CompactString;
+        use crate::configuration::{ProxyKind, RequestProxy};
+        use crate::proxy_strategy::{ProxyRouteContext, ProxyStrategy};
+
+        struct AlwaysCustom;
+        impl ProxyStrategy for AlwaysCustom {
+            fn route(&self, _: &ProxyRouteContext) -> ProxyKind {
+                ProxyKind::Custom(CompactString::new("tier-a"))
+            }
+        }
+
+        let mut website = crate::website::Website::new("http://example.com");
+        let kind = ProxyKind::Custom(CompactString::new("tier-a"));
+        website.configuration.with_proxies_for_kind(
+            kind.clone(),
+            Some(vec![RequestProxy {
+                addr: "http://tier-a.example:8080".into(),
+                ..Default::default()
+            }]),
+        );
+        website.with_proxy_strategy(std::sync::Arc::new(AlwaysCustom));
+        assert!(
+            website.secondary_http_client_for(&kind).is_none(),
+            "Custom kind not auto-wired in V1 — should fall back to primary"
+        );
+    }
+
+    #[cfg(all(not(feature = "decentralized"), not(feature = "cache_request")))]
+    #[test]
+    fn proxy_strategy_secondary_drops_when_idle() {
+        // After the last Arc<Client> clone is dropped, the lazy slot
+        // should report dead and rebuild on the next access.
+        use crate::configuration::{ProxyKind, RequestProxy};
+        use crate::proxy_strategy::{ProxyRouteContext, ProxyStrategy};
+
+        struct AlwaysMedia;
+        impl ProxyStrategy for AlwaysMedia {
+            fn route(&self, _: &ProxyRouteContext) -> ProxyKind {
+                ProxyKind::MediaAsset
+            }
+        }
+
+        let mut website = crate::website::Website::new("http://example.com");
+        website.configuration.with_proxies_for_kind(
+            ProxyKind::MediaAsset,
+            Some(vec![RequestProxy {
+                addr: "http://media.example:8080".into(),
+                ..Default::default()
+            }]),
+        );
+        website.with_proxy_strategy(std::sync::Arc::new(AlwaysMedia));
+
+        // Build, hold a clone, drop it.
+        {
+            let _live = website
+                .secondary_http_client_for(&ProxyKind::MediaAsset)
+                .expect("built");
+            assert!(website.secondary_media_client.is_live());
+        }
+        assert!(
+            !website.secondary_media_client.is_live(),
+            "slot must be dead after the last clone drops"
+        );
+
+        // Next access rebuilds — different ptr, still functional.
+        let after = website
+            .secondary_http_client_for(&ProxyKind::MediaAsset)
+            .expect("rebuilt");
+        assert!(website.secondary_media_client.is_live());
+        drop(after);
     }
 }
 
@@ -12383,7 +16707,7 @@ async fn test_cache_phase_multi_page_all_cached() {
         (sub1_url, sub1_html),
         (sub2_url, sub2_html),
     ] {
-        let cache_key = create_cache_key_raw(url, None, None);
+        let cache_key = create_cache_key_raw(url, None, None, None);
         let http_response = HttpResponse {
             body: html.as_bytes().to_vec(),
             headers: response_headers.clone(),
@@ -12399,7 +16723,7 @@ async fn test_cache_phase_multi_page_all_cached() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 10)])));
 
-    let mut rx = website.subscribe(16).unwrap();
+    let mut rx = website.subscribe(16);
 
     website.crawl_raw().await;
 
@@ -12439,7 +16763,7 @@ async fn test_cache_mem_auto_skip_browser() {
     use std::collections::HashMap as StdHashMap;
 
     let target_url = "http://localhost:9/cache-mem-auto-skip";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -12476,7 +16800,7 @@ async fn test_cache_mem_auto_skip_browser() {
         );
     }
 
-    let mut rx = website.subscribe(16).unwrap();
+    let mut rx = website.subscribe(16);
 
     let start = tokio::time::Instant::now();
     website.crawl_raw().await;
@@ -12558,7 +16882,7 @@ async fn test_chrome_remote_cache_skip_browser_timing() {
 
     // --- Populate local in-memory cache ---
     let target_url = "http://localhost:9/remote-cache-skip-timing";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -12593,7 +16917,7 @@ async fn test_chrome_remote_cache_skip_browser_timing() {
         );
     }
 
-    let mut rx = website.subscribe(16).unwrap();
+    let mut rx = website.subscribe(16);
 
     let start = tokio::time::Instant::now();
     website.crawl_raw().await;
@@ -12646,7 +16970,7 @@ async fn test_cache_phase_partial_miss() {
     };
 
     // Only seed root, NOT sub
-    let cache_key = create_cache_key_raw(root_url, None, None);
+    let cache_key = create_cache_key_raw(root_url, None, None, None);
     let http_response = HttpResponse {
         body: root_html.as_bytes().to_vec(),
         headers: response_headers,
@@ -12661,7 +16985,7 @@ async fn test_cache_phase_partial_miss() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 10)])));
 
-    let mut rx = website.subscribe(16).unwrap();
+    let mut rx = website.subscribe(16);
 
     // crawl_raw will: cache phase serves root, puts sub in extra_links,
     // then falls through to raw HTTP which fails to connect (localhost:9).
@@ -12701,7 +17025,7 @@ async fn test_cache_phase_skipped_without_skip_browser() {
         h
     };
 
-    let cache_key = create_cache_key_raw(root_url, None, None);
+    let cache_key = create_cache_key_raw(root_url, None, None, None);
     let http_response = HttpResponse {
         body: b"<html><body>Cached</body></html>".to_vec(),
         headers: response_headers,
@@ -12759,7 +17083,7 @@ async fn test_cache_phase_respects_budget() {
         (sub1_url, sub_html),
         (sub2_url, sub_html),
     ] {
-        let cache_key = create_cache_key_raw(url, None, None);
+        let cache_key = create_cache_key_raw(url, None, None, None);
         let http_response = HttpResponse {
             body: html.as_bytes().to_vec(),
             headers: response_headers.clone(),
@@ -12776,7 +17100,7 @@ async fn test_cache_phase_respects_budget() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 2)])));
 
-    let mut rx = website.subscribe(16).unwrap();
+    let mut rx = website.subscribe(16);
     website.crawl_raw().await;
 
     let mut pages = Vec::new();
@@ -12836,7 +17160,7 @@ async fn test_cache_phase_dedup_signatures() {
     };
 
     for url in [root_url, dup_url] {
-        let cache_key = create_cache_key_raw(url, None, None);
+        let cache_key = create_cache_key_raw(url, None, None, None);
         let http_response = HttpResponse {
             body: html.as_bytes().to_vec(),
             headers: response_headers.clone(),
@@ -12853,7 +17177,7 @@ async fn test_cache_phase_dedup_signatures() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 10)])));
 
-    let mut rx = website.subscribe(16).unwrap();
+    let mut rx = website.subscribe(16);
     website.crawl_raw().await;
 
     let mut pages = Vec::new();
@@ -12886,7 +17210,7 @@ async fn test_cache_shortcircuit_single_page_mem() {
     use std::collections::HashMap as StdHashMap;
 
     let target_url = "http://localhost:9/shortcircuit-mem-test";
-    let cache_key = create_cache_key_raw(target_url, None, None);
+    let cache_key = create_cache_key_raw(target_url, None, None, None);
 
     let mut response_headers = StdHashMap::new();
     response_headers.insert("content-type".to_string(), "text/html".to_string());
@@ -12914,7 +17238,7 @@ async fn test_cache_shortcircuit_single_page_mem() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 1)])));
 
-    let mut rx = website.subscribe(4).unwrap();
+    let mut rx = website.subscribe(4);
     let handle = tokio::spawn(async move { rx.recv().await.ok() });
 
     let start = tokio::time::Instant::now();
@@ -12980,7 +17304,7 @@ async fn test_cache_phase_multi_page_all_cached_mem() {
         (sub1_url, sub1_html),
         (sub2_url, sub2_html),
     ] {
-        let cache_key = create_cache_key_raw(url, None, None);
+        let cache_key = create_cache_key_raw(url, None, None, None);
         let http_response = HttpResponse {
             body: html.as_bytes().to_vec(),
             headers: response_headers.clone(),
@@ -12996,7 +17320,7 @@ async fn test_cache_phase_multi_page_all_cached_mem() {
     website.with_cache_skip_browser(true);
     website.with_budget(Some(HashMap::from([("*", 10)])));
 
-    let mut rx = website.subscribe(16).unwrap();
+    let mut rx = website.subscribe(16);
     website.crawl_raw().await;
 
     let mut pages = Vec::new();
@@ -13056,14 +17380,26 @@ impl crate::traits::Crawler for Website {
 
 #[cfg(feature = "sync")]
 impl crate::traits::CrawlerSubscription for Website {
-    fn subscribe(&mut self, capacity: usize) -> Option<tokio::sync::broadcast::Receiver<Page>> {
-        Website::subscribe(self, capacity)
+    fn subscribe(&mut self, capacity: usize) -> tokio::sync::broadcast::Receiver<Page> {
+        let channel = self.channel.get_or_insert_with(|| {
+            let (tx, rx) = tokio::sync::broadcast::channel(
+                (if capacity == 0 {
+                    *DEFAULT_PERMITS
+                } else {
+                    capacity
+                })
+                .max(1),
+            );
+            (tx, std::sync::Arc::new(rx))
+        });
+
+        channel.0.subscribe()
     }
 }
 
-#[cfg(all(test, feature = "balance"))]
-#[test]
-fn test_shed_page_html() {
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_shed_page_html() {
     let make_page = |url: &str| {
         let mut page = Page::default();
         page.url = url.to_string();
@@ -13071,27 +17407,1170 @@ fn test_shed_page_html() {
         page
     };
 
-    // Under threshold: nothing shed
+    // Under threshold: nothing shed (fewer than 100 pages).
     let mut pages: Vec<Page> = (0..50)
         .map(|i| make_page(&format!("https://a.com/{i}")))
         .collect();
-    Website::shed_page_html(&mut pages);
+    Website::shed_page_html(&mut pages).await;
     assert!(pages.iter().all(|p| p.html.is_some()));
 
-    // Over threshold: older pages shed, recent 100 kept
-    let mut pages: Vec<Page> = (0..200)
-        .map(|i| make_page(&format!("https://a.com/{i}")))
-        .collect();
-    Website::shed_page_html(&mut pages);
-    // First 100 should have html=None
-    for page in &pages[..100] {
-        assert!(page.html.is_none(), "old page should have html shed");
-    }
-    // Last 100 should still have html
-    for page in &pages[100..] {
-        assert!(page.html.is_some(), "recent page should keep html");
-    }
-    // All pages should preserve url
+    // All pages should preserve url.
     assert_eq!(pages[0].url, "https://a.com/0");
-    assert_eq!(pages[199].url, "https://a.com/199");
+    assert_eq!(pages[49].url, "https://a.com/49");
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_html_to_disk_and_reload() {
+    let mut page = Page::default();
+    page.url = "https://example.com".to_string();
+    let html = b"<html><body>test content</body></html>";
+    page.html = Some(bytes::Bytes::from(html.as_slice()));
+
+    // Spool to disk.
+    assert!(page.spool_html_to_disk());
+    assert!(page.html.is_none(), "in-memory html should be cleared");
+    assert!(page.is_html_on_disk(), "should report as on-disk");
+    assert!(!page.is_empty(), "page with disk content is not empty");
+
+    // get_html() transparently reads from disk.
+    let content = page.get_html();
+    assert_eq!(content, "<html><body>test content</body></html>");
+
+    // Reload into memory and verify the spool file is cleaned up.
+    assert!(page.ensure_html_loaded());
+    assert!(page.html.is_some(), "html should be back in memory");
+    assert!(
+        page.html_spool_path.is_none(),
+        "spool guard should be cleared after reload"
+    );
+    assert_eq!(page.get_html(), "<html><body>test content</body></html>");
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_guard_clone_independence() {
+    let mut page = Page::default();
+    page.url = "https://example.com/clone".to_string();
+    page.html = Some(bytes::Bytes::from("clone test"));
+
+    page.spool_html_to_disk();
+    let cloned = page.clone();
+
+    // Both should be able to independently read content.
+    assert_eq!(page.get_html(), "clone test");
+    assert_eq!(cloned.get_html(), "clone test");
+
+    // Dropping original shouldn't affect the clone.
+    drop(page);
+    assert_eq!(cloned.get_html(), "clone test");
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_drop_cleans_up_file() {
+    let path;
+    {
+        let mut page = Page::default();
+        page.html = Some(bytes::Bytes::from("temporary"));
+        page.spool_html_to_disk();
+        path = page
+            .html_spool_path
+            .as_ref()
+            .unwrap()
+            .path()
+            .unwrap()
+            .to_path_buf();
+        assert!(path.exists(), "spool file should exist");
+    }
+    // Flush the background cleanup thread so the delete is processed.
+    crate::utils::html_spool::flush_cleanup();
+    assert!(!path.exists(), "spool file should be deleted on drop");
+}
+
+// ── Deep end-to-end spool tests ────────────────────────────────────────────
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_empty_html_noop() {
+    // Empty HTML should not be spooled.
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::new());
+    assert!(!page.spool_html_to_disk(), "empty HTML should not spool");
+    assert!(!page.is_html_on_disk());
+
+    // No HTML at all.
+    let mut page2 = Page::default();
+    assert!(!page2.spool_html_to_disk());
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_double_spool_is_noop() {
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from("content"));
+    assert!(page.spool_html_to_disk());
+    // Second spool should be a no-op (html is already None, spool exists).
+    assert!(!page.spool_html_to_disk());
+    // Content still accessible.
+    assert_eq!(page.get_html(), "content");
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_set_html_bytes_replaces_spool() {
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from("original"));
+    page.spool_html_to_disk();
+    let spool_path = page.get_html_spool_path().unwrap().to_path_buf();
+    assert!(spool_path.exists());
+
+    // Setting new html should clean up the spool file.
+    page.set_html_bytes(Some(b"replacement".to_vec()));
+    crate::utils::html_spool::flush_cleanup();
+    assert!(!spool_path.exists(), "old spool file should be deleted");
+    assert!(!page.is_html_on_disk());
+    assert_eq!(page.get_html(), "replacement");
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_set_html_bytes_none_clears_spool() {
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from("to clear"));
+    page.spool_html_to_disk();
+    let spool_path = page.get_html_spool_path().unwrap().to_path_buf();
+
+    page.set_html_bytes(None);
+    crate::utils::html_spool::flush_cleanup();
+    assert!(!spool_path.exists());
+    assert!(!page.is_html_on_disk());
+    assert!(page.is_empty());
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_get_html_cow_from_disk() {
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from("<html>cow</html>"));
+    page.spool_html_to_disk();
+
+    let cow = page.get_html_cow();
+    assert_eq!(cow.as_ref(), "<html>cow</html>");
+    // Since loaded from disk, it should be Owned.
+    assert!(matches!(cow, std::borrow::Cow::Owned(_)));
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_page_size_basic() {
+    let mut page = Page::default();
+    assert_eq!(page.size(), 0);
+
+    page.html = Some(bytes::Bytes::from("hello"));
+    assert_eq!(page.size(), 5);
+
+    page.html = Some(bytes::Bytes::from(""));
+    assert_eq!(page.size(), 0);
+
+    page.html = None;
+    assert_eq!(page.size(), 0);
+}
+
+#[test]
+fn test_stream_html_bytes_from_memory() {
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from("abcdefghij"));
+
+    let mut collected = Vec::new();
+    let total = page.stream_html_bytes(4, |chunk| {
+        collected.extend_from_slice(chunk);
+        true
+    });
+    assert_eq!(total, 10);
+    assert_eq!(collected, b"abcdefghij");
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_stream_html_bytes_from_disk() {
+    let mut page = Page::default();
+    let html = b"<html><body>streamed from disk</body></html>";
+    page.html = Some(bytes::Bytes::from(html.as_slice()));
+    page.spool_html_to_disk();
+
+    let mut collected = Vec::new();
+    let total = page.stream_html_bytes(10, |chunk| {
+        collected.extend_from_slice(chunk);
+        true
+    });
+    assert_eq!(total, html.len());
+    assert_eq!(collected, html);
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_stream_html_bytes_early_stop() {
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from(vec![0u8; 100]));
+
+    let mut chunks = 0usize;
+    page.stream_html_bytes(10, |_| {
+        chunks += 1;
+        chunks < 3
+    });
+    assert_eq!(chunks, 3);
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_stream_html_bytes_empty_page() {
+    let page = Page::default();
+    let total = page.stream_html_bytes(10, |_| true);
+    assert_eq!(total, 0);
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_page_size_in_memory_and_on_disk() {
+    let mut page = Page::default();
+
+    // Empty page.
+    assert_eq!(page.size(), 0);
+
+    // In-memory content.
+    let html = b"<html><body>hello world</body></html>";
+    page.html = Some(bytes::Bytes::from(html.as_slice()));
+    assert_eq!(page.size(), html.len());
+
+    // Spool to disk: size() must still return the correct byte length.
+    assert!(page.spool_html_to_disk());
+    assert!(page.html.is_none());
+    assert!(page.is_html_on_disk());
+    assert_eq!(page.size(), html.len());
+
+    // Reload back into memory: size() stays consistent.
+    assert!(page.ensure_html_loaded());
+    assert!(page.html.is_some());
+    assert_eq!(page.size(), html.len());
+
+    // Replace with different content.
+    let html2 = b"<html><body>longer content here for testing</body></html>";
+    page.html = Some(bytes::Bytes::from(html2.as_slice()));
+    assert_eq!(page.size(), html2.len());
+
+    // Spool the new content and verify size tracks the new length.
+    page.html_spool_path = None;
+    assert!(page.spool_html_to_disk());
+    assert_eq!(page.size(), html2.len());
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_page_size_async_spool() {
+    let mut page = Page::default();
+    let html = b"<html><body>async spool size test</body></html>";
+    page.html = Some(bytes::Bytes::from(html.as_slice()));
+    assert_eq!(page.size(), html.len());
+
+    assert!(page.spool_html_to_disk_async().await);
+    assert!(page.is_html_on_disk());
+    assert_eq!(page.size(), html.len());
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_concurrent_pages() {
+    // Simulate many pages being spooled/unspooled concurrently.
+    use std::sync::Arc;
+
+    let pages: Vec<_> = (0..50)
+        .map(|i| {
+            let mut page = Page::default();
+            page.url = format!("https://example.com/{i}");
+            page.html = Some(bytes::Bytes::from(format!("<html>{i}</html>")));
+            page.spool_html_to_disk();
+            Arc::new(std::sync::Mutex::new(page))
+        })
+        .collect();
+
+    // All should be on disk.
+    for p in &pages {
+        let page = p.lock().unwrap();
+        assert!(page.is_html_on_disk());
+    }
+
+    // Read content from all concurrently.
+    let handles: Vec<_> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let p = Arc::clone(p);
+            std::thread::spawn(move || {
+                let page = p.lock().unwrap();
+                let html = page.get_html();
+                assert_eq!(html, format!("<html>{i}</html>"));
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread should not panic");
+    }
+
+    // Reload half of them.
+    for p in pages.iter().take(25) {
+        let mut page = p.lock().unwrap();
+        assert!(page.ensure_html_loaded());
+        assert!(!page.is_html_on_disk());
+    }
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_clone_byte_counter_consistency() {
+    // Clones now share the same spool file via Arc — no file copy.
+    // The file is deleted only when the last clone drops.
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from("clone counter"));
+    page.spool_html_to_disk();
+
+    let clone1 = page.clone();
+    let clone2 = clone1.clone();
+
+    // All three share the same file and are readable.
+    assert_eq!(page.get_html(), "clone counter");
+    assert_eq!(clone1.get_html(), "clone counter");
+    assert_eq!(clone2.get_html(), "clone counter");
+
+    // All point to the same spool path (Arc shared).
+    let shared_path = page.get_html_spool_path().unwrap().to_path_buf();
+    assert_eq!(clone1.get_html_spool_path().unwrap(), shared_path);
+    assert_eq!(clone2.get_html_spool_path().unwrap(), shared_path);
+
+    // Drop two — file should still exist (last Arc alive in clone1).
+    drop(clone2);
+    drop(page);
+    assert!(
+        shared_path.exists(),
+        "file should survive while clone1 lives"
+    );
+    assert_eq!(clone1.get_html(), "clone counter");
+
+    // Drop the last clone — file should be cleaned up.
+    drop(clone1);
+    crate::utils::html_spool::flush_cleanup();
+    assert!(
+        !shared_path.exists(),
+        "file should be deleted after last clone drops"
+    );
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_page_drop_subtracts_leaked_bytes() {
+    // Simulate the Chrome retry pattern: multiple pages created via build(),
+    // only the last one goes through channel_send_page.  Old pages must
+    // subtract their bytes via the Drop impl.
+    use crate::utils::html_spool;
+
+    let before = html_spool::total_bytes_in_memory();
+
+    // Create a page (simulating build()) — bytes are tracked.
+    let html_data = vec![b'x'; 10_000];
+    let mut page1 = Page::default();
+    page1.html = Some(bytes::Bytes::from(html_data.clone()));
+    html_spool::track_bytes_add(page1.html.as_ref().unwrap().len());
+    page1.balance_bytes_tracked = true;
+
+    assert_eq!(html_spool::total_bytes_in_memory(), before + 10_000);
+
+    // Create a second page (retry) — also tracked.
+    let mut page2 = Page::default();
+    page2.html = Some(bytes::Bytes::from(html_data));
+    html_spool::track_bytes_add(page2.html.as_ref().unwrap().len());
+    page2.balance_bytes_tracked = true;
+
+    assert_eq!(html_spool::total_bytes_in_memory(), before + 20_000);
+
+    // Drop the first page (simulates `page = next_page` in retry).
+    // The Drop impl should subtract the 10_000 bytes.
+    drop(page1);
+    assert_eq!(html_spool::total_bytes_in_memory(), before + 10_000);
+
+    // Simulate channel_send_page: subtract bytes and clear the flag.
+    let remaining = page2.html.as_ref().map_or(0, |b| b.len());
+    html_spool::track_bytes_sub(remaining);
+    page2.balance_bytes_tracked = false;
+
+    assert_eq!(html_spool::total_bytes_in_memory(), before);
+
+    // Drop page2 — should NOT double-subtract (flag is false).
+    drop(page2);
+    assert_eq!(html_spool::total_bytes_in_memory(), before);
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_page_drop_no_double_subtract_on_clone() {
+    // When a page is broadcast via channel_send_page, it's cloned for
+    // subscribers.  The clone inherits balance_bytes_tracked=false, so
+    // dropping it must not subtract bytes.
+    use crate::utils::html_spool;
+
+    let before = html_spool::total_bytes_in_memory();
+
+    let mut page = Page::default();
+    page.html = Some(bytes::Bytes::from(vec![b'y'; 5_000]));
+    html_spool::track_bytes_add(5_000);
+    page.balance_bytes_tracked = true;
+
+    // Simulate channel_send_page clearing the flag before broadcast.
+    html_spool::track_bytes_sub(5_000);
+    page.balance_bytes_tracked = false;
+
+    // Clone (simulating broadcast::send cloning the page).
+    let clone = page.clone();
+    assert!(!clone.balance_bytes_tracked);
+
+    // Drop both — neither should subtract.
+    drop(page);
+    drop(clone);
+    assert_eq!(html_spool::total_bytes_in_memory(), before);
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_large_html_link_extraction() {
+    // Generate a large HTML page with many links, spool it, then extract
+    // links from disk without loading the full content.
+    let mut html = String::from("<html><body>");
+    for i in 0..500 {
+        html.push_str(&format!(
+            r#"<a href="https://example.com/page/{i}">link {i}</a>"#
+        ));
+    }
+    html.push_str("</body></html>");
+
+    let mut page = Page::default();
+    page.url = "https://example.com".to_string();
+    page.html = Some(bytes::Bytes::from(html.clone()));
+
+    // Extract links from memory first as a baseline.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let selectors = crate::page::get_page_selectors("https://example.com", false, false);
+
+    let expected_links = rt.block_on(async { page.links(&selectors, &None).await });
+    assert!(
+        expected_links.len() >= 400,
+        "should extract many links from memory: got {}",
+        expected_links.len()
+    );
+
+    // Now spool to disk and extract links from disk.
+    page.spool_html_to_disk();
+    assert!(page.is_html_on_disk());
+
+    let disk_links = rt.block_on(async { page.links(&selectors, &None).await });
+
+    assert_eq!(
+        expected_links.len(),
+        disk_links.len(),
+        "disk extraction should produce the same number of links as memory"
+    );
+    // Verify the sets match.
+    for link in &expected_links {
+        assert!(
+            disk_links.contains(link),
+            "disk links should contain all memory links: missing {link}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_page_through_channel() {
+    // Simulate the scrape() pattern: send pages through a channel, receive
+    // them, spool under pressure, then read content back.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<Page>(16);
+
+        // Spawn producer.
+        let producer = tokio::spawn(async move {
+            for i in 0..20 {
+                let mut page = Page::default();
+                page.url = format!("https://example.com/{i}");
+                page.html = Some(bytes::Bytes::from(format!("<html>page {i}</html>")));
+                let _ = tx.send(page);
+            }
+        });
+
+        // Collect pages, spool every other one.
+        let mut pages = Vec::new();
+        let consumer = async {
+            loop {
+                match rx.recv().await {
+                    Ok(mut page) => {
+                        let idx = pages.len();
+                        if idx % 2 == 0 {
+                            page.spool_html_to_disk();
+                        }
+                        pages.push(page);
+                        if pages.len() >= 20 {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
+        };
+
+        let _ = tokio::join!(producer, consumer);
+
+        // Verify all received pages have accessible content (some may be
+        // lost to broadcast lag, but those we did receive must be valid).
+        assert!(!pages.is_empty(), "should receive at least some pages");
+
+        for page in &pages {
+            let html = page.get_html();
+            assert!(
+                html.starts_with("<html>page ") && html.ends_with("</html>"),
+                "page content should be valid: {html}"
+            );
+
+            // Verify streaming produces the same content.
+            let mut collected = Vec::new();
+            page.stream_html_bytes(32, |chunk| {
+                collected.extend_from_slice(chunk);
+                true
+            });
+            assert_eq!(
+                String::from_utf8_lossy(&collected),
+                html,
+                "streamed content should match get_html()"
+            );
+        }
+    });
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_decision_logic() {
+    // Small pages never spool.
+    assert!(
+        !crate::utils::html_spool::should_spool(100),
+        "small page should not spool"
+    );
+    // Normal-sized pages stay in memory under normal conditions.
+    assert!(
+        !crate::utils::html_spool::should_spool(4 * 1024 * 1024),
+        "4 MiB page should stay in memory under normal conditions"
+    );
+    // Truly massive pages always spool (outsized resources).
+    assert!(
+        crate::utils::html_spool::should_spool(100 * 1024 * 1024),
+        "100 MiB page should always spool"
+    );
+}
+
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_spool_subscription_stream_from_disk() {
+    // Simulate the subscription pattern: crawl sends pages via broadcast,
+    // subscriber receives them, some are spooled, and we stream bytes from
+    // both memory and disk pages — verifying the full e2e path.
+    let mut website = Website::new("https://example.com");
+    let mut rx = website.subscribe(16);
+
+    // Manually send pages through the channel to simulate crawl output.
+    if let Some(ref channel) = website.channel {
+        for i in 0..10 {
+            let mut page = Page::default();
+            page.url = format!("https://example.com/page/{i}");
+            let html =
+                format!("<html><body><a href=\"/link/{i}\">link</a> content {i}</body></html>");
+            page.html = Some(bytes::Bytes::from(html));
+
+            // Spool even-numbered pages to disk before sending.
+            if i % 2 == 0 {
+                page.spool_html_to_disk();
+                assert!(page.is_html_on_disk());
+            }
+
+            let _ = channel.0.send(page);
+        }
+    }
+
+    // Receive and verify all pages from the subscription.
+    let mut received = 0;
+    while let Ok(page) = rx.try_recv() {
+        let url = page.get_url().to_string();
+        assert!(url.starts_with("https://example.com/page/"));
+
+        // get_html() should work regardless of memory or disk.
+        let html = page.get_html();
+        assert!(html.contains("content"), "html should have content: {url}");
+
+        // stream_html_bytes should produce the same content.
+        let mut streamed = Vec::new();
+        let total = page.stream_html_bytes(16, |chunk| {
+            streamed.extend_from_slice(chunk);
+            true
+        });
+        assert_eq!(
+            total,
+            html.len(),
+            "streamed bytes should match html length for {url}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&streamed),
+            html,
+            "streamed content should match get_html() for {url}"
+        );
+
+        // Verify is_html_on_disk marker is correct.
+        let idx: usize = url.rsplit('/').next().unwrap().parse().unwrap();
+        if idx.is_multiple_of(2) {
+            assert!(page.is_html_on_disk(), "even page should be on disk: {url}");
+        } else {
+            assert!(
+                !page.is_html_on_disk(),
+                "odd page should be in memory: {url}"
+            );
+        }
+
+        received += 1;
+    }
+    assert_eq!(received, 10, "should receive all 10 pages");
+
+    website.unsubscribe();
+}
+
+/// Vitals computed at construction time must survive a disk spool so
+/// readers like `size()`, `is_empty()`, and `is_binary_spool_aware()`
+/// never need to touch the disk again.
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[test]
+fn test_spool_vitals_zero_disk_io() {
+    use crate::page::build;
+    use crate::utils::PageResponse;
+
+    let html = b"<html><body>balance vitals check</body></html>".to_vec();
+    let html_len = html.len();
+
+    let mut res = PageResponse::default();
+    res.content = Some(html);
+    res.status_code = reqwest::StatusCode::OK;
+    let mut page = build("https://example.com", res);
+
+    // Vitals are captured in build() before any spool happens.
+    assert_eq!(page.size(), html_len, "byte length cached at build time");
+    assert!(page.is_valid_utf8, "utf-8 flag captured");
+    assert!(!page.binary_file, "not binary");
+    assert!(!page.is_xml, "not xml");
+    assert!(!page.is_empty(), "has content");
+    assert!(!page.is_binary_spool_aware(), "not binary (in memory)");
+
+    // Spool and re-check — vitals and accessors remain correct without any
+    // disk I/O.
+    assert!(page.spool_html_to_disk());
+    assert!(page.is_html_on_disk(), "on disk after spool");
+    assert!(page.html.is_none(), "html buffer cleared");
+
+    // Delete the spool file out from under us to prove these paths do NOT
+    // touch the disk.  The file has already been opened by the guard so
+    // removal on macOS/Linux tolerates a subsequent read by the FD, but
+    // our fast vitals paths should not open it at all.
+    if let Some(spool_path) = page.get_html_spool_path().map(|p| p.to_path_buf()) {
+        let _ = std::fs::remove_file(&spool_path);
+        assert_eq!(page.size(), html_len, "size from cached byte len");
+        assert!(page.is_valid_utf8, "utf-8 flag survives spool");
+        assert!(!page.is_empty(), "spooled page not empty");
+        assert!(!page.is_binary_spool_aware(), "binary flag survives spool");
+    }
+}
+
+/// Link extraction from a spooled page must stay streaming — the spool
+/// must remain on disk and `self.html` must not be repopulated.
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_spool_links_extraction_does_not_reload() {
+    let mut html = String::from("<html><body>");
+    for i in 0..200 {
+        html.push_str(&format!(r#"<a href="/page/{i}">l{i}</a>"#));
+    }
+    html.push_str("</body></html>");
+
+    let mut page = Page::default();
+    page.url = "https://example.com".to_string();
+    page.html = Some(bytes::Bytes::from(html));
+    assert!(page.spool_html_to_disk_async().await);
+    assert!(page.is_html_on_disk());
+
+    let selectors = crate::page::get_page_selectors("https://example.com", false, false);
+
+    let links = page.links(&selectors, &None).await;
+    assert!(!links.is_empty(), "should extract links from disk");
+
+    assert!(
+        page.html.is_none(),
+        "self.html must stay empty after disk-streaming link extraction"
+    );
+    assert!(
+        page.is_html_on_disk(),
+        "spool file must remain on disk after link extraction"
+    );
+}
+
+/// `compute_spool_signature` reads a disk-spooled HTML file, normalises
+/// it with the same lol_html handlers as `normalize_html`, and returns
+/// a `u64` that **must equal** `hash_html(raw_bytes)` for the same raw
+/// payload — otherwise signature-based dedup silently diverges between
+/// the in-memory and the disk-spooled path.  This test pins that
+/// invariant.
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_compute_spool_signature_matches_hash_html() {
+    use crate::utils::{
+        compute_spool_signature, hash_html,
+        html_spool::{
+            next_spool_path, spool_delete, spool_write_async, SPOOL_SIGNATURE_BUFFER_CAP,
+        },
+    };
+
+    // A realistic mix: doctype, script (stripped), href (cleared),
+    // class/id/data-* (preserved), plain text.  Any divergence between
+    // the two normalisation paths on this sample would fail the
+    // equivalence test.
+    let raw: &[u8] = br#"<!DOCTYPE html>
+<html>
+<head>
+    <title>sig test</title>
+    <script>window.leaks = 1;</script>
+    <style>body { color: red; }</style>
+</head>
+<body>
+    <a href="https://elsewhere.example/?q=1" class="kept" id="link" data-x="y">link</a>
+    <div class="wrapper">
+        <p>stable text</p>
+        <iframe src="https://ads.example"></iframe>
+    </div>
+    <noscript>no js</noscript>
+</body>
+</html>"#;
+
+    let expected = hash_html(raw).await;
+    assert_ne!(expected, 0, "sample must produce a non-zero reference hash");
+
+    let path = next_spool_path();
+    spool_write_async(&path, raw).await.unwrap();
+
+    let actual = compute_spool_signature(&path, SPOOL_SIGNATURE_BUFFER_CAP, Some(raw.len())).await;
+    assert_eq!(
+        actual,
+        Some(expected),
+        "disk-spool signature must equal hash_html byte-for-byte"
+    );
+
+    spool_delete(&path);
+}
+
+/// When the normalised output exceeds the cap, the helper returns
+/// `None` so the caller can fall back to the in-memory path and
+/// recompute the exact same signature there.  Verifies the abort path
+/// without needing a huge payload.
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_compute_spool_signature_aborts_on_cap() {
+    use crate::utils::{
+        compute_spool_signature,
+        html_spool::{next_spool_path, spool_delete, spool_write_async},
+    };
+
+    let mut raw = String::from("<html><body>");
+    // 8 KiB of preserved text content — easily over any small cap.
+    for _ in 0..1024 {
+        raw.push_str("<p class=\"x\">aaaaaaaa</p>");
+    }
+    raw.push_str("</body></html>");
+
+    let path = next_spool_path();
+    spool_write_async(&path, raw.as_bytes()).await.unwrap();
+
+    // Tiny cap: 1 KiB.  Normalised output is much larger, so the helper
+    // must return None rather than produce a partial-hash value.
+    let actual = compute_spool_signature(&path, 1024, Some(raw.len())).await;
+    assert!(
+        actual.is_none(),
+        "helper must abort when normalised output exceeds cap"
+    );
+
+    spool_delete(&path);
+}
+
+/// XML link extraction from a spooled feed must stay streaming — no
+/// full-file read, and the spool must still be on disk afterwards.
+/// Uses the Atom-style `<link>` tag format matched by
+/// `links_stream_xml_from_reader`.
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_spool_xml_links_extraction_streams_from_disk() {
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    xml.push_str(r#"<feed xmlns="http://www.w3.org/2005/Atom">"#);
+    for i in 0..50 {
+        xml.push_str(&format!(
+            r#"<entry><link>https://example.com/entry/{i}</link></entry>"#
+        ));
+    }
+    xml.push_str("</feed>");
+
+    let mut page = Page::default();
+    page.url = "https://example.com/feed.xml".to_string();
+    page.html = Some(bytes::Bytes::from(xml));
+    page.is_xml = true;
+    assert!(page.spool_html_to_disk_async().await);
+    assert!(page.is_html_on_disk());
+
+    let selectors = crate::page::get_page_selectors("https://example.com", false, false);
+
+    let mut map: hashbrown::HashSet<case_insensitive_string::CaseInsensitiveString> =
+        hashbrown::HashSet::new();
+    if let Some(p) = page.get_html_spool_path().map(|p| p.to_path_buf()) {
+        page.links_stream_xml_from_disk(&selectors, p, &mut map, &None)
+            .await;
+    }
+    assert!(!map.is_empty(), "xml streaming should yield <link> entries");
+    assert!(
+        page.html.is_none(),
+        "html buffer must stay empty after xml disk stream"
+    );
+    assert!(
+        page.is_html_on_disk(),
+        "spool file must remain after xml stream"
+    );
+}
+
+/// `Page::build` must consume a pre-spooled `SpooledContent` handle
+/// cleanly: the resulting page has `html=None`, `html_spool_path=Some`,
+/// all cached vitals mirrored, and `balance_bytes_tracked=false` so the
+/// Drop impl does not double-subtract bytes that never entered the
+/// in-memory counter.
+#[cfg(all(test, feature = "balance", not(feature = "decentralized")))]
+#[tokio::test]
+async fn test_page_build_consumes_content_spool() {
+    use crate::page::build;
+    use crate::utils::html_spool::{spool_write_streaming_vitals, SpooledContent};
+    use crate::utils::PageResponse;
+
+    // Stage a real spool file via the streaming writer so SpooledContent
+    // mirrors the same vitals the writer would hand us in production.
+    let payload = b"<!DOCTYPE html><html><body>build from spool</body></html>";
+    let path = crate::utils::html_spool::next_spool_path();
+    let vitals = spool_write_streaming_vitals(&path, payload).await.unwrap();
+
+    let spool = SpooledContent {
+        path: path.clone(),
+        vitals,
+        head: bytes::Bytes::copy_from_slice(&payload[..payload.len().min(32)]),
+        tail: bytes::Bytes::copy_from_slice(&payload[payload.len().saturating_sub(32)..]),
+        signature: None,
+    };
+
+    let mut res = PageResponse::default();
+    res.status_code = reqwest::StatusCode::OK;
+    res.content_spool = Some(spool);
+
+    let page = build("https://example.com", res);
+
+    assert!(page.html.is_none(), "build must not materialise html");
+    assert!(page.is_html_on_disk(), "page must report on-disk");
+    assert_eq!(page.size(), payload.len(), "vitals byte_len mirrors");
+    assert!(page.is_valid_utf8, "vitals utf-8 mirrors");
+    assert!(!page.binary_file, "vitals binary mirrors");
+    assert!(!page.is_xml, "vitals xml mirrors");
+    assert!(!page.is_empty(), "spooled content is not empty");
+    assert!(
+        !page.balance_bytes_tracked,
+        "pre-spooled page never entered the in-memory byte counter"
+    );
+
+    // Spool path is reachable and points at the file the writer created.
+    let reported = page
+        .get_html_spool_path()
+        .expect("spool path must be populated")
+        .to_path_buf();
+    assert_eq!(reported, path);
+}
+
+/// Verify that ChannelGuard::lock() completes correctly when called
+/// multiple times — counters are monotonic and never reset.
+#[cfg(all(test, feature = "sync"))]
+#[tokio::test]
+async fn test_channel_guard_repeated_lock() {
+    let guard = ChannelGuard::new();
+
+    // Simulate first batch: send 3 pages.
+    for _ in 0..3 {
+        ChannelGuard::inc_guard(&guard.0);
+    }
+    // Consume 3 pages.
+    let mut g = guard.clone();
+    for _ in 0..3 {
+        g.inc();
+    }
+    // First lock should resolve immediately.
+    tokio::time::timeout(std::time::Duration::from_millis(100), guard.lock())
+        .await
+        .expect("first lock should not timeout");
+
+    // Simulate second batch: send 2 more pages (counters keep growing).
+    for _ in 0..2 {
+        ChannelGuard::inc_guard(&guard.0);
+    }
+    assert_eq!(
+        guard.0.sent.load(Ordering::Relaxed),
+        5,
+        "sent = 5 cumulative"
+    );
+
+    // Consume 2 more pages.
+    for _ in 0..2 {
+        g.inc();
+    }
+    assert_eq!(
+        guard.0.consumed.load(Ordering::Relaxed),
+        5,
+        "consumed = 5 cumulative"
+    );
+
+    // Second lock must also resolve — this was a livelock before the fix.
+    tokio::time::timeout(std::time::Duration::from_millis(100), guard.lock())
+        .await
+        .expect("second lock should not timeout (livelock regression)");
+}
+
+/// Verify lock() returns immediately when no pages were sent.
+#[cfg(all(test, feature = "sync"))]
+#[tokio::test]
+async fn test_channel_guard_lock_empty() {
+    let guard = ChannelGuard::new();
+    tokio::time::timeout(std::time::Duration::from_millis(50), guard.lock())
+        .await
+        .expect("lock on empty guard should return immediately");
+}
+
+/// Verify lock() waits for consumers then resolves.
+#[cfg(all(test, feature = "sync"))]
+#[tokio::test]
+async fn test_channel_guard_lock_waits_for_consumers() {
+    let guard = ChannelGuard::new();
+    let mut g = guard.clone();
+
+    // Send 2 pages.
+    ChannelGuard::inc_guard(&guard.0);
+    ChannelGuard::inc_guard(&guard.0);
+
+    // lock() should NOT resolve yet (0 consumed, 2 sent).
+    let result = tokio::time::timeout(std::time::Duration::from_millis(50), guard.lock()).await;
+    assert!(
+        result.is_err(),
+        "lock should timeout while consumers are behind"
+    );
+
+    // Consume both.
+    g.inc();
+    g.inc();
+
+    // Now lock() should resolve.
+    tokio::time::timeout(std::time::Duration::from_millis(100), guard.lock())
+        .await
+        .expect("lock should resolve after all pages consumed");
+}
+
+/// Regression test for the crawl-loop manual-shutdown path.
+///
+/// Every fetch spawned during a crawl owns its `OwnedSemaphorePermit` for its
+/// lifetime (see the `semaphore.clone().acquire_owned()` + `spawn_set(...)`
+/// sites in the crawl loops). Aborting those tasks via `JoinSet::shutdown()`
+/// drops their futures, which drops the permits and returns them to the
+/// semaphore automatically.
+///
+/// The manual-shutdown branches previously also called
+/// `semaphore.add_permits(set.len())` afterwards, returning the same permits a
+/// *second* time. Under load `get_semaphore` hands out the process-global
+/// `SEM_SHARED`, so every mid-flight stop/pause permanently inflated that shared
+/// pool and let real in-flight concurrency drift above the configured cap.
+///
+/// This pins the invariant the fix relies on: `shutdown()` alone conserves
+/// permits, so a manual `add_permits` after it is incorrect.
+#[tokio::test]
+async fn shutdown_conserves_semaphore_permits() {
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
+    const PERMITS: usize = 10;
+    let semaphore = std::sync::Arc::new(Semaphore::new(PERMITS));
+    let mut set: JoinSet<()> = JoinSet::new();
+
+    // Mirror the crawl loop: each in-flight task owns a permit until it ends.
+    let in_flight = 4;
+    for _ in 0..in_flight {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        set.spawn(async move {
+            // A long-running "fetch" so the permit is still held at shutdown.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            drop(permit);
+        });
+    }
+    assert_eq!(semaphore.available_permits(), PERMITS - in_flight);
+
+    // The manual-shutdown branch: abort + join all in-flight tasks.
+    set.shutdown().await;
+    tokio::task::yield_now().await; // let the aborted tasks' Drop glue settle
+
+    // Permits are fully restored by Drop alone. A manual `add_permits` here
+    // would over-release and inflate the pool (the bug this test guards).
+    assert_eq!(
+        semaphore.available_permits(),
+        PERMITS,
+        "JoinSet::shutdown() must restore all owned permits without add_permits"
+    );
+}
+
+#[test]
+fn depth_limit_ignores_trailing_slash() {
+    let mut website: Website = Website::new("https://example.com");
+    website.configuration.depth = 2;
+    website.configuration.depth_distance = 2;
+
+    // A trailing slash must not add a phantom depth level: "/a/b/" is the same
+    // logical depth as "/a/b" and both are within the depth-2 budget.
+    for url in ["https://example.com/a/b", "https://example.com/a/b/"] {
+        assert!(
+            !website.is_over_depth(&url.into()),
+            "{url} is within depth 2 and must be crawled"
+        );
+    }
+
+    // The fix must not over-permit: genuinely deeper paths are still dropped,
+    // with or without a trailing slash.
+    for url in ["https://example.com/a/b/c", "https://example.com/a/b/c/"] {
+        assert!(
+            website.is_over_depth(&url.into()),
+            "{url} exceeds depth 2 and must be dropped"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "control"))]
+mod control_handler_lifetime_tests {
+    use super::*;
+    use std::future::Future;
+
+    async fn assert_handler_released(state: &Arc<AtomicI8>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(state) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("control handler must release its state after cancellation");
+    }
+
+    #[tokio::test]
+    async fn control_handler_guard_preserves_commands_and_opt_out() {
+        let mut website = Website::new("https://control-commands.invalid");
+        let (state, task) = website.configure_handler().expect("control enabled");
+        let guard = ControlHandlerGuard::new(&task);
+        // Let the handler subscribe before publishing the first command.
+        tokio::task::yield_now().await;
+        for (command, expected) in [
+            (crate::utils::Handler::Pause, 1),
+            (crate::utils::Handler::Resume, 0),
+            (crate::utils::Handler::Shutdown, 2),
+        ] {
+            crate::utils::CONTROLLER
+                .0
+                .send((website.target_id().into(), command))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while state.load(Ordering::Relaxed) != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("control command must still be applied");
+        }
+        drop(guard);
+        assert!(task
+            .await
+            .expect_err("task must be cancelled")
+            .is_cancelled());
+        assert_handler_released(&state).await;
+        website.configuration.no_control_thread = true;
+        assert!(website.configure_handler().is_none());
+    }
+
+    #[tokio::test]
+    async fn control_handler_guard_cancels_on_future_drop() {
+        let website = Website::new("https://control-cancellation.invalid");
+        let (state, task) = website.configure_handler().expect("control enabled");
+        let guard = ControlHandlerGuard::new(&task);
+        let mut operation = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(operation.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(operation);
+        assert!(task
+            .await
+            .expect_err("task must be cancelled")
+            .is_cancelled());
+        assert_handler_released(&state).await;
+    }
+
+    #[tokio::test]
+    async fn control_handler_guard_cancels_on_completion() {
+        let website = Website::new("https://control-completion.invalid");
+        let (state, task) = website.configure_handler().expect("control enabled");
+        async {
+            let _guard = ControlHandlerGuard::new(&task);
+            tokio::task::yield_now().await;
+        }
+        .await;
+        assert!(task
+            .await
+            .expect_err("task must be cancelled")
+            .is_cancelled());
+        assert_handler_released(&state).await;
+    }
+
+    #[tokio::test]
+    async fn control_handler_guard_disarm_preserves_public_ownership() {
+        let website = Website::new("https://control-transfer.invalid");
+        let (state, task) = website.configure_handler().expect("control enabled");
+        ControlHandlerGuard::new(&task).disarm();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("task must be cancelled")
+            .is_cancelled());
+        assert_handler_released(&state).await;
+    }
 }

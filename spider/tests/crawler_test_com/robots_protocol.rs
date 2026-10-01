@@ -137,7 +137,7 @@ async fn x_robots_tag_noindex() {
             .get("x-robots-tag")
             .map(|v| v.to_str().unwrap_or("").to_lowercase());
         assert!(
-            x_robots.map_or(false, |v| v.contains("noindex")),
+            x_robots.is_some_and(|v| v.contains("noindex")),
             "should have X-Robots-Tag: noindex header"
         );
     }
@@ -358,7 +358,7 @@ async fn robots_crawl_with_respect_robots() {
         .with_request_timeout(Some(std::time::Duration::from_secs(30)))
         .with_crawl_timeout(Some(std::time::Duration::from_secs(60)));
 
-    let mut rx = website.subscribe(16).expect("subscribe");
+    let mut rx = website.subscribe(16);
     let (done_tx, done_rx) = spider::tokio::sync::oneshot::channel();
 
     let collector = spider::tokio::spawn(async move {

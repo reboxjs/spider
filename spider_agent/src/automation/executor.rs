@@ -12,6 +12,39 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+// JoinHandle detaches on drop. Keep ownership until completion and abort any
+// remaining tasks when the caller cancels a chain or batch.
+pub(super) struct TaskBatch<T> {
+    pub(super) tasks: Vec<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> TaskBatch<T> {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tasks: Vec::with_capacity(capacity),
+        }
+    }
+}
+
+impl<T> Drop for TaskBatch<T> {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(feature = "chrome")]
+// Stack-owned cancellation guard for a single task; no collection allocation.
+pub(super) struct AbortOnDrop(pub(super) tokio::task::AbortHandle);
+
+#[cfg(feature = "chrome")]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// High-performance executor for automation chains.
 ///
 /// Features:
@@ -52,8 +85,9 @@ impl ChainExecutor {
         }
     }
 
-    /// Create with custom concurrency limit.
+    /// Create with custom concurrency limit, clamped to the supported nonzero range.
     pub fn with_concurrency(max_concurrency: usize) -> Self {
+        let max_concurrency = max_concurrency.clamp(1, Semaphore::MAX_PERMITS);
         Self {
             max_concurrency,
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
@@ -207,7 +241,7 @@ impl ChainExecutor {
         F: Fn(ChainStep, ChainContext) -> Fut + Clone + Send + Sync + 'static,
         Fut: std::future::Future<Output = ChainStepResult> + Send,
     {
-        let mut handles = Vec::with_capacity(steps.len());
+        let mut handles = TaskBatch::with_capacity(steps.len());
 
         for (i, step) in steps.into_iter().enumerate() {
             let ctx = ChainContext {
@@ -221,7 +255,7 @@ impl ChainExecutor {
                 .unwrap_or(self.step_timeout);
             let step_fn = step_fn.clone();
 
-            handles.push(tokio::spawn(async move {
+            handles.tasks.push(tokio::spawn(async move {
                 let _permit = match semaphore.acquire().await {
                     Ok(p) => Some(p),
                     Err(_) => {
@@ -245,8 +279,8 @@ impl ChainExecutor {
             }));
         }
 
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
+        let mut results = Vec::with_capacity(handles.tasks.len());
+        for handle in &mut handles.tasks {
             if let Ok(result) = handle.await {
                 results.push(result);
             }
@@ -263,7 +297,7 @@ impl ChainExecutor {
         steps: &[ChainStep],
         _context: &ChainContext,
     ) -> Vec<Vec<ChainStep>> {
-        let mut groups: Vec<Vec<ChainStep>> = Vec::new();
+        let mut groups: Vec<Vec<ChainStep>> = Vec::with_capacity(steps.len());
         let mut current_group: Vec<ChainStep> = Vec::new();
 
         for step in steps {
@@ -453,8 +487,10 @@ impl BatchExecutor {
         }
     }
 
-    /// Create with custom settings.
+    /// Create with nonzero batch size and concurrency clamped to the supported range.
     pub fn with_settings(max_batch_size: usize, max_concurrent: usize) -> Self {
+        let max_batch_size = max_batch_size.max(1);
+        let max_concurrent = max_concurrent.clamp(1, Semaphore::MAX_PERMITS);
         Self {
             max_batch_size,
             max_concurrent,
@@ -474,18 +510,18 @@ impl BatchExecutor {
         let chunks: Vec<Vec<T>> = items
             .into_iter()
             .collect::<Vec<_>>()
-            .chunks(self.max_batch_size)
+            .chunks(self.max_batch_size.max(1))
             .map(|c| c.to_vec())
             .collect();
 
         for chunk in chunks {
-            let mut handles = Vec::with_capacity(chunk.len());
+            let mut handles = TaskBatch::with_capacity(chunk.len());
 
             for item in chunk {
                 let semaphore = self.semaphore.clone();
                 let processor = processor.clone();
 
-                handles.push(tokio::spawn(async move {
+                handles.tasks.push(tokio::spawn(async move {
                     let _permit = match semaphore.acquire().await {
                         Ok(p) => Some(p),
                         Err(_) => {
@@ -497,7 +533,7 @@ impl BatchExecutor {
                 }));
             }
 
-            for handle in handles {
+            for handle in &mut handles.tasks {
                 if let Ok(result) = handle.await {
                     results.push(result);
                 }
@@ -525,18 +561,18 @@ impl BatchExecutor {
         let chunks: Vec<Vec<(usize, T)>> = indexed
             .into_iter()
             .collect::<Vec<_>>()
-            .chunks(self.max_batch_size)
+            .chunks(self.max_batch_size.max(1))
             .map(|c| c.to_vec())
             .collect();
 
         for chunk in chunks {
-            let mut handles = Vec::with_capacity(chunk.len());
+            let mut handles = TaskBatch::with_capacity(chunk.len());
 
             for (idx, item) in chunk {
                 let semaphore = self.semaphore.clone();
                 let processor = processor.clone();
 
-                handles.push(tokio::spawn(async move {
+                handles.tasks.push(tokio::spawn(async move {
                     let _permit = match semaphore.acquire().await {
                         Ok(p) => Some(p),
                         Err(_) => {
@@ -548,7 +584,7 @@ impl BatchExecutor {
                 }));
             }
 
-            for handle in handles {
+            for handle in &mut handles.tasks {
                 if let Ok(result) = handle.await {
                     results.push(result);
                 }
@@ -582,6 +618,14 @@ struct PrefetchedContent {
     fetched_at: Instant,
 }
 
+impl Drop for PrefetchManager {
+    fn drop(&mut self) {
+        for task in self.in_progress.iter() {
+            task.value().abort();
+        }
+    }
+}
+
 impl Default for PrefetchManager {
     fn default() -> Self {
         Self::new()
@@ -606,6 +650,10 @@ impl PrefetchManager {
         F: FnOnce(String) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Option<String>> + Send,
     {
+        // Reap completed tasks, including failures, so handles and their results
+        // do not accumulate and a failed URL can be retried.
+        self.in_progress.retain(|_, task| !task.is_finished());
+
         // Fast path: return if a fresh prefetched entry is already available.
         if let Some(content) = self.cache.get(&url) {
             if content.fetched_at.elapsed() < Duration::from_secs(60) {
@@ -678,7 +726,12 @@ impl PrefetchManager {
         // Check cache first
         if let Some(content) = self.cache.get(url) {
             if content.fetched_at.elapsed() < Duration::from_secs(60) {
-                return Some(content.html.clone());
+                let html = content.html.clone();
+                drop(content);
+                if let Some((_, task)) = self.in_progress.remove(url) {
+                    task.abort();
+                }
+                return Some(html);
             }
             drop(content);
             self.cache.remove(url);
@@ -688,8 +741,11 @@ impl PrefetchManager {
         let handle = self.in_progress.remove(url).map(|(_, handle)| handle);
 
         if let Some(handle) = handle {
-            // Wait for prefetch to complete
-            if let Ok(result) = handle.await {
+            // Abort the fetch if this waiter is cancelled after taking ownership.
+            let mut pending = TaskBatch {
+                tasks: vec![handle],
+            };
+            if let Ok(result) = (&mut pending.tasks[0]).await {
                 return result;
             }
         }
@@ -734,6 +790,116 @@ impl PrefetchManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_prefetch_is_reaped_and_can_retry() {
+        let manager = PrefetchManager::new();
+        manager.prefetch("page".into(), |_| async { None }).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let finished = manager
+                    .in_progress
+                    .get("page")
+                    .map(|h| h.is_finished())
+                    .unwrap_or(false);
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        manager
+            .prefetch("page".into(), |_| async { Some("fresh".into()) })
+            .await;
+        assert_eq!(manager.get("page").await.as_deref(), Some("fresh"));
+        assert!(manager.in_progress.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_zero_settings_are_usable_and_preserve_order() {
+        let mut batch = BatchExecutor::with_settings(0, 0);
+        batch.max_batch_size = 0;
+        assert_eq!(
+            batch.process(vec![1, 2, 3], |n| async move { n * 2 }).await,
+            vec![2, 4, 6]
+        );
+        assert_eq!(
+            batch
+                .process_indexed(vec![1, 2], |i, n| async move { i + n })
+                .await,
+            vec![(0, 1), (1, 3)]
+        );
+        assert_eq!(ChainExecutor::with_concurrency(0).max_concurrency(), 1);
+        assert_eq!(
+            ChainExecutor::with_concurrency(usize::MAX).max_concurrency(),
+            Semaphore::MAX_PERMITS
+        );
+        assert_eq!(
+            BatchExecutor::with_settings(1, usize::MAX).max_concurrent,
+            Semaphore::MAX_PERMITS
+        );
+    }
+
+    #[cfg(feature = "chrome")]
+    #[tokio::test]
+    async fn listener_guard_releases_detached_task_state() {
+        for _ in 0..32 {
+            let state = Arc::new(vec![0u8; 1024]);
+            let weak = Arc::downgrade(&state);
+            let task = tokio::spawn(async move {
+                let _state = state;
+                std::future::pending::<()>().await;
+            });
+            let guard = AbortOnDrop(task.abort_handle());
+            drop(task);
+            drop(guard);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener task retained state after guard drop");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_batch_drops_in_flight_workers() {
+        struct OnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let worker_started = started.clone();
+        let worker_dropped = dropped.clone();
+        let parent = tokio::spawn(async move {
+            BatchExecutor::new()
+                .process(vec![1], move |_| {
+                    let started = worker_started.clone();
+                    let guard = OnDrop(worker_dropped.clone());
+                    async move {
+                        let _guard = guard;
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                })
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("worker must be dropped after caller cancellation");
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -884,10 +1050,7 @@ mod tests {
         let sem = Arc::new(Semaphore::new(1));
         sem.close();
 
-        let permit = match sem.acquire().await {
-            Ok(p) => Some(p),
-            Err(_) => None,
-        };
+        let permit = sem.acquire().await.ok();
         assert!(
             permit.is_none(),
             "closed semaphore must yield None, not panic"
@@ -898,10 +1061,7 @@ mod tests {
     #[tokio::test]
     async fn test_semaphore_open_returns_valid_permit() {
         let sem = Arc::new(Semaphore::new(1));
-        let permit = match sem.acquire().await {
-            Ok(p) => Some(p),
-            Err(_) => None,
-        };
+        let permit = sem.acquire().await.ok();
         assert!(permit.is_some(), "open semaphore must yield a permit");
     }
 
@@ -941,10 +1101,7 @@ mod tests {
         for i in 0..10usize {
             let sem = sem.clone();
             set.spawn(async move {
-                let _permit = match sem.acquire().await {
-                    Ok(p) => Some(p),
-                    Err(_) => None,
-                };
+                let _permit = sem.acquire().await.ok();
                 i * 2 // actual work
             });
         }

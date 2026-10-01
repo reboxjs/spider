@@ -249,6 +249,32 @@ lazy_static! {
             b"Just a moment...".as_slice(),
         ])
         .expect("valid CF just-a-moment patterns");
+
+    /// Embedded Turnstile widget matcher.
+    ///
+    /// Distinct from the wall-page detector above: these patterns
+    /// recognise pages that aren't a full "Just a moment..." wall but
+    /// still host a real Turnstile widget (CF-protected pages that
+    /// render an embedded challenge, or managed-challenge variants).
+    ///
+    /// Patterns are intentionally narrow to avoid false positives on
+    /// documentation pages that quote the markup:
+    ///
+    /// * `challenges.cloudflare.com/turnstile` — the official api.js
+    ///   endpoint. Only loaded by sites that actually use Turnstile.
+    /// * `<div class="cf-turnstile"` / `<div class='cf-turnstile` —
+    ///   the canonical widget markup with HTML tag context, so a
+    ///   string literal `"cf-turnstile"` inside a script body or a
+    ///   JSON blob cannot trigger a match.
+    static ref CF_EMBEDDED_TURNSTILE_AC: aho_corasick::AhoCorasick = aho_corasick::AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+        .build([
+            b"challenges.cloudflare.com/turnstile".as_slice(),
+            b"<div class=\"cf-turnstile".as_slice(),
+            b"<div class='cf-turnstile".as_slice(),
+        ])
+        .expect("valid CF embedded turnstile patterns");
 }
 
 #[inline(always)]
@@ -335,21 +361,30 @@ pub(crate) fn detect_cf_turnstyle(b: &[u8]) -> bool {
 
     let pfx = cf_prefix_slice(b);
 
-    pfx.starts_with(CF_JUST_A_MOMENT.as_ref()) || CF_JUST_A_MOMENT_AC.is_match(pfx)
+    if pfx.starts_with(CF_JUST_A_MOMENT.as_ref()) || CF_JUST_A_MOMENT_AC.is_match(pfx) {
+        return true;
+    }
+
+    // Embedded Turnstile widget on an otherwise-non-wall page. Scans the
+    // whole body (not just the prefix) because the widget markup can
+    // appear anywhere. Patterns are scoped to actual HTML tag context
+    // and the official api.js endpoint so quoted code samples in docs
+    // pages don't false-positive.
+    detect_cf_embedded_turnstile(b)
+}
+
+/// Detect an embedded Cloudflare Turnstile widget anywhere in the body.
+///
+/// Distinct entry point so callers that only want the embedded-widget
+/// signal (without the wall-page fingerprints) can use it directly. Pure
+/// byte-level Aho-Corasick scan — no allocations, no mutexes, no panics.
+#[cfg(feature = "chrome")]
+#[inline]
+pub(crate) fn detect_cf_embedded_turnstile(b: &[u8]) -> bool {
+    !b.is_empty() && CF_EMBEDDED_TURNSTILE_AC.is_match(b)
 }
 
 lazy_static! {
-    /// Apache server forbidden.
-    pub static ref APACHE_FORBIDDEN: &'static [u8; 317] = br#"<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
-<html><head>
-<title>403 Forbidden</title>
-</head><body>
-<h1>Forbidden</h1>
-<p>You don't have permission to access this resource.</p>
-<p>Additionally, a 403 Forbidden
-error was encountered while trying to use an ErrorDocument to handle the request.</p>
-</body></html>"#;
-
     /// Open Resty forbidden.
     pub static ref OPEN_RESTY_FORBIDDEN: &'static [u8; 125] = br#"<html><head><title>403 Forbidden</title></head>
 <body>
@@ -376,18 +411,6 @@ pub fn detect_imperva_verification_iframe(html: &[u8]) -> bool {
 #[inline(always)]
 pub fn looks_like_imperva_verify(content_len: usize, html: &[u8]) -> bool {
     imperva_challenge_sized(content_len) && detect_imperva_verification_iframe(html)
-}
-
-/// Detect if openresty hard 403 is forbidden and should not retry.
-#[inline(always)]
-pub fn detect_open_resty_forbidden(b: &[u8]) -> bool {
-    b.starts_with(*OPEN_RESTY_FORBIDDEN)
-}
-
-/// Detect if a page is forbidden and should not retry.
-#[inline(always)]
-pub fn detect_hard_forbidden_content(b: &[u8]) -> bool {
-    b == *APACHE_FORBIDDEN || detect_open_resty_forbidden(b)
 }
 
 /// Needs bot verification.
@@ -456,8 +479,8 @@ pub async fn cf_handle(
                 for el in els {
                     let f = async {
                         match el.clickable_point().await {
-                            Ok(pt) => page.click(pt).await.is_ok() || el.click().await.is_ok(),
-                            Err(_) => el.click().await.is_ok(),
+                            Ok(pt) => page.click_smooth(pt).await.is_ok() || el.click_smooth().await.is_ok(),
+                            Err(_) => el.click_smooth().await.is_ok(),
                         }
                     };
 
@@ -650,8 +673,11 @@ fire(at(tx,ty)||el0,'mouseup',tx,ty);return true;}})()"#,
                     if let Some(cb_el) = boxes.into_iter().next() {
                         // Click the checkbox – prefer the clickable point.
                         let clicked = match cb_el.clickable_point().await {
-                            Ok(p) => page.click(p).await.is_ok() || cb_el.click().await.is_ok(),
-                            Err(_) => cb_el.click().await.is_ok(),
+                            Ok(p) => {
+                                page.click_smooth(p).await.is_ok()
+                                    || cb_el.click_smooth().await.is_ok()
+                            }
+                            Err(_) => cb_el.click_smooth().await.is_ok(),
                         };
 
                         if clicked {
@@ -810,11 +836,11 @@ fire(at(tx,ty)||el0,'mouseup',tx,ty);return true;}})()"#,
                                     let _ = tokio::join!(
                                         perform_smart_mouse_movement(page, viewport),
                                         async {
-                                            let _ = page.move_mouse(from).await;
+                                            let _ = page.move_mouse_smooth(from).await;
                                         }
                                     );
 
-                                    if page.click_and_drag(from, to).await.is_ok() {
+                                    if page.click_and_drag_smooth(from, to).await.is_ok() {
                                         did_drag = true;
                                     }
                                 }
@@ -1095,15 +1121,24 @@ async fn solve_with_external_gemini(
     timeout_ms: u64,
 ) -> Result<Vec<u8>, RequestError> {
     if let Ok(api_key) = std::env::var("GEMINI_API_KEY") {
-        if let Ok(_sem) = crate::utils::GEMINI_SEM
-            .acquire_many(challenge.tiles.len().try_into().unwrap_or(1))
-            .await
-        {
+        // Clamp to the semaphore's total permits: `acquire_many(n)` with `n`
+        // greater than the total never resolves (permits are never added), which
+        // would hang the solve forever on a tile grid larger than the permit
+        // count. For tile counts <= the permit count `min` is a no-op, so this is
+        // byte-identical to the previous `acquire_many(tiles.len())`.
+        let want = challenge
+            .tiles
+            .len()
+            .min(*crate::utils::GEMINI_SEM_PERMITS)
+            .max(1)
+            .try_into()
+            .unwrap_or(1);
+        if let Ok(_sem) = crate::utils::GEMINI_SEM.acquire_many(want).await {
             let endpoint = format!("{}?key={}", *GEMINI_VISION_ENDPOINT, api_key);
 
             let target = challenge.target.unwrap_or("target object").to_string();
 
-            let mut yes_ids = Vec::new();
+            let mut yes_ids = Vec::with_capacity(challenge.tiles.len().min(64));
 
             for tile in &challenge.tiles {
                 // -------------------------------------------------------------
@@ -1282,8 +1317,11 @@ pub async fn recaptcha_handle(
                     if let Ok(els) = page.find_elements_pierced(r#"#recaptcha-anchor"#).await {
                         if let Some(el) = els.into_iter().next() {
                             return match el.clickable_point().await {
-                                Ok(p) => page.click(p).await.is_ok() || el.click().await.is_ok(),
-                                Err(_) => el.click().await.is_ok(),
+                                Ok(p) => {
+                                    page.click_smooth(p).await.is_ok()
+                                        || el.click_smooth().await.is_ok()
+                                }
+                                Err(_) => el.click_smooth().await.is_ok(),
                             };
                         }
                     }
@@ -1293,8 +1331,11 @@ pub async fn recaptcha_handle(
                     {
                         if let Some(el) = els.into_iter().next() {
                             return match el.clickable_point().await {
-                                Ok(p) => page.click(p).await.is_ok() || el.click().await.is_ok(),
-                                Err(_) => el.click().await.is_ok(),
+                                Ok(p) => {
+                                    page.click_smooth(p).await.is_ok()
+                                        || el.click_smooth().await.is_ok()
+                                }
+                                Err(_) => el.click_smooth().await.is_ok(),
                             };
                         }
                     }
@@ -1362,7 +1403,7 @@ pub async fn recaptcha_handle(
                         let selector = format!(r#"img[src="{}"]"#, tile.img_src);
                         if let Ok(els) = page.find_elements_pierced(&selector).await {
                             if let Some(el) = els.into_iter().next() {
-                                let _ = el.click().await; // ignore possible errors
+                                let _ = el.click_smooth().await; // ignore possible errors
                             }
                         }
                     }
@@ -1379,7 +1420,7 @@ pub async fn recaptcha_handle(
                         .await
                     {
                         if let Some(btn) = btns.into_iter().next() {
-                            let _ = btn.click().await;
+                            let _ = btn.click_smooth().await;
                         }
                     }
                 }
@@ -1448,8 +1489,10 @@ pub async fn recaptcha_handle(
             if let Ok(els) = page.find_elements_pierced(r#"#recaptcha-anchor"#).await {
                 if let Some(el) = els.into_iter().next() {
                     clicked = match el.clickable_point().await {
-                        Ok(p) => page.click(p).await.is_ok() || el.click().await.is_ok(),
-                        Err(_) => el.click().await.is_ok(),
+                        Ok(p) => {
+                            page.click_smooth(p).await.is_ok() || el.click_smooth().await.is_ok()
+                        }
+                        Err(_) => el.click_smooth().await.is_ok(),
                     };
                 }
             }
@@ -1460,8 +1503,11 @@ pub async fn recaptcha_handle(
                 {
                     if let Some(el) = els.into_iter().next() {
                         clicked = match el.clickable_point().await {
-                            Ok(p) => page.click(p).await.is_ok() || el.click().await.is_ok(),
-                            Err(_) => el.click().await.is_ok(),
+                            Ok(p) => {
+                                page.click_smooth(p).await.is_ok()
+                                    || el.click_smooth().await.is_ok()
+                            }
+                            Err(_) => el.click_smooth().await.is_ok(),
                         };
                     }
                 }
@@ -1734,8 +1780,8 @@ pub async fn lemin_handle(
             {
                 if let Some(cb) = checkboxes.into_iter().next() {
                     let clicked = match cb.clickable_point().await {
-                        Ok(p) => page.click(p).await.is_ok() || cb.click().await.is_ok(),
-                        Err(_) => cb.click().await.is_ok(),
+                        Ok(p) => page.click_smooth(p).await.is_ok() || cb.click_smooth().await.is_ok(),
+                        Err(_) => cb.click_smooth().await.is_ok(),
                     };
                     if clicked {
                         let mut wait_for = CF_WAIT_FOR.clone();
@@ -1865,7 +1911,7 @@ pub async fn lemin_handle(
                 x: page_target_x,
                 y: page_target_y,
             };
-            let _ = page.click_and_drag(from, to).await;
+            let _ = page.click_and_drag_smooth(from, to).await;
 
             // ---------------------------------------------------------
             // i) Click the **Verify** button (if present).
@@ -1875,7 +1921,7 @@ pub async fn lemin_handle(
                 .await
             {
                 if let Some(btn) = btns.into_iter().next() {
-                    let _ = btn.click().await;
+                    let _ = btn.click_smooth().await;
                 }
             }
 
@@ -2392,8 +2438,10 @@ pub async fn geetest_handle(
             if let Ok(els) = page.find_elements_pierced(r#".geetest_radar"#).await {
                 if let Some(el) = els.into_iter().next() {
                     clicked = match el.clickable_point().await {
-                        Ok(p) => page.click(p).await.is_ok() || el.click().await.is_ok(),
-                        Err(_) => el.click().await.is_ok(),
+                        Ok(p) => {
+                            page.click_smooth(p).await.is_ok() || el.click_smooth().await.is_ok()
+                        }
+                        Err(_) => el.click_smooth().await.is_ok(),
                     };
                 }
             }
@@ -2405,8 +2453,11 @@ pub async fn geetest_handle(
                 {
                     if let Some(el) = els.into_iter().next() {
                         clicked = match el.clickable_point().await {
-                            Ok(p) => page.click(p).await.is_ok() || el.click().await.is_ok(),
-                            Err(_) => el.click().await.is_ok(),
+                            Ok(p) => {
+                                page.click_smooth(p).await.is_ok()
+                                    || el.click_smooth().await.is_ok()
+                            }
+                            Err(_) => el.click_smooth().await.is_ok(),
                         };
                     }
                 }
@@ -2565,7 +2616,7 @@ pub async fn geetest_handle(
                     // -------------------------------------------------
                     // 7️⃣  Perform the drag.
                     // -------------------------------------------------
-                    let _ = page.click_and_drag(from, to).await;
+                    let _ = page.click_and_drag_smooth(from, to).await;
 
                     // -------------------------------------------------
                     // 8️⃣  Wait a little, then verify whether the widget vanished.
@@ -2614,5 +2665,74 @@ pub async fn geetest_handle(
     match page_result {
         Ok(_) => Ok(progressed),
         Err(_) => Err(CdpError::Timeout),
+    }
+}
+
+#[cfg(all(test, feature = "chrome"))]
+mod cf_turnstile_detection_tests {
+    use super::{detect_cf_embedded_turnstile, detect_cf_turnstyle};
+
+    #[test]
+    fn empty_body_no_match() {
+        assert!(!detect_cf_turnstyle(&[]));
+        assert!(!detect_cf_embedded_turnstile(&[]));
+    }
+
+    #[test]
+    fn just_a_moment_wall_still_detected() {
+        // Regression guard: the prefix-only AC for the wall-page
+        // fingerprint must keep matching exactly as before, even
+        // though the wall page contains no embedded-widget markup.
+        let body = br#"<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head><body>cf wall</body></html>"#;
+        assert!(detect_cf_turnstyle(body));
+    }
+
+    #[test]
+    fn embedded_widget_div_double_quoted() {
+        let body = br#"<html><body><form><div class="cf-turnstile" data-sitekey="abc"></div></form></body></html>"#;
+        assert!(detect_cf_embedded_turnstile(body));
+        assert!(detect_cf_turnstyle(body));
+    }
+
+    #[test]
+    fn embedded_widget_div_single_quoted() {
+        let body =
+            br#"<html><body><div class='cf-turnstile' data-sitekey='abc'></div></body></html>"#;
+        assert!(detect_cf_embedded_turnstile(body));
+        assert!(detect_cf_turnstyle(body));
+    }
+
+    #[test]
+    fn embedded_widget_api_js_endpoint() {
+        let body = br#"<html><head><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body></body></html>"#;
+        assert!(detect_cf_embedded_turnstile(body));
+        assert!(detect_cf_turnstyle(body));
+    }
+
+    #[test]
+    fn quoted_class_in_script_does_not_match() {
+        // Critical false-positive guard: a script body or JSON blob
+        // that mentions the string "cf-turnstile" without an actual
+        // HTML tag wrapper must NOT trigger detection. The patterns
+        // require the `<div class=` tag prefix specifically.
+        let body = br#"<html><body><script>var name="cf-turnstile";var data={"class":"cf-turnstile"};</script></body></html>"#;
+        assert!(!detect_cf_embedded_turnstile(body));
+        assert!(!detect_cf_turnstyle(body));
+    }
+
+    #[test]
+    fn unrelated_page_does_not_match() {
+        let body = br#"<html><body><h1>Welcome</h1><p>Hello world.</p></body></html>"#;
+        assert!(!detect_cf_embedded_turnstile(body));
+        assert!(!detect_cf_turnstyle(body));
+    }
+
+    #[test]
+    fn case_insensitive_class_attribute() {
+        // HTML attribute values are case-insensitive per spec — make
+        // sure shouty markup still routes through the same path.
+        let body =
+            br#"<HTML><BODY><DIV CLASS="CF-TURNSTILE" DATA-SITEKEY="abc"></DIV></BODY></HTML>"#;
+        assert!(detect_cf_embedded_turnstile(body));
     }
 }

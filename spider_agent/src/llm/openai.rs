@@ -250,7 +250,7 @@ fn build_responses_body(
 ) -> serde_json::Value {
     // Separate system messages into `instructions` and the rest into `input`.
     let mut instructions = String::new();
-    let mut input_items = Vec::new();
+    let mut input_items = Vec::with_capacity(messages.len());
 
     for msg in messages {
         if msg.role == "system" {
@@ -622,16 +622,20 @@ mod tests {
 
     #[test]
     fn test_build_responses_body_json_mode() {
-        let mut opts = CompletionOptions::default();
-        opts.json_mode = true;
+        let opts = CompletionOptions {
+            json_mode: true,
+            ..Default::default()
+        };
         let body = build_responses_body("gpt-4o", &[Message::user("Hi")], &opts);
         assert_eq!(body["text"]["format"]["type"], "json_object");
     }
 
     #[test]
     fn test_build_completions_body_json_mode() {
-        let mut opts = CompletionOptions::default();
-        opts.json_mode = true;
+        let opts = CompletionOptions {
+            json_mode: true,
+            ..Default::default()
+        };
         let body = build_completions_body("gpt-4o", &[Message::user("Hi")], &opts);
         assert_eq!(body["response_format"]["type"], "json_object");
     }

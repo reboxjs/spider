@@ -21,6 +21,7 @@ A concurrent-safe multimodal agent for web automation and research.
 - **Self-Healing Selectors**: Auto-repair failed selectors with LLM diagnosis
 - **Schema Generation**: Auto-generate JSON schemas from example outputs
 - **Concurrent Chains**: Execute independent actions in parallel with dependency graphs
+- **Embedded Scripting**: LLM-callable pure-Rust Python (`rustpython-vm`) and JavaScript (`boa_engine`) interpreters via the `scripting` feature. Runs on a dedicated thread pool off tokio's blocking pool, with no mutexes, no deadlocks, a sandboxed filesystem, and opt-in HTTP
 
 ## Installation
 
@@ -114,12 +115,71 @@ println!("Summary: {}", research.summary.unwrap());
 |---------|-------------|
 | `openai` | OpenAI/OpenAI-compatible LLM provider |
 | `chrome` | Browser automation via chromiumoxide |
+| `webdriver` | Browser automation via thirtyfour |
 | `search` | Base search functionality |
 | `search_serper` | Serper.dev search provider |
 | `search_brave` | Brave Search provider |
 | `search_bing` | Bing Search provider |
 | `search_tavily` | Tavily AI Search provider |
+| `fs` | Tempfile-backed disk storage helpers |
+| `skills` | Dynamic skill loading for web challenge solving |
+| `memvid` | Long-term experience memory via semantic search |
+| `scripting` | Embedded pure-Rust Python + JavaScript interpreters for LLM-callable `RunPython` / `RunJavaScript` actions |
 | `full` | All features |
+
+### Scripting
+
+With `features = ["scripting"]`, the agent embeds pure-Rust [`rustpython-vm`] (with the frozen pure-Python stdlib, so `json`, `re`, `urllib.parse`, and friends are available) and [`boa_engine`] JavaScript interpreters and exposes them as two LLM-callable actions: `RunPython` and `RunJavaScript`.
+
+**Design constraints honored:**
+
+- **No `spawn_blocking`.** Workers run on dedicated `std::thread`s, isolated from tokio's blocking pool, so they never contend with reqwest, file I/O, or DB drivers.
+- **No mutexes in our code.** `OutputBuffer` uses a thread-local `RefCell<Vec<u8>>`; JS per-call state lives in a thread-local; channels are lock-free (`flume` MPMC + `tokio::oneshot`).
+- **No deadlocks.** The async caller only awaits lock-free primitives (semaphore acquire, flume `send_async`, oneshot, timeout); worker `Handle::block_on` parks an OS thread on a futex without consuming a runtime worker.
+- **No panics escape.** Every script invocation runs inside `catch_unwind`, so a bad script cannot tear down a worker thread. The worker path contains no `unwrap`/`expect`.
+- **Sandboxed filesystem.** `cap-std::fs::Dir` rooted at a per-call tmpdir; path escapes (`..`, absolute paths, symlinks) are structurally impossible.
+
+**Scripts get an `agent` object:**
+
+- `agent.url`, `agent.title`, `agent.html`, `agent.memory`, `agent.tmpdir` hold read-only context
+- `agent.log(...)`, `print(...)`, and `console.log(...)` write to `stdout`
+- `agent.fetch(url, opts?)` reuses the shared reqwest client, gated by `allow_network`
+- `agent.read_file(rel)` and `agent.write_file(rel, content)` do sandboxed I/O
+- `agent.check_interrupted()` polls for cancellation; a timeout flips an `AtomicBool` the script reads
+
+```rust,ignore
+use spider_agent::scripting::{ScriptConfig, ScriptContext, ScriptEngine};
+use std::time::Duration;
+
+let engine = ScriptEngine::new(ScriptConfig {
+    enabled: true,
+    allow_network: true,
+    default_timeout: Duration::from_secs(5),
+    ..ScriptConfig::default()
+});
+
+let result = engine.run_python(
+    r#"
+import json, re
+nums = [int(n) for n in re.findall(r"\d+", agent.html)]
+print(json.dumps({"url": agent.url, "found": nums}))
+"#.to_string(),
+    ScriptContext {
+        url: Some("https://shop.example.com".into()),
+        html: Some("<p>price 1999, stock 42</p>".into()),
+        ..ScriptContext::default()
+    },
+    None,
+).await;
+println!("{}", result.stdout);
+```
+
+When attached via `RemoteMultimodalEngine::with_script_engine(...)`, the LLM can emit `{"RunPython": {"code": "..."}}` or `{"RunJavaScript": {"code": "..."}}` actions and the chrome dispatcher routes them through the worker pool, surfacing stdout to the next round.
+
+Run the end-to-end demo: `cargo run --example scripting --features scripting`.
+
+[`rustpython-vm`]: https://crates.io/crates/rustpython-vm
+[`boa_engine`]: https://crates.io/crates/boa_engine
 
 ## Examples
 
@@ -135,6 +195,9 @@ OPENAI_API_KEY=xxx SERPER_API_KEY=xxx cargo run --example research --features "o
 
 # Concurrent execution
 OPENAI_API_KEY=xxx SERPER_API_KEY=xxx cargo run --example concurrent --features "openai search_serper"
+
+# Embedded scripting (Python + JS, no API key required)
+cargo run --example scripting --features scripting
 ```
 
 ## Verification
@@ -180,7 +243,7 @@ Agent::builder()
 
 ### Spider Cloud Tool Inheritance
 
-You can register Spider Cloud routes as custom tools directly from the builder.
+Register Spider Cloud routes as custom tools from the builder.
 
 ```rust
 use spider_agent::Agent;
@@ -249,7 +312,7 @@ SPIDER_CLOUD_API_KEY=your-key cargo run -p spider_agent --example spider_cloud_j
 Notes:
 - For markdown/text/raw/commonmark/bytes, use route-level `return_format`; transform is optional.
 - For binary assets (PDF/images/files), `return_format: "bytes"` preserves fidelity.
-- Run transform only when you explicitly need post-processing (`SPIDER_CLOUD_INCLUDE_TRANSFORM=1` in the examples).
+- Run transform only when you need post-processing (`SPIDER_CLOUD_INCLUDE_TRANSFORM=1` in the examples).
 
 You can also point this at any compatible endpoint (not only `api.spider.cloud`) and
 use your own naming convention:
@@ -264,7 +327,7 @@ let spider_cloud = SpiderCloudToolConfig::new("provider-key")
 
 ### RemoteMultimodalConfig
 
-Configure automation features. Use preset configurations for optimal performance:
+Configure automation features. Two presets cover the common setups:
 
 ```rust
 use spider_agent::RemoteMultimodalConfig;
@@ -356,7 +419,7 @@ let schema = generate_schema(&request);
 | Self-Healing | `None` | `None` | Higher success rate on failures |
 | Concurrent Execution | `false` | `true` | Parallel action execution |
 
-**Recommended**: Use `RemoteMultimodalConfig::fast()` for optimal performance.
+`RemoteMultimodalConfig::fast()` turns on every performance-positive feature in the table above.
 
 All features are opt-in with zero overhead when disabled.
 

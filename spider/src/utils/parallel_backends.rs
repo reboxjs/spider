@@ -1,10 +1,10 @@
-/// Parallel crawl backends — race alternative browser engines (LightPanda, Servo)
-/// alongside the primary crawl path. Lock-free, panic-free, zero overhead when disabled.
+/// Parallel crawl backends — race alternative browser engines alongside the
+/// primary crawl path. Lock-free, panic-free, zero overhead when disabled.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-#[cfg(any(feature = "lightpanda", feature = "servo"))]
+#[cfg(any(feature = "chrome", feature = "webdriver"))]
 use std::time::Instant;
 
 use crate::configuration::{
@@ -13,6 +13,70 @@ use crate::configuration::{
 };
 use crate::page::AntiBotTech;
 use reqwest::StatusCode;
+
+// ---------------------------------------------------------------------------
+// Global In-Flight Byte Tracking
+// ---------------------------------------------------------------------------
+
+/// Total HTML bytes currently held by in-flight backend responses across all
+/// concurrent races. This is a proactive memory safeguard that works without
+/// the `balance` feature — it caps the aggregate memory footprint of racing
+/// backend pages regardless of system memory monitoring.
+static BACKEND_BYTES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that decrements [`BACKEND_BYTES_IN_FLIGHT`] on drop.
+///
+/// Attached to every [`BackendResponse`]. When the response is consumed
+/// (winner extracted by caller) or discarded (losers dropped after race),
+/// the tracked bytes are released automatically.
+pub struct BackendBytesGuard(usize);
+
+impl BackendBytesGuard {
+    /// Register `n` bytes as in-flight and return a guard that will release
+    /// them on drop. Returns `None` if adding `n` bytes would exceed `limit`,
+    /// indicating the caller should skip this backend fetch.
+    pub fn try_acquire(n: usize, limit: usize) -> Option<Self> {
+        if limit == 0 {
+            // Unlimited — always succeed, but still track for observability.
+            BACKEND_BYTES_IN_FLIGHT.fetch_add(n, Ordering::Relaxed);
+            return Some(Self(n));
+        }
+        // CAS loop: only add if we stay under the limit.
+        let mut current = BACKEND_BYTES_IN_FLIGHT.load(Ordering::Relaxed);
+        loop {
+            if current.saturating_add(n) > limit {
+                return None;
+            }
+            match BACKEND_BYTES_IN_FLIGHT.compare_exchange_weak(
+                current,
+                current + n,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(n)),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Register bytes unconditionally (no limit check). Used when the response
+    /// is already committed (e.g. primary path).
+    pub fn acquire_unchecked(n: usize) -> Self {
+        BACKEND_BYTES_IN_FLIGHT.fetch_add(n, Ordering::Relaxed);
+        Self(n)
+    }
+
+    /// Current total in-flight bytes (for testing / diagnostics).
+    pub fn in_flight() -> usize {
+        BACKEND_BYTES_IN_FLIGHT.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for BackendBytesGuard {
+    fn drop(&mut self) {
+        BACKEND_BYTES_IN_FLIGHT.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Asset / Binary Content-Type Detection
@@ -89,7 +153,7 @@ pub struct ValidationResult {
 
 /// User-supplied quality validator. Called after the built-in scorer for
 /// every backend response. Receives the raw HTML bytes, status code, URL,
-/// and the backend source name ("primary", "lightpanda", "servo", "custom").
+/// and the backend source name ("primary", "cdp", "servo", "custom").
 ///
 /// Must be `Send + Sync` so it can be shared across async tasks.
 pub type QualityValidator = std::sync::Arc<
@@ -117,7 +181,7 @@ pub fn html_quality_score_validated(
     source: &str,
     validator: Option<&QualityValidator>,
 ) -> u16 {
-    let base = html_quality_score(content, status_code, anti_bot);
+    let base = html_quality_score(content, status_code, anti_bot, url);
 
     if let Some(v) = validator {
         let result = v(content, status_code, url, source);
@@ -138,10 +202,16 @@ pub fn html_quality_score_validated(
 ///
 /// Used by [`race_backends`] to pick the best response when multiple backends
 /// complete within the grace period.
+///
+/// `url` is used to detect asset responses (images, PDFs, media, fonts) so
+/// HTML-specific probes — the `<body` tag scan and the empty-HTML-shell
+/// check — are skipped on binary content where they'd both return `false`
+/// by construction and cost a full-body `memmem` scan each.
 pub fn html_quality_score(
     content: Option<&[u8]>,
     status_code: StatusCode,
     anti_bot: &AntiBotTech,
+    url: &str,
 ) -> u16 {
     let mut score: u16 = 0;
 
@@ -154,6 +224,9 @@ pub fn html_quality_score(
         score += 5;
     }
     // 4xx / 5xx contribute 0.
+
+    // Cheap URL-extension check first; only probe bytes if that misses.
+    let url_is_asset = crate::page::is_asset_url(url);
 
     if let Some(body) = content {
         let len = body.len();
@@ -169,16 +242,33 @@ pub fn html_quality_score(
             score += 10;
         }
 
-        // Has a <body tag (max 15). Fast memchr scan.
-        if memchr::memmem::find(body, b"<body").is_some()
-            || memchr::memmem::find(body, b"<BODY").is_some()
-        {
-            score += 15;
-        }
+        // Byte-level binary check picks up extension-less assets
+        // (e.g. `/download`, `/file/abc123`) that `is_asset_url` misses.
+        // Whitespace-padded HTML (some Aestiva/HTML-OS sites send
+        // `\n\n\n\n<!doctype...`) gets trimmed first so it doesn't get
+        // scored as an asset.
+        let is_asset = url_is_asset || (len > 0 && crate::utils::is_binary_body(body));
 
-        // Not an empty HTML shell (max 10).
-        if !crate::utils::is_cacheable_body_empty(body) {
-            score += 10;
+        if is_asset {
+            // Asset bodies are binary — the `<body` scan and HTML-shell
+            // detector don't apply. A 2xx asset with content is "good
+            // enough" on the HTML-structure axis; award the combined 25
+            // points so cross-backend comparisons stay comparable.
+            if len > 0 && status_code.is_success() {
+                score += 25;
+            }
+        } else {
+            // Has a <body tag (max 15). Fast memchr scan.
+            if memchr::memmem::find(body, b"<body").is_some()
+                || memchr::memmem::find(body, b"<BODY").is_some()
+            {
+                score += 15;
+            }
+
+            // Not an empty HTML shell (max 10).
+            if !crate::utils::is_cacheable_body_empty(body) {
+                score += 10;
+            }
         }
     }
 
@@ -271,8 +361,12 @@ impl BackendTracker {
             if count <= 1 {
                 s.ema_ms.store(ms, Ordering::Relaxed);
             } else {
-                let old = s.ema_ms.load(Ordering::Relaxed);
-                s.ema_ms.store((old * 4 + ms) / 5, Ordering::Relaxed);
+                // CAS loop ensures concurrent record_duration() calls don't lose updates.
+                let _ = s
+                    .ema_ms
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                        Some((old * 4 + ms) / 5)
+                    });
             }
         }
     }
@@ -390,6 +484,10 @@ pub struct BackendResponse {
     pub backend_index: usize,
     /// Wall-clock duration of the fetch.
     pub duration: Duration,
+    /// RAII guard that releases the tracked in-flight bytes on drop.
+    /// When a losing response is discarded or the winning response is
+    /// consumed by the caller, the bytes are freed automatically.
+    pub _bytes_guard: Option<BackendBytesGuard>,
 }
 
 /// Wrapper returned by backend futures — always carries the backend index
@@ -404,7 +502,7 @@ pub struct BackendResult {
 /// Return a human-readable backend source name for the given config entry.
 pub fn backend_source_name(endpoint: &BackendEndpoint) -> &'static str {
     match endpoint.engine {
-        BackendEngine::LightPanda => "lightpanda",
+        BackendEngine::Cdp => "cdp",
         BackendEngine::Servo => "servo",
         BackendEngine::Custom => "custom",
     }
@@ -416,7 +514,7 @@ pub fn resolve_protocol(endpoint: &BackendEndpoint) -> BackendProtocol {
         return p.clone();
     }
     match endpoint.engine {
-        BackendEngine::LightPanda => BackendProtocol::Cdp,
+        BackendEngine::Cdp => BackendProtocol::Cdp,
         BackendEngine::Servo => BackendProtocol::WebDriver,
         BackendEngine::Custom => {
             // Infer from URL scheme if possible.
@@ -474,15 +572,15 @@ pub async fn race_backends(
 
     // Randomise launch order: sometimes the primary goes first, sometimes
     // a backend does. This prevents predictable timing patterns that could
-    // be fingerprinted. The primary gets a random 0–3ms jitter; backends
-    // already have their own jitter from build_backend_futures.
+    // be fingerprinted. Uses a tighter jitter range (0–1ms) than backends
+    // so the primary is rarely meaningfully delayed.
     let primary_jitter_us = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut h = DefaultHasher::new();
         std::time::SystemTime::now().hash(&mut h);
         0u16.hash(&mut h); // primary marker
-        h.finish() % 3000 // 0–3ms
+        h.finish() % 1000 // 0–999µs (~0–1ms)
     };
 
     let primary_wrapped: Pin<Box<dyn Future<Output = BackendResult> + Send>> =
@@ -503,7 +601,18 @@ pub async fn race_backends(
         futs.spawn(alt);
     }
 
-    let grace = Duration::from_millis(config.grace_period_ms);
+    // Under memory pressure, halve the grace period so losing responses
+    // are freed sooner. Under critical pressure, skip grace entirely.
+    let grace = {
+        let mem_state = crate::utils::detect_system::get_process_memory_state_sync();
+        if mem_state >= 2 {
+            Duration::ZERO
+        } else if mem_state >= 1 {
+            Duration::from_millis(config.grace_period_ms / 2)
+        } else {
+            Duration::from_millis(config.grace_period_ms)
+        }
+    };
     let threshold = config.fast_accept_threshold;
 
     let mut best: Option<BackendResponse> = None;
@@ -572,6 +681,13 @@ pub async fn race_backends(
         }
     }
 
+    // Abort all remaining in-flight tasks immediately, then drop the JoinSet
+    // so completed-but-unread responses (carrying full Page data) are freed.
+    // abort_all() sends cancel signals eagerly — drop alone would do this too,
+    // but being explicit avoids relying on drop ordering.
+    futs.abort_all();
+    drop(futs);
+
     if let Some(ref b) = best {
         tracker.record_win(b.backend_index);
     }
@@ -585,7 +701,7 @@ pub async fn race_backends(
 
 /// Round-robin proxy address selector for parallel backends.
 ///
-/// Pre-filters proxy lists for CDP (LightPanda) and WebDriver (Servo)
+/// Pre-filters proxy lists for CDP and WebDriver backends
 /// based on [`ProxyIgnore`]. Lock-free via [`AtomicUsize`].
 pub struct ProxyRotator {
     /// Proxies for CDP backends (filtered: `ProxyIgnore != Chrome`).
@@ -599,7 +715,8 @@ pub struct ProxyRotator {
 impl ProxyRotator {
     /// Build from the crawler's proxy list.
     pub fn new(proxies: &Option<Vec<RequestProxy>>) -> Self {
-        let (mut cdp, mut wd) = (Vec::new(), Vec::new());
+        let cap = proxies.as_ref().map_or(0, |v| v.len());
+        let (mut cdp, mut wd) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
 
         if let Some(proxies) = proxies {
             for p in proxies {
@@ -666,26 +783,26 @@ impl Clone for ProxyRotator {
 // Backend Fetch Functions
 // ---------------------------------------------------------------------------
 
-/// Fetch a page via a remote LightPanda CDP endpoint.
+/// Fetch a page via a remote CDP endpoint (any CDP-speaking browser).
 ///
 /// Fresh CDP connection per fetch with the **same handler config** as the
 /// primary Chrome path — network interception, resource blocking, viewport,
 /// timeouts all pass through transparently via `connect_with_config()`.
-/// Fully lock-free: no mutexes, no semaphores, no locks.
-#[cfg(feature = "lightpanda")]
-pub async fn fetch_lightpanda_cdp(
+#[cfg(all(feature = "chrome", not(feature = "decentralized")))]
+pub async fn fetch_cdp(
     url: &str,
     endpoint: &str,
     config: &std::sync::Arc<crate::configuration::Configuration>,
     backend_index: usize,
     connect_timeout: Duration,
     proxy: Option<String>,
+    source_name: &str,
 ) -> Option<BackendResponse> {
     let start = Instant::now();
     let timeout = config.request_timeout.unwrap_or(Duration::from_secs(15));
 
     // Build the same handler config as the primary Chrome crawl path.
-    // This gives LightPanda identical network interception: block_visuals,
+    // This gives CDP backends identical network interception: block_visuals,
     // block_javascript, block_stylesheets, block_ads, block_analytics,
     // whitelist/blacklist patterns, extra headers, viewport, etc.
     let handler_config = crate::features::chrome::create_handler_config(config);
@@ -706,44 +823,69 @@ pub async fn fetch_lightpanda_cdp(
             (browser, h)
         }
         Ok(Err(e)) => {
-            log::warn!("LightPanda CDP connect failed ({}): {:?}", endpoint, e);
+            log::warn!("{} CDP connect failed ({}): {:?}", source_name, endpoint, e);
             return None;
         }
         Err(_) => {
-            log::warn!("LightPanda CDP connect timed out ({})", endpoint);
+            log::warn!("{} CDP connect timed out ({})", source_name, endpoint);
             return None;
         }
     };
 
-    // If a proxy is configured, create an isolated browser context with
-    // proxy_server so this backend's requests route through it.
+    // Always create an isolated browser context so parallel fetches don't
+    // contend over the shared default context/tab of a persistent remote
+    // Chrome. `dispose_on_detach` is set as a best-effort cleanup hint
+    // (experimental in the spec, not relied on) — `Page.close` +
+    // `Target.disposeBrowserContext` below remain the source of truth so the
+    // remote browser's storage/cookies are freed even when the connection
+    // stays alive (e.g. pooled connections).
+    let mut ctx_params =
+        chromiumoxide::cdp::browser_protocol::target::CreateBrowserContextParams::default();
+    ctx_params.dispose_on_detach = Some(true);
     if let Some(ref proxy_addr) = proxy {
-        let mut ctx_params =
-            chromiumoxide::cdp::browser_protocol::target::CreateBrowserContextParams::default();
-        ctx_params.dispose_on_detach = Some(true);
         ctx_params.proxy_server = Some(proxy_addr.clone());
-        if let Ok(ctx) = browser.create_browser_context(ctx_params).await {
-            let _ = browser.send_new_context(ctx).await;
-        } else {
-            log::warn!(
-                "LightPanda proxy browser context failed for {}, continuing without proxy",
-                proxy_addr
-            );
-        }
     }
-
-    // Get the default page.
-    let page = match browser.pages().await {
-        Ok(mut p) if !p.is_empty() => p.swap_remove(0),
-        _ => match browser.new_page(url).await {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("LightPanda page failed: {:?}", e);
-                handler_handle.abort();
-                return None;
+    let context_id: Option<chromiumoxide::cdp::browser_protocol::browser::BrowserContextId> =
+        match browser.create_browser_context(ctx_params).await {
+            Ok(ctx) => {
+                let _ = browser.send_new_context(ctx.clone()).await;
+                Some(ctx)
             }
-        },
+            Err(e) => {
+                log::warn!(
+                    "{} browser context create failed ({}): {:?} — falling back to default context",
+                    source_name,
+                    endpoint,
+                    e
+                );
+                None
+            }
+        };
+
+    // Always open a fresh tab — never reuse `browser.pages()` which returns
+    // the shared default tab on a persistent remote Chrome and races with
+    // other concurrent fetches.
+    let page = match browser.new_page("about:blank").await {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("{} page failed: {:?}", source_name, e);
+            if let Some(ctx_id) = context_id {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    browser.dispose_browser_context(ctx_id),
+                )
+                .await;
+            }
+            handler_handle.abort();
+            return None;
+        }
     };
+
+    // Guard closes the tab if this future is cancelled mid-flight (e.g. by
+    // `race_backends::abort_all()`). Drop sends the page to the background
+    // watcher — no per-Drop spawn — and the watcher dedups by `target_id`
+    // so this never double-closes alongside the explicit close paths below.
+    let tab_guard = crate::features::chrome::TabCloseGuard::new(page.clone());
 
     // Apply the same page-level config as the primary Chrome path.
     crate::features::chrome::setup_chrome_events(&page, config).await;
@@ -759,18 +901,26 @@ pub async fn fetch_lightpanda_cdp(
     .await;
 
     // Navigate.
-    match tokio::time::timeout(timeout, page.goto(url)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            log::warn!("LightPanda navigate failed for {}: {:?}", url, e);
-            handler_handle.abort();
-            return None;
+    let nav_result = tokio::time::timeout(timeout, page.goto(url)).await;
+    if !matches!(nav_result, Ok(Ok(_))) {
+        match &nav_result {
+            Ok(Err(e)) => log::warn!("{} navigate failed for {}: {:?}", source_name, url, e),
+            Err(_) => log::warn!("{} navigate timed out for {}", source_name, url),
+            _ => {}
         }
-        Err(_) => {
-            log::warn!("LightPanda navigate timed out for {}", url);
-            handler_handle.abort();
-            return None;
+        // Defuse the guard, close tab, dispose the isolated context, then
+        // kill the handler — all CDP commands need the message pump alive.
+        tab_guard.defuse();
+        let _ = tokio::time::timeout(Duration::from_secs(2), page.close()).await;
+        if let Some(ctx_id) = context_id {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                browser.dispose_browser_context(ctx_id),
+            )
+            .await;
         }
+        handler_handle.abort();
+        return None;
     }
 
     // Wait for load event if configured.
@@ -786,17 +936,35 @@ pub async fn fetch_lightpanda_cdp(
     // Get the outer HTML.
     let html_result = tokio::time::timeout(Duration::from_secs(10), page.outer_html_bytes()).await;
 
-    // Clean up.
+    // Close the tab, dispose the isolated context, then abort the handler.
+    // Order matters: all CDP commands need the message pump alive, so close
+    // + dispose run inline before `handler_handle.abort()`. Dispose frees
+    // the remote context's storage/cookies even when the browser connection
+    // itself is pooled and kept alive by a future caller.
+    tab_guard.defuse();
+    let _ = tokio::time::timeout(Duration::from_secs(2), page.close()).await;
+    if let Some(ctx_id) = context_id {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            browser.dispose_browser_context(ctx_id),
+        )
+        .await;
+    }
     handler_handle.abort();
 
     let html_bytes: Vec<u8> = match html_result {
         Ok(Ok(b)) => b.to_vec(),
         Ok(Err(e)) => {
-            log::warn!("LightPanda outer_html_bytes() failed for {}: {:?}", url, e);
+            log::warn!(
+                "{} outer_html_bytes() failed for {}: {:?}",
+                source_name,
+                url,
+                e
+            );
             return None;
         }
         Err(_) => {
-            log::warn!("LightPanda outer_html_bytes() timed out for {}", url);
+            log::warn!("{} outer_html_bytes() timed out for {}", source_name, url);
             return None;
         }
     };
@@ -804,41 +972,44 @@ pub async fn fetch_lightpanda_cdp(
     let dur = start.elapsed();
     let status = StatusCode::OK;
 
-    let score = html_quality_score(Some(&html_bytes), status, &AntiBotTech::None);
+    let score = html_quality_score(Some(&html_bytes), status, &AntiBotTech::None, url);
+    let byte_len = html_bytes.len();
     let res = crate::utils::PageResponse {
         content: Some(html_bytes),
         status_code: status,
         ..Default::default()
     };
     let mut page = crate::page::build(url, res);
-    tag_page_source(&mut page, "lightpanda");
+    tag_page_source(&mut page, source_name);
 
     Some(BackendResponse {
         page,
         quality_score: score,
         backend_index,
         duration: dur,
+        _bytes_guard: Some(BackendBytesGuard::acquire_unchecked(byte_len)),
     })
 }
 
-/// Fetch a page via a remote Servo WebDriver endpoint.
+/// Fetch a page via a remote WebDriver endpoint (Servo, custom, or any WebDriver-speaking browser).
 ///
 /// Reuses the existing `thirtyfour` / `webdriver.rs` infrastructure.
-#[cfg(feature = "servo")]
-pub async fn fetch_servo_webdriver(
+#[cfg(feature = "webdriver")]
+pub async fn fetch_webdriver(
     url: &str,
     endpoint: &str,
     config: &std::sync::Arc<crate::configuration::Configuration>,
     backend_index: usize,
     connect_timeout: Duration,
     proxy: Option<String>,
+    source_name: &str,
 ) -> Option<BackendResponse> {
     use crate::features::webdriver_common::{WebDriverBrowser, WebDriverConfig};
 
     let start = Instant::now();
     let timeout = config.request_timeout.unwrap_or(Duration::from_secs(15));
 
-    // Build a WebDriverConfig pointing at the Servo endpoint.
+    // Build a WebDriverConfig pointing at the remote endpoint.
     let wd_config = WebDriverConfig {
         server_url: endpoint.to_string(),
         browser: WebDriverBrowser::Chrome, // Servo's WebDriver is browser-agnostic
@@ -862,11 +1033,11 @@ pub async fn fetch_servo_webdriver(
     let mut controller = match controller_opt {
         Ok(Some(c)) => c,
         Ok(None) => {
-            log::warn!("Servo WebDriver connect failed ({})", endpoint);
+            log::warn!("{} WebDriver connect failed ({})", source_name, endpoint);
             return None;
         }
         Err(_) => {
-            log::warn!("Servo WebDriver connect timed out ({})", endpoint);
+            log::warn!("{} WebDriver connect timed out ({})", source_name, endpoint);
             return None;
         }
     };
@@ -877,12 +1048,17 @@ pub async fn fetch_servo_webdriver(
     match tokio::time::timeout(timeout, driver.goto(url)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            log::warn!("Servo WebDriver navigate failed for {}: {:?}", url, e);
+            log::warn!(
+                "{} WebDriver navigate failed for {}: {:?}",
+                source_name,
+                url,
+                e
+            );
             controller.dispose();
             return None;
         }
         Err(_) => {
-            log::warn!("Servo WebDriver navigate timed out for {}", url);
+            log::warn!("{} WebDriver navigate timed out for {}", source_name, url);
             controller.dispose();
             return None;
         }
@@ -892,12 +1068,17 @@ pub async fn fetch_servo_webdriver(
     let source = match tokio::time::timeout(Duration::from_secs(10), driver.source()).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            log::warn!("Servo WebDriver source failed for {}: {:?}", url, e);
+            log::warn!(
+                "{} WebDriver source failed for {}: {:?}",
+                source_name,
+                url,
+                e
+            );
             controller.dispose();
             return None;
         }
         Err(_) => {
-            log::warn!("Servo WebDriver source timed out for {}", url);
+            log::warn!("{} WebDriver source timed out for {}", source_name, url);
             controller.dispose();
             return None;
         }
@@ -909,20 +1090,22 @@ pub async fn fetch_servo_webdriver(
     let html_bytes = source.into_bytes();
     let status = StatusCode::OK;
 
-    let score = html_quality_score(Some(&html_bytes), status, &AntiBotTech::None);
+    let score = html_quality_score(Some(&html_bytes), status, &AntiBotTech::None, url);
+    let byte_len = html_bytes.len();
     let res = crate::utils::PageResponse {
         content: Some(html_bytes),
         status_code: status,
         ..Default::default()
     };
     let mut page = crate::page::build(url, res);
-    tag_page_source(&mut page, "servo");
+    tag_page_source(&mut page, source_name);
 
     Some(BackendResponse {
         page,
         quality_score: score,
         backend_index,
         duration: dur,
+        _bytes_guard: Some(BackendBytesGuard::acquire_unchecked(byte_len)),
     })
 }
 
@@ -956,11 +1139,50 @@ pub fn build_backend_futures(
         return Vec::new();
     }
 
+    // Proactive byte-level guard: skip backends when the aggregate in-flight
+    // HTML from all concurrent races exceeds the configured cap. Works without
+    // the `balance` feature.
+    let byte_limit = config.max_backend_bytes_in_flight;
+    if byte_limit > 0 && BackendBytesGuard::in_flight() >= byte_limit {
+        log::debug!(
+            "[parallel_backends] skipping backends — in-flight bytes ({}) >= limit ({})",
+            BackendBytesGuard::in_flight(),
+            byte_limit,
+        );
+        return Vec::new();
+    }
+
+    // Reactive memory pressure guard (requires `balance` feature, otherwise
+    // no-op returning 0). State 2 (critical) skips all backends; state 1
+    // (pressure) limits to at most 1 alternative backend.
+    let mem_state = crate::utils::detect_system::get_process_memory_state_sync();
+    if mem_state >= 2 {
+        log::debug!("[parallel_backends] skipping all backends — process memory critical");
+        return Vec::new();
+    }
+    let mem_pressure = mem_state >= 1;
+
+    // Hard outer deadline: prevents a stalled backend from blocking the
+    // primary result during the grace window. 0 = disabled (phase timeouts
+    // still apply). Computed once outside the loop — pure Copy value.
+    let outer_timeout = if config.backend_timeout_ms > 0 {
+        Some(Duration::from_millis(config.backend_timeout_ms))
+    } else {
+        None
+    };
+    let backend_timeout_ms_log = config.backend_timeout_ms;
+
     #[allow(unused_mut)]
-    let mut futs: Vec<Pin<Box<dyn Future<Output = BackendResult> + Send>>> = Vec::new();
+    let mut futs: Vec<Pin<Box<dyn Future<Output = BackendResult> + Send>>> =
+        Vec::with_capacity(config.backends.len());
 
     for (i, backend) in config.backends.iter().enumerate() {
         let backend_index = i + 1; // 0 is primary
+
+        // Under memory pressure, only keep the first enabled backend.
+        if mem_pressure && !futs.is_empty() {
+            break;
+        }
 
         if tracker.is_disabled(backend_index) {
             continue;
@@ -1001,9 +1223,9 @@ pub fn build_backend_futures(
             None
         };
 
-        // Random sub-ms to 5ms jitter before each backend launch to prevent
-        // fingerprint correlation from simultaneous requests. Uses a cheap
-        // hash-based PRNG (no allocations, no syscalls).
+        // Sub-ms jitter before each backend launch to prevent fingerprint
+        // correlation from simultaneous requests. Kept small so backends
+        // start quickly — the value of hedging drops with launch delay.
         let jitter_us = {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
@@ -1011,7 +1233,7 @@ pub fn build_backend_futures(
             url.hash(&mut hasher);
             backend_index.hash(&mut hasher);
             std::time::SystemTime::now().hash(&mut hasher);
-            hasher.finish() % 5000 + 100 // 100µs – 5100µs (~0.1ms – 5ms)
+            hasher.finish() % 1000 // 0–999µs (~0–1ms)
         };
 
         let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
@@ -1020,75 +1242,142 @@ pub fn build_backend_futures(
         let sem = semaphore.clone();
 
         match proto {
-            #[cfg(feature = "lightpanda")]
+            #[cfg(all(feature = "chrome", not(feature = "decentralized")))]
             BackendProtocol::Cdp => {
                 let url = url.to_string();
                 let cfg = crawl_config.clone(); // Arc clone — cheap
                 let proxy = resolved_proxy.clone();
+                let source = backend_source_name(backend).to_string();
                 futs.push(Box::pin(async move {
-                    // Acquire semaphore permit before doing any real work.
-                    let _permit = if let Some(ref s) = sem {
-                        match s.acquire().await {
-                            Ok(p) => Some(p),
+                    // Wrap the ENTIRE backend future (including semaphore
+                    // acquire) in the outer timeout.  Previously the timeout
+                    // only covered fetch_cdp — if all permits were held by
+                    // other backends or leaked tabs, acquire() would block
+                    // forever and stall the crawl.
+                    let work = async {
+                        // Acquire semaphore permit with a bounded wait.
+                        // 10s is generous — if permits are still held after
+                        // that, the backends are likely stalled or leaked.
+                        let _permit = if let Some(ref s) = sem {
+                            match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                s.acquire(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(p)) => Some(p),
+                                _ => {
+                                    log::warn!(
+                                        "[parallel_backends] {} backend {} semaphore timeout for {}",
+                                        source, backend_index, url
+                                    );
+                                    return BackendResult {
+                                        backend_index,
+                                        response: None,
+                                    };
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        tokio::time::sleep(Duration::from_micros(jitter_us)).await;
+                        let response = fetch_cdp(
+                            &url,
+                            &resolved_endpoint,
+                            &cfg,
+                            backend_index,
+                            connect_timeout,
+                            proxy,
+                            &source,
+                        )
+                        .await;
+                        BackendResult {
+                            backend_index,
+                            response,
+                        }
+                    };
+                    match outer_timeout {
+                        Some(deadline) => match tokio::time::timeout(deadline, work).await {
+                            Ok(r) => r,
                             Err(_) => {
-                                return BackendResult {
+                                log::warn!(
+                                    "[parallel_backends] {} backend {} hard timeout ({}ms) for {}",
+                                    source, backend_index, backend_timeout_ms_log, url
+                                );
+                                BackendResult {
                                     backend_index,
                                     response: None,
                                 }
                             }
-                        }
-                    } else {
-                        None
-                    };
-                    tokio::time::sleep(Duration::from_micros(jitter_us)).await;
-                    let response = fetch_lightpanda_cdp(
-                        &url,
-                        &resolved_endpoint,
-                        &cfg,
-                        backend_index,
-                        connect_timeout,
-                        proxy,
-                    )
-                    .await;
-                    BackendResult {
-                        backend_index,
-                        response,
+                        },
+                        None => work.await,
                     }
                 }));
             }
-            #[cfg(feature = "servo")]
+            #[cfg(feature = "webdriver")]
             BackendProtocol::WebDriver => {
                 let url = url.to_string();
                 let cfg = crawl_config.clone(); // Arc clone — cheap
                 let proxy = resolved_proxy.clone();
+                let source = backend_source_name(backend).to_string();
                 futs.push(Box::pin(async move {
-                    // Acquire semaphore permit before doing any real work.
-                    let _permit = if let Some(ref s) = sem {
-                        match s.acquire().await {
-                            Ok(p) => Some(p),
+                    // Wrap the ENTIRE backend future (including semaphore
+                    // acquire) in the outer timeout — same fix as CDP path.
+                    let work = async {
+                        // Acquire semaphore permit with a bounded wait.
+                        let _permit = if let Some(ref s) = sem {
+                            match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                s.acquire(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(p)) => Some(p),
+                                _ => {
+                                    log::warn!(
+                                        "[parallel_backends] {} backend {} semaphore timeout for {}",
+                                        source, backend_index, url
+                                    );
+                                    return BackendResult {
+                                        backend_index,
+                                        response: None,
+                                    };
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        tokio::time::sleep(Duration::from_micros(jitter_us)).await;
+                        let response = fetch_webdriver(
+                            &url,
+                            &resolved_endpoint,
+                            &cfg,
+                            backend_index,
+                            connect_timeout,
+                            proxy,
+                            &source,
+                        )
+                        .await;
+                        BackendResult {
+                            backend_index,
+                            response,
+                        }
+                    };
+                    match outer_timeout {
+                        Some(deadline) => match tokio::time::timeout(deadline, work).await {
+                            Ok(r) => r,
                             Err(_) => {
-                                return BackendResult {
+                                log::warn!(
+                                    "[parallel_backends] {} backend {} hard timeout ({}ms) for {}",
+                                    source, backend_index, backend_timeout_ms_log, url
+                                );
+                                BackendResult {
                                     backend_index,
                                     response: None,
                                 }
                             }
-                        }
-                    } else {
-                        None
-                    };
-                    tokio::time::sleep(Duration::from_micros(jitter_us)).await;
-                    let response = fetch_servo_webdriver(
-                        &url,
-                        &resolved_endpoint,
-                        &cfg,
-                        backend_index,
-                        connect_timeout,
-                        proxy,
-                    )
-                    .await;
-                    BackendResult {
-                        backend_index,
-                        response,
+                        },
+                        None => work.await,
                     }
                 }));
             }
@@ -1123,21 +1412,21 @@ mod tests {
     #[test]
     fn test_quality_score_perfect_response() {
         let body = make_html(&"x".repeat(5000));
-        let score = html_quality_score(Some(&body), StatusCode::OK, &AntiBotTech::None);
+        let score = html_quality_score(Some(&body), StatusCode::OK, &AntiBotTech::None, "");
         // 30 (200) + 5 (>0) + 10 (>512) + 10 (>4096) + 15 (<body>) + 10 (not empty) + 20 (no bot) = 100
         assert_eq!(score, 100);
     }
 
     #[test]
     fn test_quality_score_empty_body() {
-        let score = html_quality_score(Some(&[]), StatusCode::OK, &AntiBotTech::None);
+        let score = html_quality_score(Some(&[]), StatusCode::OK, &AntiBotTech::None, "");
         // 30 (200) + 0 (empty) + 0 + 0 + 0 + 0 (is_cacheable_body_empty → true for empty) + 20 = 50
         assert_eq!(score, 50);
     }
 
     #[test]
     fn test_quality_score_none_content() {
-        let score = html_quality_score(None, StatusCode::OK, &AntiBotTech::None);
+        let score = html_quality_score(None, StatusCode::OK, &AntiBotTech::None, "");
         // 30 (200) + 20 (no bot) = 50
         assert_eq!(score, 50);
     }
@@ -1145,7 +1434,7 @@ mod tests {
     #[test]
     fn test_quality_score_empty_html_shell() {
         let body = b"<html><head></head><body></body></html>";
-        let score = html_quality_score(Some(body), StatusCode::OK, &AntiBotTech::None);
+        let score = html_quality_score(Some(body), StatusCode::OK, &AntiBotTech::None, "");
         // 30 + 5 (>0) + 0 (38 bytes, <512) + 0 + 15 (<body) + 0 (empty shell) + 20 = 70
         assert_eq!(score, 70);
     }
@@ -1153,8 +1442,12 @@ mod tests {
     #[test]
     fn test_quality_score_antibot_cloudflare() {
         let body = make_html("blocked");
-        let score =
-            html_quality_score(Some(&body), StatusCode::FORBIDDEN, &AntiBotTech::Cloudflare);
+        let score = html_quality_score(
+            Some(&body),
+            StatusCode::FORBIDDEN,
+            &AntiBotTech::Cloudflare,
+            "",
+        );
         // 0 (403) + 5 + 0 + 0 + 15 + 10 + 0 (bot!) = 30
         assert_eq!(score, 30);
     }
@@ -1166,6 +1459,7 @@ mod tests {
             Some(&body),
             StatusCode::INTERNAL_SERVER_ERROR,
             &AntiBotTech::None,
+            "",
         );
         // 0 (500) + 5 + 0 + 0 + 15 + 10 + 20 = 50
         assert_eq!(score, 50);
@@ -1173,7 +1467,7 @@ mod tests {
 
     #[test]
     fn test_quality_score_redirect() {
-        let score = html_quality_score(None, StatusCode::MOVED_PERMANENTLY, &AntiBotTech::None);
+        let score = html_quality_score(None, StatusCode::MOVED_PERMANENTLY, &AntiBotTech::None, "");
         // 5 (301) + 20 = 25
         assert_eq!(score, 25);
     }
@@ -1181,7 +1475,7 @@ mod tests {
     #[test]
     fn test_quality_score_small_body_with_body_tag() {
         let body = b"<html><body>hi</body></html>";
-        let score = html_quality_score(Some(body), StatusCode::OK, &AntiBotTech::None);
+        let score = html_quality_score(Some(body), StatusCode::OK, &AntiBotTech::None, "");
         // 30 + 5 (>0) + 0 (<512) + 0 + 15 (<body) + 10 (not empty) + 20 = 80
         assert_eq!(score, 80);
     }
@@ -1189,9 +1483,46 @@ mod tests {
     #[test]
     fn test_quality_score_large_body_no_body_tag() {
         let body = "x".repeat(5000);
-        let score = html_quality_score(Some(body.as_bytes()), StatusCode::OK, &AntiBotTech::None);
+        let score = html_quality_score(
+            Some(body.as_bytes()),
+            StatusCode::OK,
+            &AntiBotTech::None,
+            "",
+        );
         // 30 + 5 + 10 + 10 + 0 (no <body) + 10 (not empty) + 20 = 85
         assert_eq!(score, 85);
+    }
+
+    #[test]
+    fn test_quality_score_asset_url_skips_body_probe() {
+        // Binary asset body — `<body` scan would miss (no tag in PNG header)
+        // and `is_cacheable_body_empty` is HTML-specific noise. The asset
+        // branch awards the combined 25 points for a 2xx response with
+        // content, keeping parity with a well-formed HTML response.
+        let png_header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\x00\x00\x01\x00";
+        let score = html_quality_score(
+            Some(png_header),
+            StatusCode::OK,
+            &AntiBotTech::None,
+            "https://example.com/logo.png",
+        );
+        // 30 (200) + 5 (>0) + 0 (<512) + 0 + 25 (asset bundle) + 20 (no bot) = 80
+        assert_eq!(score, 80);
+    }
+
+    #[test]
+    fn test_quality_score_extensionless_binary_detected_from_bytes() {
+        // URL has no extension so is_asset_url returns false — byte-level
+        // binary check must pick it up so `<body` scan is skipped.
+        let pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<< /Type /Catalog >>\nendobj";
+        let score = html_quality_score(
+            Some(pdf),
+            StatusCode::OK,
+            &AntiBotTech::None,
+            "https://example.com/download/abc123",
+        );
+        // 30 (200) + 5 (>0) + 0 (<512) + 0 + 25 (asset bundle) + 20 (no bot) = 80
+        assert_eq!(score, 80);
     }
 
     // ---- Backend Tracker ----
@@ -1327,6 +1658,7 @@ mod tests {
                 quality_score: score,
                 backend_index: 0,
                 duration: Duration::from_millis(delay_ms),
+                _bytes_guard: None,
             })
         })
     }
@@ -1348,6 +1680,7 @@ mod tests {
                     quality_score: score,
                     backend_index: idx,
                     duration: Duration::from_millis(delay_ms),
+                    _bytes_guard: None,
                 }),
             }
         })
@@ -1392,6 +1725,8 @@ mod tests {
             skip_binary_content_types: true,
             max_concurrent_sessions: 0,
             skip_extensions: Vec::new(),
+            max_backend_bytes_in_flight: 0, // unlimited for test mocks
+            backend_timeout_ms: 0,          // disabled for test mocks
         }
     }
 
@@ -1817,5 +2152,220 @@ mod tests {
             "https://example.com/page.html",
             &extras
         ));
+    }
+
+    // ---- BackendBytesGuard ----
+    //
+    // BACKEND_BYTES_IN_FLIGHT is a process-wide global atomic. Since tests
+    // run in parallel threads, we consolidate all counter-sensitive assertions
+    // into a single test function to guarantee sequential execution.
+
+    #[test]
+    fn test_bytes_guard_all() {
+        // --- acquire_unchecked + Drop ---
+        let base = BackendBytesGuard::in_flight();
+        {
+            let g = BackendBytesGuard::acquire_unchecked(1000);
+            assert_eq!(BackendBytesGuard::in_flight(), base + 1000);
+            drop(g);
+        }
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- try_acquire within limit ---
+        let g = BackendBytesGuard::try_acquire(500, base + 1000);
+        assert!(g.is_some());
+        assert_eq!(BackendBytesGuard::in_flight(), base + 500);
+        drop(g);
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- try_acquire exceeds limit ---
+        let hold = BackendBytesGuard::acquire_unchecked(800);
+        assert_eq!(BackendBytesGuard::in_flight(), base + 800);
+        let g = BackendBytesGuard::try_acquire(300, base + 1000);
+        assert!(g.is_none(), "should reject when would exceed limit");
+        assert_eq!(BackendBytesGuard::in_flight(), base + 800);
+        drop(hold);
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- try_acquire with limit=0 (unlimited) ---
+        let g = BackendBytesGuard::try_acquire(1_000_000, 0);
+        assert!(g.is_some(), "limit=0 means unlimited");
+        assert_eq!(BackendBytesGuard::in_flight(), base + 1_000_000);
+        drop(g);
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- multiple guards, selective drops ---
+        let g1 = BackendBytesGuard::acquire_unchecked(100);
+        let g2 = BackendBytesGuard::acquire_unchecked(200);
+        let g3 = BackendBytesGuard::acquire_unchecked(300);
+        assert_eq!(BackendBytesGuard::in_flight(), base + 600);
+        drop(g2);
+        assert_eq!(BackendBytesGuard::in_flight(), base + 400);
+        drop(g1);
+        drop(g3);
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- guard inside BackendResponse: full drop ---
+        let resp = BackendResponse {
+            page: crate::page::Page::default(),
+            quality_score: 90,
+            backend_index: 1,
+            duration: Duration::from_millis(50),
+            _bytes_guard: Some(BackendBytesGuard::acquire_unchecked(5000)),
+        };
+        assert_eq!(BackendBytesGuard::in_flight(), base + 5000);
+        drop(resp);
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- guard inside BackendResponse: partial move (page extracted) ---
+        {
+            let resp = BackendResponse {
+                page: crate::page::Page::default(),
+                quality_score: 90,
+                backend_index: 0,
+                duration: Duration::from_millis(10),
+                _bytes_guard: Some(BackendBytesGuard::acquire_unchecked(2000)),
+            };
+            assert_eq!(BackendBytesGuard::in_flight(), base + 2000);
+            let _page = resp.page;
+            // Remaining fields (including _bytes_guard) dropped at end of block.
+        }
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- build_backend_futures: skips when byte limit exceeded ---
+        let _hold = BackendBytesGuard::acquire_unchecked(1_000_000);
+        let cfg = ParallelBackendsConfig {
+            backends: vec![crate::configuration::BackendEndpoint {
+                engine: crate::configuration::BackendEngine::Cdp,
+                endpoint: Some("ws://localhost:9222".to_string()),
+                binary_path: None,
+                protocol: None,
+                proxy: None,
+            }],
+            max_backend_bytes_in_flight: base + 500, // well below current
+            ..Default::default()
+        };
+        let crawl_cfg = Arc::new(crate::configuration::Configuration::default());
+        let tracker = BackendTracker::new(2, 10);
+        let futs = build_backend_futures(
+            "https://example.com",
+            &cfg,
+            &crawl_cfg,
+            &tracker,
+            &None,
+            &None,
+        );
+        assert!(
+            futs.is_empty(),
+            "should skip backends when byte limit exceeded"
+        );
+        drop(_hold);
+        assert_eq!(BackendBytesGuard::in_flight(), base);
+
+        // --- thread safety: hammer the counter, verify no underflow ---
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..1000 {
+                        let g = BackendBytesGuard::acquire_unchecked(100);
+                        std::thread::yield_now();
+                        drop(g);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            BackendBytesGuard::in_flight(),
+            base,
+            "counter must return to baseline after concurrent thread usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_race_grace_zero_under_pressure_no_deadlock() {
+        // Simulate what happens when grace=0 (critical memory pressure path).
+        // This must not deadlock or panic.
+        let tracker = BackendTracker::new(3, 10);
+        let cfg = ParallelBackendsConfig {
+            grace_period_ms: 0,
+            ..Default::default()
+        };
+        let primary = mock_primary(50, 5);
+        let alt = mock_alt(1, 95, 1);
+        let result = race_backends(primary, vec![alt], &cfg, &tracker).await;
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_race_backends_drops_futs_before_return() {
+        // Verify that race_backends doesn't hold losing responses after
+        // returning. The primary fast-accepts; the slow alt should be
+        // aborted and dropped inside race_backends (not leaked to caller).
+        let tracker = BackendTracker::new(2, 10);
+        let cfg = test_config(200, 80);
+
+        // Primary: score=90 (above threshold=80), returns in 1ms.
+        let primary = mock_primary(90, 1);
+        // Alt: score=50, returns in 500ms — should be aborted.
+        let alt = mock_alt(1, 50, 500);
+
+        let result = race_backends(primary, vec![alt], &cfg, &tracker).await;
+        assert!(result.is_some());
+        let winner = result.unwrap();
+        // Primary wins via fast-accept.
+        assert_eq!(winner.backend_index, 0);
+        assert_eq!(winner.quality_score, 90);
+        // race_backends returned in ~1ms, not 500ms — alt was aborted.
+    }
+
+    #[tokio::test]
+    async fn test_race_backends_winner_replaces_losers() {
+        // When multiple alts complete during grace, only the best is returned.
+        // Others are dropped (not leaked).
+        let tracker = BackendTracker::new(4, 10);
+        let cfg = test_config(500, 95); // high threshold so grace period is used
+
+        let primary = mock_primary(40, 1); // low score, triggers grace
+        let alt1 = mock_alt(1, 60, 5);
+        let alt2 = mock_alt(2, 80, 10);
+        let alt3 = mock_alt(3, 70, 15);
+
+        let result = race_backends(primary, vec![alt1, alt2, alt3], &cfg, &tracker).await;
+        assert!(result.is_some());
+        let winner = result.unwrap();
+        // Best alt (score=80) should win.
+        assert_eq!(winner.backend_index, 2);
+        assert_eq!(winner.quality_score, 80);
+        // The other responses (primary=40, alt1=60, alt3=70) were dropped
+        // inside race_backends when futs was dropped before return.
+    }
+
+    #[test]
+    fn test_build_backend_futures_allows_when_byte_limit_not_exceeded() {
+        let cfg = ParallelBackendsConfig {
+            backends: vec![crate::configuration::BackendEndpoint {
+                engine: crate::configuration::BackendEngine::Cdp,
+                endpoint: Some("ws://localhost:9222".to_string()),
+                binary_path: None,
+                protocol: None,
+                proxy: None,
+            }],
+            max_backend_bytes_in_flight: usize::MAX,
+            ..Default::default()
+        };
+        let crawl_cfg = Arc::new(crate::configuration::Configuration::default());
+        let tracker = BackendTracker::new(2, 10);
+        // Should not panic or deadlock regardless of feature flags.
+        let _futs = build_backend_futures(
+            "https://example.com",
+            &cfg,
+            &crawl_cfg,
+            &tracker,
+            &None,
+            &None,
+        );
     }
 }

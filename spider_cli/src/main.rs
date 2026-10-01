@@ -3,16 +3,28 @@
     not(windows),
     not(target_os = "android"),
     not(target_env = "musl"),
-    feature = "jemalloc"
+    feature = "jemalloc",
+    not(feature = "mimalloc")
 ))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// mimalloc — alternative high-performance allocator with thread-local caches
+#[cfg(all(
+    not(windows),
+    not(target_os = "android"),
+    not(target_env = "musl"),
+    feature = "mimalloc"
+))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 extern crate env_logger;
 extern crate serde_json;
 extern crate spider;
 
 pub mod build_folders;
+pub mod oauth;
 pub mod options;
 
 use clap::Parser;
@@ -20,6 +32,45 @@ use options::{Cli, Commands};
 use tokio::io::AsyncWriteExt;
 
 use serde_json::{json, Value};
+
+/// Path to the Spider Cloud credentials file (~/.spider/credentials).
+fn credentials_path() -> Option<std::path::PathBuf> {
+    dirs_home().map(|h| h.join(".spider").join("credentials"))
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+}
+
+/// Read a stored Spider Cloud API key from ~/.spider/credentials.
+fn load_api_key() -> Option<String> {
+    let path = credentials_path()?;
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Persist a Spider Cloud API key to ~/.spider/credentials.
+fn save_api_key(key: &str) -> std::io::Result<()> {
+    let path = credentials_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot determine home directory",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, key.trim())
+}
 
 use spider_transformations::transformation::content::{
     transform_content_input, ReturnFormat, TransformConfig, TransformInput,
@@ -154,6 +205,57 @@ async fn main() {
         env_logger::init_from_env(env);
     }
 
+    // Handle the authenticate command early — it doesn't need a URL.
+    if let Some(Commands::AUTHENTICATE { api_key, paste }) = &cli.command {
+        use std::io::IsTerminal;
+
+        let key = if let Some(k) = api_key {
+            k.clone()
+        } else if *paste || !std::io::stdin().is_terminal() {
+            // Explicit --paste, or a piped key (scripting): read it from stdin.
+            eprint!("Enter your Spider Cloud API key: ");
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_line(&mut buf)
+                .expect("failed to read API key from stdin");
+            buf.trim().to_string()
+        } else {
+            // Interactive: sign in through the browser and provision a key.
+            match oauth::login().await {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Sign-in failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        if key.is_empty() {
+            eprintln!("Error: API key cannot be empty.");
+            std::process::exit(1);
+        }
+
+        match save_api_key(&key) {
+            Ok(()) => {
+                if let Some(path) = credentials_path() {
+                    println!("API key saved to {}", path.display());
+                } else {
+                    println!("API key saved.");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to save API key: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if cli.url.is_empty() {
+        eprintln!("Error: --url is required for crawl/scrape/download commands.");
+        std::process::exit(1);
+    }
+
     let url = if cli.url.starts_with("http") {
         cli.url
     } else {
@@ -261,6 +363,55 @@ async fn main() {
             });
     }
 
+    // Cache namespace (partition key for country / proxy pool / tenant / …).
+    // Flag first, then SPIDER_CACHE_NAMESPACE env var.
+    {
+        let ns = cli
+            .cache_namespace
+            .clone()
+            .or_else(|| std::env::var("SPIDER_CACHE_NAMESPACE").ok())
+            .filter(|s| !s.is_empty());
+        if let Some(ns) = ns {
+            website.with_cache_namespace(Some(ns));
+        }
+    }
+
+    // Resolve Spider Cloud API key: --spider-cloud-key > SPIDER_CLOUD_API_KEY env > stored credentials.
+    {
+        let api_key = cli
+            .spider_cloud_key
+            .or_else(|| std::env::var("SPIDER_CLOUD_API_KEY").ok())
+            .or_else(load_api_key);
+
+        if let Some(key) = api_key {
+            #[cfg(feature = "spider_cloud")]
+            {
+                if cli.spider_cloud_browser {
+                    website.with_spider_browser(&key);
+                } else {
+                    use spider::configuration::{SpiderCloudConfig, SpiderCloudMode};
+
+                    let mode = match cli.spider_cloud_mode.as_deref() {
+                        Some("proxy") => SpiderCloudMode::Proxy,
+                        Some("unblocker") => SpiderCloudMode::Unblocker,
+                        Some("fallback") => SpiderCloudMode::Fallback,
+                        Some("smart") => SpiderCloudMode::Smart,
+                        // api is the default mode.
+                        _ => SpiderCloudMode::Api,
+                    };
+
+                    let config = SpiderCloudConfig::new(&key).with_mode(mode);
+                    website.with_spider_cloud_config(config);
+                }
+            }
+            #[cfg(not(feature = "spider_cloud"))]
+            {
+                let _ = key;
+                eprintln!("Warning: Spider Cloud API key provided but the `spider_cloud` feature is not enabled. Ignoring.");
+            }
+        }
+    }
+
     let return_headers = cli.return_headers;
     let use_headless = cli.headless && !cli.http;
     let return_format = cli.return_format.clone();
@@ -269,7 +420,7 @@ async fn main() {
         .build()
     {
         Ok(mut website) => {
-            let mut rx2 = website.subscribe(0).expect("sync feature required");
+            let mut rx2 = website.subscribe(0);
 
             match cli.command {
                 Some(Commands::CRAWL {
@@ -373,8 +524,14 @@ async fn main() {
                         website.configuration.return_page_links = true;
                     }
 
+                    // Scrape returns the page content by default (markdown via
+                    // --return-format); --output-html returns the raw HTML instead.
                     let transform_conf = TransformConfig {
-                        return_format: ReturnFormat::from_str(&return_format),
+                        return_format: if output_html {
+                            ReturnFormat::Raw
+                        } else {
+                            ReturnFormat::from_str(&return_format)
+                        },
                         ..Default::default()
                     };
 
@@ -384,7 +541,7 @@ async fn main() {
                     });
 
                     while let Ok(res) = rx2.recv().await {
-                        let content = if output_html {
+                        let content = {
                             let input = TransformInput {
                                 url: res.get_url_parsed_ref().as_ref(),
                                 content: res.get_html_bytes_u8(),
@@ -394,8 +551,6 @@ async fn main() {
                                 ignore_tags: None,
                             };
                             transform_content_input(input, &transform_conf)
-                        } else {
-                            Default::default()
                         };
 
                         let page_json = json!({
@@ -426,6 +581,7 @@ async fn main() {
                         }
                     }
                 }
+                Some(Commands::AUTHENTICATE { .. }) => {},
                 None => ()
             }
         }

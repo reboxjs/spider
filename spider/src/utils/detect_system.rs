@@ -82,11 +82,12 @@ fn process_memory_pressure_pct() -> u64 {
         std::env::var("SPIDER_MEMORY_PRESSURE_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(70)
+            .unwrap_or(90) // 90% — high but tolerable, start being selective
     })
 }
 
-/// The critical threshold percentage for process RSS (default 85%).
+/// The critical threshold percentage for process RSS (default 95%).
+/// At this level OOM is imminent — spool aggressively to survive.
 #[cfg(feature = "balance")]
 fn process_memory_critical_pct() -> u64 {
     static VAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -94,7 +95,7 @@ fn process_memory_critical_pct() -> u64 {
         std::env::var("SPIDER_MEMORY_CRITICAL_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(85)
+            .unwrap_or(95) // 95% — OOM imminent, spool everything
     })
 }
 
@@ -121,8 +122,7 @@ fn update_process_memory(sys: &mut System) {
         if let Some(process) = sys.process(pid) {
             let rss = process.memory();
             let total = sys.total_memory();
-            if total > 0 {
-                let pct = (rss * 100) / total;
+            if let Some(pct) = (rss * 100).checked_div(total) {
                 PROCESS_MEMORY_STATE.store(determine_process_memory_state(pct), Ordering::Relaxed);
             }
         }
@@ -161,6 +161,9 @@ async fn update_cpu_usage() {
             update_cpu(&mut sys);
             update_memory(&mut sys);
             update_process_memory(&mut sys);
+            // Push the latest memory state into the html_spool cache so
+            // should_spool() reads a single atomic instead of re-querying.
+            crate::utils::html_spool::refresh_cached_mem_state();
             sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
         }
     }
@@ -182,9 +185,25 @@ pub async fn get_global_cpu_state() -> i8 {
     CPU_STATE.load(Ordering::Relaxed)
 }
 
+/// Get CPU state without async overhead.
+#[cfg(feature = "balance")]
+pub fn get_global_cpu_state_sync() -> i8 {
+    if INIT.initialized() {
+        CPU_STATE.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Get the cpu usage being used state utility.
 #[cfg(not(feature = "balance"))]
 pub async fn get_global_cpu_state() -> i8 {
+    0
+}
+
+/// Get CPU state without async overhead (no-op without balance).
+#[cfg(not(feature = "balance"))]
+pub fn get_global_cpu_state_sync() -> i8 {
     0
 }
 
@@ -195,15 +214,42 @@ pub async fn get_global_memory_state() -> i8 {
     MEMORY_STATE.load(Ordering::Relaxed)
 }
 
+/// Get the memory state without async overhead.
+///
+/// Returns the cached atomic value if the background monitor is already
+/// initialized, otherwise returns 0 (no pressure). This avoids the
+/// `OnceCell` poll + waker machinery on every call in hot paths like
+/// `insert_link` / `insert_signature`.
+#[cfg(all(feature = "disk", feature = "balance"))]
+pub fn get_global_memory_state_sync() -> i8 {
+    if INIT.initialized() {
+        MEMORY_STATE.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Get the memory usage being used state utility.
 #[cfg(all(feature = "disk", not(feature = "balance")))]
 pub async fn get_global_memory_state() -> i8 {
     0
 }
 
+/// Get the memory state without async overhead (no-op without balance).
+#[cfg(all(feature = "disk", not(feature = "balance")))]
+pub fn get_global_memory_state_sync() -> i8 {
+    0
+}
+
 /// Get the memory usage being used state utility.
 #[cfg(not(feature = "disk"))]
 pub async fn get_global_memory_state() -> i8 {
+    0
+}
+
+/// Get the memory state without async overhead (no-op without disk).
+#[cfg(not(feature = "disk"))]
+pub fn get_global_memory_state_sync() -> i8 {
     0
 }
 
@@ -215,9 +261,25 @@ pub async fn get_process_memory_state() -> i8 {
     PROCESS_MEMORY_STATE.load(Ordering::Relaxed)
 }
 
+/// Get process RSS memory state without async overhead.
+#[cfg(feature = "balance")]
+pub fn get_process_memory_state_sync() -> i8 {
+    if INIT.initialized() {
+        PROCESS_MEMORY_STATE.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Get the process RSS memory pressure state (no-op without balance).
 #[cfg(not(feature = "balance"))]
 pub async fn get_process_memory_state() -> i8 {
+    0
+}
+
+/// Get process RSS memory state without async overhead (no-op without balance).
+#[cfg(not(feature = "balance"))]
+pub fn get_process_memory_state_sync() -> i8 {
     0
 }
 
@@ -238,12 +300,12 @@ mod tests {
 
     #[test]
     fn test_determine_process_memory_state_all_states() {
-        // Default thresholds: pressure=70, critical=85
+        // Default thresholds: pressure=90, critical=95
         assert_eq!(determine_process_memory_state(0), 0);
-        assert_eq!(determine_process_memory_state(69), 0);
-        assert_eq!(determine_process_memory_state(70), 1);
-        assert_eq!(determine_process_memory_state(84), 1);
-        assert_eq!(determine_process_memory_state(85), 2);
+        assert_eq!(determine_process_memory_state(89), 0);
+        assert_eq!(determine_process_memory_state(90), 1);
+        assert_eq!(determine_process_memory_state(94), 1);
+        assert_eq!(determine_process_memory_state(95), 2);
         assert_eq!(determine_process_memory_state(100), 2);
     }
 

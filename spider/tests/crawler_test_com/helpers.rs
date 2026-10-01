@@ -69,7 +69,7 @@ pub async fn crawl_collect_http(path: &str, budget: u32, depth: usize) -> Vec<Pa
         .with_crawl_timeout(Some(CRAWL_TIMEOUT));
 
     let mut w = website.clone();
-    let mut rx = w.subscribe(16).expect("subscribe");
+    let mut rx = w.subscribe(16);
     let (done_tx, mut done_rx) = spider::tokio::sync::oneshot::channel::<()>();
 
     let crawl = async move {
@@ -111,7 +111,7 @@ pub async fn crawl_collect_smart(path: &str, budget: u32, depth: usize) -> Vec<P
         .with_crawl_timeout(Some(CRAWL_TIMEOUT));
 
     let mut w = website.clone();
-    let mut rx = w.subscribe(16).expect("subscribe");
+    let mut rx = w.subscribe(16);
     let (done_tx, mut done_rx) = spider::tokio::sync::oneshot::channel::<()>();
 
     let crawl = async move {
@@ -154,7 +154,7 @@ pub async fn fetch_page_chrome(path: &str) -> Option<Page> {
         .with_crawl_timeout(Some(CRAWL_TIMEOUT));
 
     let mut w = website.clone();
-    let mut rx = w.subscribe(4).expect("subscribe");
+    let mut rx = w.subscribe(4);
     let (done_tx, mut done_rx) = spider::tokio::sync::oneshot::channel::<()>();
 
     let crawl = async move {
@@ -199,7 +199,7 @@ pub fn extract_tag_content(html: &str, tag: &str) -> Option<String> {
 pub fn extract_canonical(html: &str) -> Option<String> {
     let lower = html.to_lowercase();
     let idx = lower.find("rel=\"canonical\"")?;
-    let snippet_start = if idx > 200 { idx - 200 } else { 0 };
+    let snippet_start = idx.saturating_sub(200);
     let snippet_end = (idx + 200).min(html.len());
     let snippet = &html[snippet_start..snippet_end];
     let href_idx = snippet.to_lowercase().find("href=\"")?;
@@ -212,7 +212,7 @@ pub fn extract_canonical(html: &str) -> Option<String> {
 pub fn extract_meta_description(html: &str) -> Option<String> {
     let lower = html.to_lowercase();
     let idx = lower.find("name=\"description\"")?;
-    let snippet_start = if idx > 300 { idx - 300 } else { 0 };
+    let snippet_start = idx.saturating_sub(300);
     let snippet_end = (idx + 300).min(html.len());
     let snippet = &html[snippet_start..snippet_end];
     let lower_snippet = snippet.to_lowercase();

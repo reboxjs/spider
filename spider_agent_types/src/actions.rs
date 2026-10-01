@@ -94,6 +94,12 @@ pub enum ActionType {
     },
     /// Wait for the next navigation event.
     WaitForNavigation,
+    /// Wait for the page load event (readyState complete).
+    WaitForLoad,
+    /// Wait for zero in-flight network connections (CDP networkIdle).
+    WaitForNetworkIdle,
+    /// Wait for ≤2 in-flight network connections (CDP networkAlmostIdle).
+    WaitForNetworkAlmostIdle,
     /// Wait for DOM updates to stop.
     WaitForDom {
         /// Optional selector to watch (defaults to body).
@@ -125,6 +131,22 @@ pub enum ActionType {
     Extract,
     /// Only continue if prior step was valid (chain control).
     ValidateChain,
+    /// Run a Python script in the embedded pure-Rust interpreter (rustpython-vm).
+    RunPython {
+        /// Python source code.
+        code: String,
+        /// Optional per-call timeout in milliseconds (falls back to engine default).
+        timeout_ms: Option<u64>,
+    },
+    /// Run a JavaScript script in the embedded pure-Rust interpreter (boa_engine).
+    ///
+    /// Distinct from `Script`/`Evaluate` which runs JS in the page's real browser context.
+    RunJavaScript {
+        /// JavaScript source code.
+        code: String,
+        /// Optional per-call timeout in milliseconds (falls back to engine default).
+        timeout_ms: Option<u64>,
+    },
     /// Custom action.
     Custom(String),
 }
@@ -172,6 +194,9 @@ impl std::fmt::Display for ActionType {
                 write!(f, "wait_for_timeout:{}:{}ms", selector, timeout)
             }
             Self::WaitForNavigation => write!(f, "wait_for_navigation"),
+            Self::WaitForLoad => write!(f, "wait_for_load"),
+            Self::WaitForNetworkIdle => write!(f, "wait_for_network_idle"),
+            Self::WaitForNetworkAlmostIdle => write!(f, "wait_for_network_almost_idle"),
             Self::WaitForDom { selector, timeout } => {
                 write!(f, "wait_for_dom:{:?}:{}ms", selector, timeout)
             }
@@ -187,6 +212,18 @@ impl std::fmt::Display for ActionType {
             Self::Refresh => write!(f, "refresh"),
             Self::Extract => write!(f, "extract"),
             Self::ValidateChain => write!(f, "validate_chain"),
+            Self::RunPython { code, timeout_ms } => write!(
+                f,
+                "run_python:{}b:{:?}ms",
+                code.len(),
+                timeout_ms.unwrap_or(0)
+            ),
+            Self::RunJavaScript { code, timeout_ms } => write!(
+                f,
+                "run_javascript:{}b:{:?}ms",
+                code.len(),
+                timeout_ms.unwrap_or(0)
+            ),
             Self::Custom(name) => write!(f, "custom:{}", name),
         }
     }

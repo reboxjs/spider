@@ -33,10 +33,29 @@ mod inner {
     /// Whether the io_uring FS worker is running and healthy.
     static URING_FS_ENABLED: AtomicBool = AtomicBool::new(false);
 
-    /// Channel to the io_uring worker thread.
-    /// `mpsc::UnboundedSender` is `Send + Sync`, safe for `OnceLock`.
-    static URING_FS_POOL: std::sync::OnceLock<mpsc::UnboundedSender<FileIoTask>> =
-        std::sync::OnceLock::new();
+    /// Round-robin pool of io_uring worker threads. Each worker owns its own
+    /// ring and services tasks serially; the pool fans tasks across workers
+    /// so multiple `submit_and_wait(1)` calls can run in parallel on
+    /// different rings instead of queueing behind one thread.
+    struct UringFsPool {
+        senders: Box<[mpsc::UnboundedSender<FileIoTask>]>,
+        next: std::sync::atomic::AtomicUsize,
+    }
+
+    static URING_FS_POOL: std::sync::OnceLock<UringFsPool> = std::sync::OnceLock::new();
+
+    /// Number of io_uring worker threads to spawn. Default 2. Override via
+    /// `SPIDER_URING_WORKERS` (clamped to 1..=16).
+    fn worker_count() -> usize {
+        static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            std::env::var("SPIDER_URING_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|n| n.clamp(1, 16))
+                .unwrap_or(2)
+        })
+    }
 
     /// A self-contained I/O task sent to the worker thread.
     enum FileIoTask {
@@ -356,7 +375,7 @@ mod inner {
         ring: &mut io_uring::IoUring,
         addr: std::net::SocketAddr,
     ) -> io::Result<std::net::TcpStream> {
-        use std::os::unix::io::FromRawFd;
+        use std::os::fd::{FromRawFd, OwnedFd};
 
         let domain = match addr {
             std::net::SocketAddr::V4(_) => libc::AF_INET,
@@ -384,6 +403,10 @@ mod inner {
             return Err(io::Error::from_raw_os_error(-fd));
         }
 
+        // Own the descriptor immediately so every early return closes it.
+        // SAFETY: the successful Socket completion returned a fresh owned fd.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+
         // ── TCP Fast Open ────────────────────────────────────────────────────
         // Set TCP_FASTOPEN_CONNECT before connect — saves 1 RTT for repeat hosts.
         #[cfg(feature = "tcp_fastopen")]
@@ -404,9 +427,13 @@ mod inner {
 
         // ── Connect ─────────────────────────────────────────────────────────
         // Build sockaddr on the stack — must live until submit_and_reap returns.
+        // The storage must be outside the match arms: returning a raw pointer
+        // to an arm-local value leaves Connect reading dead stack storage.
+        let sa_v4;
+        let sa_v6;
         let (sa_ptr, sa_len) = match addr {
             std::net::SocketAddr::V4(v4) => {
-                let sa = libc::sockaddr_in {
+                sa_v4 = libc::sockaddr_in {
                     sin_family: libc::AF_INET as libc::sa_family_t,
                     sin_port: v4.port().to_be(),
                     sin_addr: libc::in_addr {
@@ -414,12 +441,12 @@ mod inner {
                     },
                     sin_zero: [0; 8],
                 };
-                // SAFETY: sa lives on the stack until after submit_and_reap.
-                let ptr = &sa as *const libc::sockaddr_in as *const libc::sockaddr;
+                // SAFETY: sa_v4 lives until after submit_and_reap below.
+                let ptr = &sa_v4 as *const libc::sockaddr_in as *const libc::sockaddr;
                 (ptr, std::mem::size_of::<libc::sockaddr_in>() as u32)
             }
             std::net::SocketAddr::V6(v6) => {
-                let sa = libc::sockaddr_in6 {
+                sa_v6 = libc::sockaddr_in6 {
                     sin6_family: libc::AF_INET6 as libc::sa_family_t,
                     sin6_port: v6.port().to_be(),
                     sin6_flowinfo: v6.flowinfo(),
@@ -428,7 +455,7 @@ mod inner {
                     },
                     sin6_scope_id: v6.scope_id(),
                 };
-                let ptr = &sa as *const libc::sockaddr_in6 as *const libc::sockaddr;
+                let ptr = &sa_v6 as *const libc::sockaddr_in6 as *const libc::sockaddr;
                 (ptr, std::mem::size_of::<libc::sockaddr_in6>() as u32)
             }
         };
@@ -439,11 +466,9 @@ mod inner {
 
         // SAFETY: sockaddr struct on the stack is alive until submit_and_reap returns.
         unsafe {
-            ring.submission().push(&connect_e).map_err(|_| {
-                // Close the socket on error.
-                libc::close(fd);
-                io::Error::other("io_uring: SQ full on connect")
-            })?;
+            ring.submission()
+                .push(&connect_e)
+                .map_err(|_| io::Error::other("io_uring: SQ full on connect"))?;
         }
 
         let res = submit_and_reap(ring)?;
@@ -452,14 +477,10 @@ mod inner {
         // it before returning the CQE, so res==0 means connected.
         // Any other negative value is an error.
         if res < 0 && res != -libc::EINPROGRESS {
-            // Close the fd we created.
-            let _ = uring_close(ring, fd);
             return Err(io::Error::from_raw_os_error(-res));
         }
 
-        // SAFETY: we own this fd, it's a valid connected TCP socket.
-        let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        Ok(stream)
+        Ok(std::net::TcpStream::from(socket))
     }
 
     // ── io_uring TCP send/recv ────────────────────────────────────────────
@@ -632,32 +653,73 @@ mod inner {
 
         // Probe: try to create a ring. Fails gracefully on AWS AL2, ECS,
         // Lambda, seccomp-filtered containers, kernels < 5.1, etc.
-        let ring = match probe_io_uring() {
+        let probe = match probe_io_uring() {
             Some(r) => r,
             None => return false,
         };
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let builder = std::thread::Builder::new().name("uring-fs-worker".into());
+        let n = worker_count();
+        let mut senders: Vec<mpsc::UnboundedSender<FileIoTask>> = Vec::with_capacity(n);
 
-        match builder.spawn(move || worker_loop(rx, ring)) {
-            Ok(_) => {
-                if URING_FS_POOL.set(tx).is_ok() {
-                    URING_FS_ENABLED.store(true, Ordering::Release);
-                }
-                // If set() failed, another thread won the race. Our worker
-                // will exit when its rx is dropped — no leak.
-            }
+        // Worker 0 reuses the probe ring — don't waste the successful build.
+        let (tx0, rx0) = mpsc::unbounded_channel();
+        match std::thread::Builder::new()
+            .name("uring-fs-worker-0".into())
+            .spawn(move || worker_loop(rx0, probe))
+        {
+            Ok(_) => senders.push(tx0),
             Err(e) => {
-                log::warn!("Failed to spawn io_uring FS worker thread: {}", e);
+                log::warn!("Failed to spawn io_uring FS worker 0: {}", e);
                 return false;
             }
         }
 
+        // Additional workers each build their own ring. Partial failure is
+        // fine: we run with however many workers we managed to start.
+        for i in 1..n {
+            let ring = match io_uring::IoUring::builder().build(64) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "io_uring worker {i}: ring build failed ({e}); stopping pool growth"
+                    );
+                    break;
+                }
+            };
+            let (tx, rx) = mpsc::unbounded_channel();
+            match std::thread::Builder::new()
+                .name(format!("uring-fs-worker-{i}"))
+                .spawn(move || worker_loop(rx, ring))
+            {
+                Ok(_) => senders.push(tx),
+                Err(e) => {
+                    log::warn!("io_uring worker {i}: spawn failed ({e}); stopping pool growth");
+                    break;
+                }
+            }
+        }
+
+        if senders.is_empty() {
+            return false;
+        }
+
+        let pool = UringFsPool {
+            senders: senders.into_boxed_slice(),
+            next: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        if URING_FS_POOL.set(pool).is_ok() {
+            URING_FS_ENABLED.store(true, Ordering::Release);
+        }
+        // If set() failed, another thread won the race. Our senders drop at
+        // end of scope → workers exit cleanly when their rx is dropped.
+
         URING_FS_ENABLED.load(Ordering::Acquire)
     }
 
-    /// Send a task to the io_uring worker and await the result.
+    /// Send a task to an io_uring worker and await the result. Tasks are
+    /// dispatched round-robin across the worker pool so concurrent file I/O
+    /// runs on parallel rings instead of serializing on one.
     /// Returns `None` if io_uring is not available (caller falls back).
     async fn try_uring<T>(
         make_task: impl FnOnce(oneshot::Sender<io::Result<T>>) -> FileIoTask,
@@ -665,7 +727,13 @@ mod inner {
         if !URING_FS_ENABLED.load(Ordering::Acquire) {
             return None;
         }
-        let sender = URING_FS_POOL.get()?;
+        let pool = URING_FS_POOL.get()?;
+        let len = pool.senders.len();
+        if len == 0 {
+            return None;
+        }
+        let idx = pool.next.fetch_add(1, Ordering::Relaxed) % len;
+        let sender = &pool.senders[idx];
         let (tx, rx) = oneshot::channel();
         if sender.send(make_task(tx)).is_err() {
             return Some(Err(io::Error::new(
@@ -886,6 +954,68 @@ mod inner {
     pub fn is_uring_enabled() -> bool {
         URING_FS_ENABLED.load(Ordering::Acquire)
     }
+
+    /// Read a file and feed it chunk-by-chunk to a callback.
+    ///
+    /// **Optimal strategy per platform:**
+    /// - io_uring available: single kernel-async read, chunk from memory
+    ///   (1 syscall, zero spawn_blocking).
+    /// - Fallback: stream via `tokio::fs::File` + `BufReader` so the full
+    ///   file is never in memory (bounded by `chunk_size`).
+    ///
+    /// Returns total bytes read.  The callback can return `false` to stop
+    /// early (e.g. on a parse error).
+    pub async fn read_file_chunked(
+        path: String,
+        chunk_size: usize,
+        mut cb: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<usize> {
+        let chunk_size = chunk_size.max(1);
+
+        // Fast path: io_uring single read → chunk from memory.
+        if let Some(result) = try_uring(|tx| FileIoTask::ReadFile {
+            path: path.clone(),
+            tx,
+        })
+        .await
+        {
+            let data = result?;
+            let mut total = 0usize;
+            for (i, chunk) in data.chunks(chunk_size).enumerate() {
+                total += chunk.len();
+                if !cb(chunk) {
+                    break;
+                }
+                // Yield every 8 chunks (~512 KiB at 64 KiB chunks) so
+                // CPU-heavy consumers don't starve the executor.
+                // `consume_budget` is a no-op when the task's coop
+                // budget isn't exhausted, avoiding scheduler trips on
+                // the hot path while still being cooperative.
+                if i & 7 == 7 {
+                    tokio::task::consume_budget().await;
+                }
+            }
+            return Ok(total);
+        }
+
+        // Fallback: stream via tokio::fs, bounded memory.
+        use tokio::io::AsyncReadExt;
+        let file = tokio::fs::File::open(&path).await?;
+        let mut reader = tokio::io::BufReader::with_capacity(chunk_size, file);
+        let mut buf = vec![0u8; chunk_size];
+        let mut total = 0usize;
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if !cb(&buf[..n]) {
+                break;
+            }
+        }
+        Ok(total)
+    }
 }
 
 // ── Fallback implementation (non-Linux or no io_uring feature) ───────────────
@@ -1031,6 +1161,32 @@ mod inner {
     pub fn is_uring_enabled() -> bool {
         false
     }
+
+    /// Read a file and feed it chunk-by-chunk to a callback.
+    /// Non-uring fallback: streams via `tokio::fs::File` + `BufReader`.
+    pub async fn read_file_chunked(
+        path: String,
+        chunk_size: usize,
+        mut cb: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<usize> {
+        use tokio::io::AsyncReadExt;
+        let chunk_size = chunk_size.max(1);
+        let file = tokio::fs::File::open(&path).await?;
+        let mut reader = tokio::io::BufReader::with_capacity(chunk_size, file);
+        let mut buf = vec![0u8; chunk_size];
+        let mut total = 0usize;
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if !cb(&buf[..n]) {
+                break;
+            }
+        }
+        Ok(total)
+    }
 }
 
 // ── Re-exports ───────────────────────────────────────────────────────────────
@@ -1039,6 +1195,7 @@ pub use inner::create_dir_all;
 pub use inner::init_uring_fs;
 pub use inner::is_uring_enabled;
 pub use inner::read_file;
+pub use inner::read_file_chunked;
 pub use inner::remove_file;
 pub use inner::tcp_connect;
 pub use inner::write_file;

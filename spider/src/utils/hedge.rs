@@ -87,13 +87,19 @@ impl HedgeTracker {
             self.ema_ms.store(ms, Ordering::Relaxed);
             self.ema_sq_ms.store(ms_sq, Ordering::Relaxed);
         } else {
-            // EMA with alpha ≈ 0.2 (integer math: new = old * 4/5 + sample * 1/5)
-            let old = self.ema_ms.load(Ordering::Relaxed);
-            self.ema_ms.store((old * 4 + ms) / 5, Ordering::Relaxed);
+            // EMA with alpha ≈ 0.2 (integer math: new = old * 4/5 + sample * 1/5).
+            // CAS loop ensures concurrent record() calls don't lose updates.
+            let _ = self
+                .ema_ms
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some((old * 4 + ms) / 5)
+                });
 
-            let old_sq = self.ema_sq_ms.load(Ordering::Relaxed);
-            self.ema_sq_ms
-                .store((old_sq * 4 + ms_sq) / 5, Ordering::Relaxed);
+            let _ = self
+                .ema_sq_ms
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old_sq| {
+                    Some((old_sq * 4 + ms_sq) / 5)
+                });
         }
     }
 
@@ -127,8 +133,10 @@ impl HedgeTracker {
     pub fn should_hedge(&self, elapsed: Duration) -> bool {
         let count = self.samples.load(Ordering::Relaxed);
         if count < self.min_samples {
-            // During warmup, always allow hedging (fall back to config delay)
-            return true;
+            // During warmup, skip hedging — we don't have enough latency
+            // data to know whether a request is actually slow. Firing
+            // hedges blindly wastes connections (especially Chrome WS tabs).
+            return false;
         }
 
         let ema = self.ema_ms.load(Ordering::Relaxed);
@@ -191,6 +199,11 @@ impl HedgeTracker {
     /// Get the number of samples recorded.
     pub fn sample_count(&self) -> u64 {
         self.samples.load(Ordering::Relaxed)
+    }
+
+    /// Get the total number of hedge races fired.
+    pub fn hedge_fires(&self) -> u64 {
+        self.hedge_fires.load(Ordering::Relaxed)
     }
 
     /// Get the hedge win rate as a percentage (0–100). Returns 0 if no hedges fired.
@@ -628,8 +641,9 @@ mod tests {
     #[test]
     fn test_tracker_warmup_phase() {
         let tracker = HedgeTracker::new(2.0, 5);
-        // During warmup (< min_samples), should_hedge always returns true
-        assert!(tracker.should_hedge(Duration::from_millis(1)));
+        // During warmup (< min_samples), should_hedge returns false —
+        // we don't have enough data to know if a request is slow.
+        assert!(!tracker.should_hedge(Duration::from_millis(1)));
         assert_eq!(tracker.sample_count(), 0);
     }
 

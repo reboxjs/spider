@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 #![allow(clippy::perf)]
 #![allow(clippy::borrowed_box)]
@@ -74,7 +75,7 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     let mut website: Website = Website::new("https://spider.cloud");
-//!     let mut rx2 = website.subscribe(16).unwrap();
+//!     let mut rx2 = website.subscribe(16);
 //!
 //!     tokio::spawn(async move {
 //!         while let Ok(res) = rx2.recv().await {
@@ -89,25 +90,40 @@
 //! ## Spider Cloud Integration
 //!
 //! Use [Spider Cloud](https://spider.cloud) for anti-bot bypass, proxy rotation, and high-throughput
-//! data collection. Enable the `spider_cloud` feature and set your API key:
+//! data collection. Enable the `spider_cloud` feature and set your API key.
+//! Set `return_format` to `"markdown"` for clean LLM-ready output:
 //!
-//! ```no_run
+//! ```ignore
+//! use spider::configuration::{SpiderCloudConfig, SpiderCloudMode, SpiderCloudReturnFormat};
 //! use spider::tokio;
 //! use spider::website::Website;
 //!
 //! #[tokio::main]
 //! async fn main() {
+//!     let config = SpiderCloudConfig::new("YOUR_API_KEY")
+//!         .with_mode(SpiderCloudMode::Smart)
+//!         .with_return_format(SpiderCloudReturnFormat::Markdown);
+//!
 //!     let mut website: Website = Website::new("https://example.com")
-//!         .with_spider_cloud("YOUR_API_KEY")
 //!         .with_limit(10)
+//!         .with_spider_cloud_config(config)
 //!         .build()
 //!         .unwrap();
 //!
-//!     website.crawl().await;
+//!     let mut rx = website.subscribe(16);
 //!
-//!     for link in website.get_links() {
-//!         println!("- {:?}", link.as_ref());
-//!     }
+//!     tokio::spawn(async move {
+//!         while let Ok(page) = rx.recv().await {
+//!             let url = page.get_url();
+//!             let markdown = page.get_content();
+//!             let status = page.status_code;
+//!
+//!             println!("[{status}] {url}\n---\n{markdown}\n");
+//!         }
+//!     });
+//!
+//!     website.crawl().await;
+//!     website.unsubscribe();
 //! }
 //! ```
 //!
@@ -128,7 +144,7 @@
 //!         .build()
 //!         .unwrap();
 //!
-//!     let mut rx = website.subscribe(16).unwrap();
+//!     let mut rx = website.subscribe(16);
 //!
 //!     tokio::spawn(async move {
 //!         while let Ok(page) = rx.recv().await {
@@ -376,10 +392,28 @@ pub mod client;
 pub mod configuration;
 /// Optional features to use.
 pub mod features;
+/// Pluggable in-process HTTP fetch engine. Replaces only spider's inner
+/// body-fetch step while keeping the surrounding retry / cache / watchdog
+/// / hedge machinery wrapped around it. Opt-in at runtime via
+/// [`Website::with_fetch_engine`](crate::website::Website::with_fetch_engine);
+/// default `None` keeps every fetch on spider's reqwest path (like the
+/// ungated [`fetcher`] hook).
+pub mod fetch_engine;
+/// Optional remote-fetch hook — replaces spider's built-in per-URL
+/// network round-trip with a user-supplied transport while leaving
+/// every other crawl concern (tracking, scheduling, link extraction,
+/// subscription channels) in spider's hands. Opt-in via
+/// [`Website::with_remote_fetcher`](crate::website::Website::with_remote_fetcher);
+/// default behavior unchanged when unset.
+pub mod fetcher;
 /// Internal packages customized.
 pub mod packages;
 /// A page scraped.
 pub mod page;
+/// Per-request proxy routing strategy.
+pub mod proxy_strategy;
+/// Configurable retry strategy for advanced retry logic.
+pub mod retry_strategy;
 /// Trait abstractions for core types.
 pub mod traits;
 /// Application utils.

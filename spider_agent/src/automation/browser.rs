@@ -10,6 +10,11 @@ use chromiumoxide::{
     cdp::browser_protocol::page::CaptureScreenshotFormat, layout::Point, page::ScreenshotParams,
     Page,
 };
+#[cfg(feature = "chrome")]
+use futures::StreamExt;
+
+#[cfg(feature = "skills")]
+use super::truncate_utf8_head;
 
 use super::{
     clean_html_with_profile, parse_tool_calls, tool_calls_to_steps, truncate_utf8_tail, ActResult,
@@ -78,6 +83,8 @@ pub(crate) struct ActionOutcome {
     pub success: bool,
     /// Human-readable detail when the action failed (e.g. "selector not found").
     pub error: Option<String>,
+    /// Optional success-side output to surface back to the LLM (e.g. script stdout).
+    pub output: Option<String>,
 }
 
 #[cfg(feature = "chrome")]
@@ -88,6 +95,7 @@ impl ActionOutcome {
             action: action.into(),
             success: true,
             error: None,
+            output: None,
         }
     }
 
@@ -97,13 +105,28 @@ impl ActionOutcome {
             action: action.into(),
             success: false,
             error: Some(reason.into()),
+            output: None,
         }
+    }
+
+    /// Attach a success-side output payload (e.g. captured stdout from a script).
+    #[cfg(feature = "scripting")]
+    pub fn with_output(mut self, output: impl Into<String>) -> Self {
+        self.output = Some(output.into());
+        self
     }
 
     /// Format as a compact single-line summary for prompt injection.
     pub fn to_feedback_line(&self) -> String {
         if self.success {
-            format!("- {} → ok", self.action)
+            match self.output.as_deref() {
+                Some(out) if !out.is_empty() => {
+                    let one_line = out.replace('\n', " ⏎ ");
+                    let trimmed = truncate_utf8_tail(&one_line, 240);
+                    format!("- {} → ok: {}", self.action, trimmed)
+                }
+                _ => format!("- {} → ok", self.action),
+            }
         } else {
             format!(
                 "- {} → FAILED: {}",
@@ -241,13 +264,19 @@ impl RemoteMultimodalEngine {
         const TEXT_ONLY_INPUT_LINE: &str =
             "- No screenshot is provided this round; use URL/title/HTML context.\n";
 
-        if system_msg.contains(SCREENSHOT_INPUT_LINE) {
-            *system_msg = system_msg.replacen(SCREENSHOT_INPUT_LINE, TEXT_ONLY_INPUT_LINE, 1);
+        // Single scan + in-place splice instead of `contains` followed by
+        // `replacen`/`replace` (which each rescan and reallocate the prompt).
+        if let Some(pos) = system_msg.find(SCREENSHOT_INPUT_LINE) {
+            system_msg.replace_range(pos..pos + SCREENSHOT_INPUT_LINE.len(), TEXT_ONLY_INPUT_LINE);
         }
 
-        if system_msg.contains("→ visible in screenshot") {
-            *system_msg =
-                system_msg.replace("→ visible in screenshot", "→ visible in next round context");
+        const VISIBLE_FROM: &str = "→ visible in screenshot";
+        const VISIBLE_TO: &str = "→ visible in next round context";
+        let mut search_from = 0;
+        while let Some(rel) = system_msg[search_from..].find(VISIBLE_FROM) {
+            let pos = search_from + rel;
+            system_msg.replace_range(pos..pos + VISIBLE_FROM.len(), VISIBLE_TO);
+            search_from = pos + VISIBLE_TO.len();
         }
 
         if can_request_vision {
@@ -534,8 +563,8 @@ impl RemoteMultimodalEngine {
     fn summarize_step_blocklist(steps: &[serde_json::Value], max_items: usize) -> Vec<String> {
         use std::collections::HashSet;
 
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
+        let mut seen = HashSet::with_capacity(max_items);
+        let mut out = Vec::with_capacity(max_items);
 
         for step in steps {
             let Some(obj) = step.as_object() else {
@@ -787,50 +816,41 @@ impl RemoteMultimodalEngine {
         // Action feedback from previous round (injected when failures occurred)
         let mut last_action_feedback: Option<String> = None;
 
-        // Recall learned strategies from long-term experience memory.
-        // Uses spawn_blocking to contain !Send ffmpeg temporaries from memvid-rs.
+        // Recall learned strategies from long-term experience memory. The
+        // memory is owned by its own thread, so this is a plain await — no
+        // `spawn_blocking` needed to contain memvid's `!Send` ffmpeg
+        // temporaries, and no lock to acquire.
         #[cfg(feature = "memvid")]
         if let Some(ref exp_mem) = self.experience_memory {
-            let exp_mem = exp_mem.clone();
             let query = format!("{} {}", url_input, last_label);
-            let handle = tokio::runtime::Handle::current();
-            let recalled = tokio::task::spawn_blocking(move || {
-                handle.block_on(async move {
-                    {
-                        let mem = exp_mem.read().await;
-                        mem.clear_cache();
+            let max_recall = exp_mem.config().max_recall;
+            let max_context_chars = exp_mem.config().max_context_chars;
+
+            exp_mem.clear_cache().await;
+
+            let recalled = match exp_mem.recall(&query, max_recall).await {
+                Ok(experiences) if !experiences.is_empty() => {
+                    let ctx = super::long_term_memory::ExperienceMemory::recall_to_context(
+                        &experiences,
+                        max_context_chars,
+                    );
+                    if ctx.is_empty() {
+                        None
+                    } else {
+                        log::info!(
+                            "Recalled {} strategies ({} chars)",
+                            experiences.len(),
+                            ctx.len(),
+                        );
+                        Some(ctx)
                     }
-                    let mut mem = exp_mem.write().await;
-                    let max_recall = mem.config.max_recall;
-                    let max_context_chars = mem.config.max_context_chars;
-                    match mem.recall(&query, max_recall).await {
-                        Ok(experiences) if !experiences.is_empty() => {
-                            let ctx = super::long_term_memory::ExperienceMemory::recall_to_context(
-                                &experiences,
-                                max_context_chars,
-                            );
-                            if ctx.is_empty() {
-                                None
-                            } else {
-                                log::info!(
-                                    "Recalled {} strategies ({} chars)",
-                                    experiences.len(),
-                                    ctx.len(),
-                                );
-                                Some(ctx)
-                            }
-                        }
-                        Ok(_) => None,
-                        Err(e) => {
-                            log::warn!("Failed to recall experiences: {}", e);
-                            None
-                        }
-                    }
-                })
-            })
-            .await
-            .ok()
-            .flatten();
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    log::warn!("Failed to recall experiences: {}", e);
+                    None
+                }
+            };
 
             if let Some(learned_context) = recalled {
                 let existing = effective_system_prompt_extra.take().unwrap_or_default();
@@ -936,8 +956,8 @@ impl RemoteMultimodalEngine {
                         if !new_title.is_empty() && new_title != title_now {
                             log::info!(
                                 "Pre-evaluate updated title: '{}' -> '{}'",
-                                &title_now[..title_now.len().min(80)],
-                                &new_title[..new_title.len().min(80)]
+                                truncate_utf8_head(&title_now, 80),
+                                truncate_utf8_head(&new_title, 80)
                             );
                             title_now = new_title.clone();
 
@@ -1072,7 +1092,7 @@ impl RemoteMultimodalEngine {
                                             log::info!(
                                                 "TTT loop (game {}): '{}'",
                                                 games_played + 1,
-                                                &updated[..updated.len().min(80)]
+                                                truncate_utf8_head(&updated, 80)
                                             );
                                             title_now = updated;
                                         }
@@ -1523,8 +1543,11 @@ impl RemoteMultimodalEngine {
                                         let words = data.get("words").and_then(|v| v.as_array());
                                         let drags = data.get("drags").and_then(|v| v.as_array());
                                         if let (Some(words), Some(drags)) = (words, drags) {
-                                            let mut dragged = Vec::new();
-                                            let mut all_coords: Vec<(f64, f64)> = Vec::new();
+                                            // Cap to bound pre-allocation against malicious page payloads.
+                                            let drag_cap = drags.len().min(128);
+                                            let mut dragged = Vec::with_capacity(drag_cap);
+                                            let mut all_coords: Vec<(f64, f64)> =
+                                                Vec::with_capacity(drag_cap * 4);
                                             for (wi, drag_pts) in drags.iter().enumerate() {
                                                 if let Some(pts) = drag_pts.as_array() {
                                                     let coords: Vec<(f64, f64)> = pts
@@ -1898,7 +1921,7 @@ impl RemoteMultimodalEngine {
                 }
                 // Record this round's URL and action
                 mem.add_visited_url(&url_now);
-                mem.add_action(format!("Round {}: {}", round_idx + 1, &plan.label));
+                mem.add_action(format!("Round {}: {}", round_idx + 1, plan.label));
             }
 
             // Save relevance flag if present
@@ -2069,17 +2092,10 @@ impl RemoteMultimodalEngine {
                                 total_steps_executed,
                                 (round_idx + 1) as u32,
                             );
-                            let exp_mem = exp_mem.clone();
-                            let handle = tokio::runtime::Handle::current();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                handle.block_on(async move {
-                                    let mut exp = exp_mem.write().await;
-                                    if let Err(e) = exp.store_experience(&record).await {
-                                        log::warn!("Failed to store experience: {}", e);
-                                    }
-                                })
-                            })
-                            .await;
+
+                            if let Err(e) = exp_mem.store_experience(&record).await {
+                                log::warn!("Failed to store experience: {}", e);
+                            }
                         }
                     }
                 }
@@ -2126,17 +2142,10 @@ impl RemoteMultimodalEngine {
                         total_steps_executed,
                         rounds as u32,
                     );
-                    let exp_mem = exp_mem.clone();
-                    let handle = tokio::runtime::Handle::current();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        handle.block_on(async move {
-                            let mut exp = exp_mem.write().await;
-                            if let Err(e) = exp.store_experience(&record).await {
-                                log::warn!("Failed to store experience: {}", e);
-                            }
-                        })
-                    })
-                    .await;
+
+                    if let Err(e) = exp_mem.store_experience(&record).await {
+                        log::warn!("Failed to store experience: {}", e);
+                    }
                 }
             }
         }
@@ -2189,7 +2198,7 @@ impl RemoteMultimodalEngine {
         let max_attempts = effective_cfg.retry.max_attempts.max(1);
         let mut last_err: Option<EngineError> = None;
         // Track which models have been tried so we can rotate on retryable errors
-        let mut tried_models: Vec<String> = Vec::new();
+        let mut tried_models: Vec<String> = Vec::with_capacity(max_attempts);
 
         for attempt in 0..max_attempts {
             // On retryable errors (502, 503, 429, timeout), try a different model from the pool
@@ -2333,7 +2342,7 @@ impl RemoteMultimodalEngine {
             #[serde(skip_serializing_if = "Option::is_none")]
             system: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            tools: Option<Vec<serde_json::Value>>,
+            tools: Option<&'static [serde_json::Value]>,
             #[serde(skip_serializing_if = "Option::is_none")]
             tool_choice: Option<serde_json::Value>,
         }
@@ -2541,13 +2550,12 @@ impl RemoteMultimodalEngine {
             None
         };
 
+        // Pre-serialized once in a LazyLock — no per-request clone/serialize.
+        // Serde emits `&[Value]` identically to the old `Vec<Value>`, and
+        // `test_all_values_matches_per_request_serialization` (tool_calling.rs)
+        // pins `all_values()` to the previous per-request serialization.
         let tools = if use_tools {
-            Some(
-                ActionToolSchemas::all()
-                    .into_iter()
-                    .filter_map(|tool| serde_json::to_value(tool).ok())
-                    .collect::<Vec<_>>(),
-            )
+            Some(ActionToolSchemas::all_values())
         } else {
             None
         };
@@ -2707,14 +2715,13 @@ impl RemoteMultimodalEngine {
         });
 
         // Try to get extracted field, or fallback to the entire response when in extraction mode.
-        // Treat `extracted: {}` (empty object) the same as missing for recovery purposes.
-        let raw_extracted = parsed.get("extracted").cloned().and_then(|v| {
-            if v.as_object().is_some_and(|o| o.is_empty()) {
-                None // empty object → trigger fallback chain
-            } else {
-                Some(v)
-            }
-        });
+        // Treat `extracted: {}` (empty object) the same as missing for recovery purposes,
+        // so it falls through to the chain below. Filtering before the clone avoids
+        // copying a value we then discard.
+        let raw_extracted = parsed
+            .get("extracted")
+            .filter(|v| !v.as_object().is_some_and(|o| o.is_empty()))
+            .cloned();
 
         let extracted = raw_extracted.or_else(|| {
             // If no explicit "extracted" field but response looks like extracted data
@@ -3277,13 +3284,11 @@ return await s.prompt(msg);
             }
         });
 
-        let raw_extracted = parsed.get("extracted").cloned().and_then(|v| {
-            if v.as_object().is_some_and(|o| o.is_empty()) {
-                None
-            } else {
-                Some(v)
-            }
-        });
+        // Empty object counts as missing; filter before cloning to skip a discarded copy.
+        let raw_extracted = parsed
+            .get("extracted")
+            .filter(|v| !v.as_object().is_some_and(|o| o.is_empty()))
+            .cloned();
 
         let extracted = raw_extracted.or_else(|| {
             if parsed.get("label").is_none()
@@ -3779,7 +3784,8 @@ return await s.prompt(msg);
     ) -> EngineResult<(usize, Vec<String>, Vec<ActionOutcome>)> {
         let mut executed = 0;
         let mut spawn_pages = Vec::new();
-        let mut outcomes = Vec::new();
+        // Cap to bound pre-allocation against oversized LLM outputs.
+        let mut outcomes = Vec::with_capacity(steps.len().min(256));
 
         for step in steps {
             log::debug!("Executing step: {:?}", step);
@@ -3840,7 +3846,7 @@ return await s.prompt(msg);
                 if let Some(selector) = value.as_str() {
                     match page.find_element(selector).await {
                         Ok(elem) => {
-                            if elem.click().await.is_ok() {
+                            if elem.click_smooth().await.is_ok() {
                                 return ActionOutcome::ok("Click");
                             }
                             return ActionOutcome::fail("Click", "click event failed");
@@ -3860,7 +3866,7 @@ return await s.prompt(msg);
                     match page.find_elements(selector).await {
                         Ok(elements) => {
                             for elem in elements {
-                                let _ = elem.click().await;
+                                let _ = elem.click_smooth().await;
                             }
                             return ActionOutcome::ok("ClickAll");
                         }
@@ -3877,10 +3883,11 @@ return await s.prompt(msg);
             "ClickPoint" => {
                 let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                // Move mouse first to set hover target, then click
+                // click_smooth already runs move_mouse_smooth internally,
+                // so a separate pre-move would just emit a duplicate
+                // bezier path before the click.
                 let point = Point::new(x, y);
-                let _ = page.move_mouse_smooth(point).await;
-                match page.click(point).await {
+                match page.click_smooth(point).await {
                     Ok(_) => ActionOutcome::ok("ClickPoint"),
                     Err(_) => {
                         ActionOutcome::fail("ClickPoint", format!("CDP click failed at ({x}, {y})"))
@@ -4013,7 +4020,7 @@ return await s.prompt(msg);
                     .await
                 {
                     for elem in elements {
-                        let _ = elem.click().await;
+                        let _ = elem.click_smooth().await;
                     }
                     ActionOutcome::ok("ClickAllClickable")
                 } else {
@@ -4064,7 +4071,7 @@ return await s.prompt(msg);
                 if let (Some(sel), Some(txt)) = (selector, text) {
                     match page.find_element(sel).await {
                         Ok(elem) => {
-                            let _ = elem.click().await;
+                            let _ = elem.click_smooth().await;
                             // Clear existing value before typing
                             if let Err(e) = eval_with_timeout(
                                 page,
@@ -4295,7 +4302,7 @@ return await s.prompt(msg);
                 if let Some(selector) = value.as_str() {
                     for _ in 0..50 {
                         if let Ok(elem) = page.find_element(selector).await {
-                            if elem.click().await.is_ok() {
+                            if elem.click_smooth().await.is_ok() {
                                 return ActionOutcome::ok("WaitForAndClick");
                             }
                             return ActionOutcome::fail(
@@ -4319,6 +4326,40 @@ return await s.prompt(msg);
                 // Use the established PageWaitStrategy instead of a fixed sleep
                 PageWaitStrategy::Load.apply(page).await;
                 ActionOutcome::ok("WaitForNavigation")
+            }
+            "WaitForLoad" => {
+                let timeout = value
+                    .get("timeout")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(15000);
+                let dur = std::time::Duration::from_millis(timeout.min(60_000));
+                if let Ok(mut events) = page
+                    .event_listener::<
+                        chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired,
+                    >()
+                    .await
+                {
+                    let _ = tokio::time::timeout(dur, events.next()).await;
+                }
+                ActionOutcome::ok("WaitForLoad")
+            }
+            "WaitForNetworkIdle" => {
+                let timeout = value
+                    .get("timeout")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30000);
+                let dur = std::time::Duration::from_millis(timeout.min(60_000));
+                let _ = page.wait_for_network_idle_with_timeout(dur).await;
+                ActionOutcome::ok("WaitForNetworkIdle")
+            }
+            "WaitForNetworkAlmostIdle" => {
+                let timeout = value
+                    .get("timeout")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30000);
+                let dur = std::time::Duration::from_millis(timeout.min(60_000));
+                let _ = page.wait_for_network_almost_idle_with_timeout(dur).await;
+                ActionOutcome::ok("WaitForNetworkAlmostIdle")
             }
             "WaitForDom" => {
                 let selector = value.get("selector").and_then(|v| v.as_str());
@@ -4529,6 +4570,10 @@ return await s.prompt(msg);
                 // Validation step - always succeeds
                 ActionOutcome::ok("ValidateChain")
             }
+
+            // === Embedded scripting (pure-Rust Python + JS) ===
+            #[cfg(feature = "scripting")]
+            "RunPython" | "RunJavaScript" => run_embedded_script(self, page, action, value).await,
 
             _ => {
                 log::debug!("Unknown action: {}", action);
@@ -5347,6 +5392,18 @@ pub async fn run_spawn_pages_concurrent(
     run_spawn_pages_with_options(browser, urls, cfgs, SpawnPageOptions::new()).await
 }
 
+/// Closes a spawned automation page's browser target when it leaves scope.
+///
+/// Dropping a chromiumoxide [`Page`] does **not** close the underlying CDP
+/// target, so each URL processed by the spawn-pages helpers would otherwise
+/// leak a tab for the lifetime of the shared `Browser`. This is the single
+/// in-crate tab guard ([`crate::browser::PageCloseGuard`]), aliased here under
+/// its original name: on drop it detaches a bounded `page.close()` so the
+/// closure stays fully async, never blocks, holds no locks (no deadlock), and
+/// returns its result with identical timing — the only change is the freed tab.
+#[cfg(feature = "chrome")]
+type SpawnPageCloseGuard = crate::browser::PageCloseGuard;
+
 /// Process spawn_pages URLs concurrently with custom options.
 ///
 /// This is the full-featured version that allows customizing extraction,
@@ -5402,7 +5459,7 @@ pub async fn run_spawn_pages_with_options(
     let base_cfgs = Arc::new(base_cfgs.clone());
     let sem = Arc::new(tokio::sync::Semaphore::new(options.max_concurrency.max(1)));
     let options = Arc::new(options);
-    let mut handles = Vec::with_capacity(urls.len());
+    let mut handles = super::executor::TaskBatch::with_capacity(urls.len());
 
     // Spawn all pages concurrently (semaphore limits in-flight work)
     for url in urls {
@@ -5412,7 +5469,7 @@ pub async fn run_spawn_pages_with_options(
         let url_clone = url.clone();
         let sem = sem.clone();
 
-        handles.push(tokio::spawn(async move {
+        handles.tasks.push(tokio::spawn(async move {
             // Acquire concurrency permit before doing real work
             let _permit = match sem.acquire().await {
                 Ok(p) => p,
@@ -5426,9 +5483,11 @@ pub async fn run_spawn_pages_with_options(
                 }
             };
 
-            // Create new page for this URL
+            // Create new page for this URL. Wrapped in a close guard so the
+            // browser target is released on every exit path (success, error,
+            // panic) — dropping the `Page` alone does not close the tab.
             let new_page = match browser.new_page(&url_clone).await {
-                Ok(page) => page,
+                Ok(page) => SpawnPageCloseGuard::from_page(page),
                 Err(e) => {
                     return SpawnedPageResult {
                         url: url_clone,
@@ -5441,18 +5500,22 @@ pub async fn run_spawn_pages_with_options(
 
             // Run page setup callback if provided (for event tracking propagation)
             if let Some(ref setup) = options.page_setup {
-                setup(&new_page).await;
+                setup(new_page.page()).await;
             }
 
             // Wait for page readiness using the configured strategy
-            options.page_wait.apply(&new_page).await;
+            options.page_wait.apply(new_page.page()).await;
 
             // Set up bytes tracking if enabled
             let total_bytes: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
             let response_map: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
 
             let bytes_listener = if options.track_bytes {
-                new_page.event_listener::<EventDataReceived>().await.ok()
+                new_page
+                    .page()
+                    .event_listener::<EventDataReceived>()
+                    .await
+                    .ok()
             } else {
                 None
             };
@@ -5477,6 +5540,9 @@ pub async fn run_spawn_pages_with_options(
             } else {
                 None
             };
+            let _tracking_guard = tracking_handle
+                .as_ref()
+                .map(|task| super::executor::AbortOnDrop(task.abort_handle()));
 
             // Build page-specific config from the full base config to preserve
             // routing, schemas, relevance gates, and other production knobs.
@@ -5499,13 +5565,14 @@ pub async fn run_spawn_pages_with_options(
             }
 
             // Run automation on the new page
-            let result = run_remote_multimodal_with_page(&page_cfgs, &new_page, &url_clone)
+            let result = run_remote_multimodal_with_page(&page_cfgs, new_page.page(), &url_clone)
                 .await
                 .map_err(|e| format!("Automation failed: {}", e));
 
             // Stop bytes tracking
             if let Some(handle) = tracking_handle {
                 handle.abort();
+                let _ = handle.await;
             }
 
             // Collect bytes data
@@ -5539,8 +5606,8 @@ pub async fn run_spawn_pages_with_options(
     }
 
     // Collect all results (concurrent execution, wait for all)
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
+    let mut results = Vec::with_capacity(handles.tasks.len());
+    for handle in &mut handles.tasks {
         match handle.await {
             Ok(spawn_result) => results.push(spawn_result),
             Err(e) => {
@@ -5623,7 +5690,7 @@ pub async fn run_spawn_pages_with_factory<E: std::fmt::Display + Send + 'static>
     let base_cfgs = Arc::new(base_cfgs.clone());
     let sem = Arc::new(tokio::sync::Semaphore::new(options.max_concurrency.max(1)));
     let options = Arc::new(options);
-    let mut handles = Vec::with_capacity(urls.len());
+    let mut handles = super::executor::TaskBatch::with_capacity(urls.len());
 
     // Spawn all pages concurrently (semaphore limits in-flight work)
     for url in urls {
@@ -5633,7 +5700,7 @@ pub async fn run_spawn_pages_with_factory<E: std::fmt::Display + Send + 'static>
         let url_clone = url.clone();
         let sem = sem.clone();
 
-        handles.push(tokio::spawn(async move {
+        handles.tasks.push(tokio::spawn(async move {
             // Acquire concurrency permit before doing real work
             let _permit = match sem.acquire().await {
                 Ok(p) => p,
@@ -5648,18 +5715,22 @@ pub async fn run_spawn_pages_with_factory<E: std::fmt::Display + Send + 'static>
             };
 
             let result = async {
-                // Create new page using the factory
-                let new_page = page_factory(url_clone.clone())
-                    .await
-                    .map_err(|e| format!("Failed to create page: {}", e))?;
+                // Create new page using the factory. Wrapped in a close guard so
+                // the browser target is released on every exit path — dropping
+                // the `Page` alone does not close the tab.
+                let new_page = SpawnPageCloseGuard::from_page(
+                    page_factory(url_clone.clone())
+                        .await
+                        .map_err(|e| format!("Failed to create page: {}", e))?,
+                );
 
                 // Run page setup callback if provided (for event tracking propagation)
                 if let Some(ref setup) = options.page_setup {
-                    setup(&new_page).await;
+                    setup(new_page.page()).await;
                 }
 
                 // Wait for page readiness using the configured strategy
-                options.page_wait.apply(&new_page).await;
+                options.page_wait.apply(new_page.page()).await;
 
                 // Build page-specific config from the full base config to preserve
                 // routing, schemas, relevance gates, and other production knobs.
@@ -5682,7 +5753,7 @@ pub async fn run_spawn_pages_with_factory<E: std::fmt::Display + Send + 'static>
                 }
 
                 // Run automation on the new page
-                run_remote_multimodal_with_page(&page_cfgs, &new_page, &url_clone)
+                run_remote_multimodal_with_page(&page_cfgs, new_page.page(), &url_clone)
                     .await
                     .map_err(|e| format!("Automation failed: {}", e))
             }
@@ -5698,8 +5769,8 @@ pub async fn run_spawn_pages_with_factory<E: std::fmt::Display + Send + 'static>
     }
 
     // Collect all results (concurrent execution, wait for all)
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
+    let mut results = Vec::with_capacity(handles.tasks.len());
+    for handle in &mut handles.tasks {
         match handle.await {
             Ok(spawn_result) => results.push(spawn_result),
             Err(e) => {
@@ -5717,6 +5788,95 @@ pub async fn run_spawn_pages_with_factory<E: std::fmt::Display + Send + 'static>
     results
 }
 
+// =====================================================================================
+// Embedded scripting dispatcher (pure-Rust Python + JS via spider_agent::scripting)
+// =====================================================================================
+
+/// Route a `RunPython`/`RunJavaScript` action through the embedded scripting engine.
+///
+/// JSON payload accepted by either action:
+///   `{"code": "<source>"}`                          — minimum
+///   `{"code": "<source>", "timeout_ms": 5000}`      — per-call timeout override
+///   `"<source>"`                                    — shorthand: just the code
+///
+/// Page URL / title / HTML are captured here and forwarded as the read-only
+/// `agent.url` / `agent.title` / `agent.html` globals.
+#[cfg(feature = "scripting")]
+async fn run_embedded_script(
+    engine: &RemoteMultimodalEngine,
+    page: &Page,
+    action: &str,
+    value: &serde_json::Value,
+) -> ActionOutcome {
+    let script = match engine.script_engine.as_ref() {
+        Some(s) => s,
+        None => return ActionOutcome::fail(action, "scripting engine not attached"),
+    };
+    if !script.is_enabled() {
+        return ActionOutcome::fail(action, "scripting engine disabled in config");
+    }
+
+    let (code, timeout_ms) = if let Some(s) = value.as_str() {
+        (s.to_string(), None::<u64>)
+    } else if let Some(obj) = value.as_object() {
+        let code = obj
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let timeout = obj.get("timeout_ms").and_then(|v| v.as_u64());
+        match code {
+            Some(c) => (c, timeout),
+            None => return ActionOutcome::fail(action, "missing `code` field"),
+        }
+    } else {
+        return ActionOutcome::fail(action, "expected string or {code, timeout_ms?}");
+    };
+
+    let url = page.url().await.ok().flatten();
+    let title = page.get_title().await.ok().flatten();
+    let html = page.content().await.ok();
+    let ctx = crate::scripting::ScriptContext {
+        url,
+        title,
+        html,
+        memory_json: None,
+    };
+    let timeout = timeout_ms.map(std::time::Duration::from_millis);
+
+    // Inherit the agent's HTTP client (proxy / TLS / headers) so `agent.fetch`
+    // from inside the script doesn't bypass the configured outbound path.
+    // Cheap clone — reqwest::Client is Arc-internal.
+    let result = match (action, engine.client.clone()) {
+        ("RunPython", Some(client)) => {
+            script
+                .run_python_with_client(code, ctx, timeout, client)
+                .await
+        }
+        ("RunPython", None) => script.run_python(code, ctx, timeout).await,
+        ("RunJavaScript", Some(client)) => {
+            script
+                .run_javascript_with_client(code, ctx, timeout, client)
+                .await
+        }
+        ("RunJavaScript", None) => script.run_javascript(code, ctx, timeout).await,
+        _ => return ActionOutcome::fail(action, "unreachable: action mismatch"),
+    };
+
+    if result.success {
+        // Surface stdout to the LLM via the feedback line.
+        ActionOutcome::ok(action).with_output(result.stdout)
+    } else {
+        let msg = if result.timed_out {
+            format!("script timed out after {}ms", result.elapsed_ms)
+        } else if !result.stderr.is_empty() {
+            result.stderr
+        } else {
+            "script failed".to_string()
+        };
+        ActionOutcome::fail(action, msg)
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -5725,6 +5885,49 @@ pub async fn run_spawn_pages_with_factory<E: std::fmt::Display + Send + 'static>
 mod tests {
     use super::*;
     use crate::automation::DEFAULT_SYSTEM_PROMPT;
+
+    #[tokio::test]
+    async fn cancelling_spawn_pages_releases_factory_and_workers() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        for _ in 0..32 {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let worker_started = started.clone();
+            let factory: Arc<PageFactory<String>> = Arc::new(Box::new(move |_| {
+                let started = worker_started.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    std::future::pending::<Result<Page, String>>().await
+                })
+            }));
+            let weak = Arc::downgrade(&factory);
+            let parent = tokio::spawn(async move {
+                run_spawn_pages_with_factory(
+                    factory,
+                    vec![
+                        "https://example.com/1".into(),
+                        "https://example.com/2".into(),
+                    ],
+                    &super::super::RemoteMultimodalConfigs::default(),
+                    SpawnPageOptions::new().with_max_concurrency(1),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            parent.abort();
+            assert!(parent.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled workers retained the page factory");
+        }
+    }
 
     #[test]
     fn test_spawn_page_options_default() {
@@ -6035,6 +6238,7 @@ mod tests {
             action: "Evaluate".to_string(),
             success: false,
             error: None,
+            output: None,
         };
         assert_eq!(
             outcome.to_feedback_line(),
@@ -6341,6 +6545,11 @@ mod tests {
 
     /// Verifies SetViewport clamps width/height to [1, 7680] (8K).
     #[test]
+    // The `.max(1).min(MAX)` form mirrors the runtime clamp at the call site
+    // (where the value is dynamic, not a literal). Rewriting these as `.clamp()`
+    // would diverge from the production path; suppressing the const-folded
+    // "always greater/smaller" warnings is the correct choice here.
+    #[allow(clippy::manual_clamp, clippy::unnecessary_min_or_max)]
     fn test_viewport_dimension_clamped() {
         // Huge values capped
         assert_eq!(99999i64.max(1).min(MAX_VIEWPORT_DIM), 7680);

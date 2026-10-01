@@ -20,11 +20,17 @@ convert_case = "0.6.0"
 env_logger = "0.11.3"
 htr = "0.5.27"
 flexbuffers = "25"
-console-subscriber = { version = "0.4" }
+console-subscriber = { version = "0.5" }
 serde_json = "1"
+# mcp_oauth example — a standalone OAuth 2.1 + PKCE client for a remote MCP server.
+reqwest = { version = "0.13", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.2"
 
 [dependencies.spider]
-version = "2"
+version = "2.53.9"
 path = "../spider"
 features = ["serde"]
 
@@ -145,6 +151,11 @@ required-features = ["spider/sync", "spider/cron"]
 [[example]]
 name = "chrome"
 path = "chrome.rs"
+required-features = ["spider/sync", "spider/chrome"]
+
+[[example]]
+name = "chrome_nxdomain_test"
+path = "chrome_nxdomain_test.rs"
 required-features = ["spider/sync", "spider/chrome"]
 
 [[example]]
@@ -350,6 +361,11 @@ path = "not_a_robot_chrome_ai.rs"
 required-features = ["spider/sync", "spider/chrome", "spider/chrome_headed", "spider/agent_chrome", "spider/agent_skills"]
 
 [[example]]
+name = "spider_cloud_markdown"
+path = "spider_cloud_markdown.rs"
+required-features = ["spider/sync", "spider/spider_cloud"]
+
+[[example]]
 name = "spider_browser_cloud"
 path = "spider_browser_cloud.rs"
 required-features = ["spider/sync", "spider/chrome", "spider/spider_cloud"]
@@ -372,4 +388,17 @@ required-features = ["spider/parallel_backends", "spider/sync"]
 [[example]]
 name = "parallel_backends_chrome"
 path = "parallel_backends_chrome.rs"
-required-features = ["spider/lightpanda", "spider/sync", "spider/chrome"]
+required-features = ["spider/parallel_backends", "spider/sync", "spider/chrome"]
+
+[[example]]
+name = "dns_nxdomain_test"
+path = "dns_nxdomain_test.rs"
+
+[[example]]
+name = "chrome_remote_logrocket"
+path = "chrome_remote_logrocket.rs"
+required-features = ["spider/sync", "spider/chrome", "spider/chrome_intercept"]
+
+[[example]]
+name = "mcp_oauth"
+path = "mcp_oauth.rs"

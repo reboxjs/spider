@@ -12,34 +12,51 @@ On Linux
 
 ## Example
 
-This is a basic async example crawling a web page, add spider to your `Cargo.toml`:
+A basic async example that crawls a web page. Add spider to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-spider = "2"
+spider = { version = "2", features = ["spider_cloud"] }
 ```
 
 And then the code:
 
 ```rust,no_run
-extern crate spider;
-
-use spider::website::Website;
+use spider::configuration::{SpiderCloudConfig, SpiderCloudMode, SpiderCloudReturnFormat};
 use spider::tokio;
+use spider::website::Website;
 
 #[tokio::main]
 async fn main() {
-    let url = "https://choosealicense.com";
-    let mut website = Website::new(&url);
-    website.crawl().await;
+    // Get your API key free at https://spider.cloud
+    let config = SpiderCloudConfig::new("YOUR_API_KEY")
+        .with_mode(SpiderCloudMode::Smart)
+        .with_return_format(SpiderCloudReturnFormat::Markdown);
 
-    for link in website.get_links() {
-        println!("- {:?}", link.as_ref());
-    }
+    let mut website = Website::new("https://example.com")
+        .with_limit(10)
+        .with_spider_cloud_config(config)
+        .build()
+        .unwrap();
+
+    let mut rx = website.subscribe(16);
+
+    tokio::spawn(async move {
+        while let Ok(page) = rx.recv().await {
+            let url = page.get_url();
+            let markdown = page.get_content();
+            let status = page.status_code;
+
+            println!("[{status}] {url}\n---\n{markdown}\n");
+        }
+    });
+
+    website.crawl().await;
+    website.unsubscribe();
 }
 ```
 
-You can use `Configuration` object to configure your crawler:
+You can use the `Configuration` object to configure your crawler:
 
 ```rust
 // ..
@@ -87,6 +104,24 @@ website
    .with_proxies(None);
 ```
 
+## Performance: Global Allocator
+
+A custom global allocator can improve throughput by 30-60% under high concurrency.
+Use [`mimalloc`](https://crates.io/crates/mimalloc) for mixed crawl+parse workloads
+or [`tikv-jemallocator`](https://crates.io/crates/tikv-jemallocator) for pure crawl workloads.
+
+```toml
+[dependencies]
+mimalloc = { version = "0.1", default-features = false }
+# or: tikv-jemallocator = "0.6"
+```
+
+```rust
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// or: static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+```
+
 ## Features
 
 We have the following optional feature flags.
@@ -109,13 +144,13 @@ spider = { version = "2", features = ["regex", "ua_generator"] }
 1. `serde`: Enables serde serialization support.
 1. `socks`: Enables socks5 proxy support.
 1. `glob`: Enables [url glob](https://everything.curl.dev/cmdline/globbing) support.
-1. `fs`: Enables storing resources to disk for parsing (may greatly increases performance at the cost of temp storage).
+1. `fs`: Enables storing resources to disk for parsing (can increase performance at the cost of temp storage).
 1. `sitemap`: Include sitemap pages in results.
 1. `time`: Enables duration tracking per page.
 1. `cache`: Enables HTTP caching request to disk.
 1. `cache_mem`: Enables HTTP caching request to persist in memory.
 1. `cache_chrome_hybrid`: Enables hybrid chrome request caching between HTTP.
-1. `cache_openai`: Enables caching the OpenAI request. This can drastically save costs when developing AI workflows.
+1. `cache_openai`: Enables caching the OpenAI request. This saves costs when developing AI workflows.
 1. `chrome`: Enables chrome headless rendering, use the env var `CHROME_URL` to connect remotely.
 1. `chrome_store_page`: Store the page object to perform other actions. The page may be closed.
 1. `chrome_screenshot`: Enables storing a screenshot of each page on crawl. Defaults the screenshots to the ./storage/ directory. Use the env variable `SCREENSHOT_DIRECTORY` to adjust the directory. To save the background set the env var `SCREENSHOT_OMIT_BACKGROUND` to false.
@@ -139,11 +174,11 @@ This is needed if `headers` is set in both [spider](../spider/README.md) and [sp
 1. `string_interner_buffer_backend`: Enables the String interning using the buffer backend [default].
 1. `string_interner_string_backend`: Enables the String interning using the string backend.
 1. `string_interner_bucket_backend`: Enables the String interning using the bucket backend.
-1. `spider_cloud`: Use [spider.cloud](https://spider.cloud) for anti-bot bypass and proxy rotation.
+1. `spider_cloud`: Use [spider.cloud](https://spider.cloud?utm_source=github&utm_medium=readme&utm_campaign=spider) for anti-bot bypass and proxy rotation.
 
 ### Decentralization
 
-Move processing to a worker, drastically increases performance even if worker is on the same machine due to efficient runtime split IO work.
+Move processing to a worker. This increases performance even when the worker runs on the same machine, since it splits the IO work across separate runtimes.
 
 ```toml
 [dependencies]
@@ -159,7 +194,7 @@ RUST_LOG=info SPIDER_WORKER_PORT=3030 spider_worker
 SPIDER_WORKER=http://127.0.0.1:3030 cargo run --example example --features decentralized
 ```
 
-The `SPIDER_WORKER` env variable takes a comma seperated list of urls to set the workers. If the `scrape` feature flag is enabled, use the `SPIDER_WORKER_SCRAPER` env variable to determine the scraper worker.
+The `SPIDER_WORKER` env variable takes a comma separated list of urls to set the workers. If the `scrape` feature flag is enabled, use the `SPIDER_WORKER_SCRAPER` env variable to determine the scraper worker.
 
 ### Handling headers with decentralisation
 
@@ -167,7 +202,7 @@ Without decentralisation the values of the headers for a page are unmodified.
 When working with decentralized workers, each worker stores the headers retrieved
 for the original request with prefixed element names (`"zz-spider-r--"`).
 
-Using the feature `decentralized_headers` provides some useful tools to clean and extract the original header
+The `decentralized_headers` feature provides tools to clean and extract the original header
 entries under `spider::features::decentralized_headers`.
 
 [WORKER_SUPPRESSED_HEADER_PREFIX]
@@ -190,7 +225,7 @@ use spider::tokio;
 #[tokio::main]
 async fn main() {
     let mut website = Website::new("https://choosealicense.com");
-    let mut rx2 = website.subscribe(16).unwrap();
+    let mut rx2 = website.subscribe(16);
 
     tokio::spawn(async move {
         while let Ok(res) = rx2.recv().await {
@@ -302,7 +337,7 @@ async fn main() {
 
 ### Cron Jobs
 
-Use cron jobs to run crawls continuously at anytime.
+Use cron jobs to run crawls on a schedule.
 
 ```toml
 [dependencies]
@@ -321,7 +356,7 @@ async fn main() {
     // set the cron to run or use the builder pattern `website.with_cron`.
     website.cron_str = "1/5 * * * * *".into();
 
-    let mut rx2 = website.subscribe(16).unwrap();
+    let mut rx2 = website.subscribe(16);
 
     let join_handle = tokio::spawn(async move {
         while let Ok(res) = rx2.recv().await {
@@ -340,8 +375,8 @@ async fn main() {
 
 ### Chrome
 
-Connecting to Chrome can be done using the ENV variable `CHROME_URL`, if no connection is found a new browser is launched on the system. You do not need a chrome installation if you are connecting remotely. If you are not scraping content for downloading use
-the feature flag [`chrome_intercept`] to possibly speed up request using Network Interception.
+Connect to Chrome with the env variable `CHROME_URL`. If no connection is found, spider launches a new browser on the system. You do not need a chrome installation if you are connecting remotely. If you are not scraping content for downloading, use
+the feature flag [`chrome_intercept`] to speed up requests with network interception.
 
 ```toml
 [dependencies]
@@ -371,14 +406,14 @@ async fn main() {
 
 ### Caching
 
-Enabling HTTP cache can be done with the feature flag [`cache`] or [`cache_mem`].
+Enable HTTP caching with the feature flag [`cache`] or [`cache_mem`].
 
 ```toml
 [dependencies]
 spider = { version = "2.0.12", features = ["cache"] }
 ```
 
-You need to set `website.cache` to true to enable as well.
+Set `website.cache` to true to enable it as well.
 
 ```rust
 extern crate spider;
@@ -402,7 +437,7 @@ async fn main() {
 
 ### Smart Mode
 
-Intelligently run crawls using HTTP and JavaScript Rendering when needed. The best of both worlds to maintain speed and extract every page. This requires a chrome connection or browser installed on the system.
+Run crawls over HTTP and switch to JavaScript rendering only when a page needs it. This requires a chrome connection or a browser installed on the system.
 
 ```toml
 [dependencies]
@@ -428,7 +463,7 @@ async fn main() {
 
 ### OpenAI
 
-Use OpenAI to generate dynamic scripts to drive the browser done with the feature flag [`openai`].
+Use OpenAI to generate scripts that drive the browser with the feature flag [`openai`].
 
 ```toml
 [dependencies]
@@ -479,7 +514,7 @@ async fn main() {
 
 ### Reusable Configuration
 
-It is possible to re-use the same configuration for a crawl list.
+You can re-use the same configuration across a crawl list.
 
 ```rust
 extern crate spider;
@@ -563,25 +598,48 @@ If you need a blocking sync implementation use a version prior to `v1.12.0`.
 
 ### Spider Cloud
 
-Use [spider.cloud](https://spider.cloud) to help with hard-to-crawl pages.
+Use [spider.cloud](https://spider.cloud?utm_source=github&utm_medium=readme&utm_campaign=spider) for hard-to-crawl pages. Get LLM-ready
+markdown by setting `return_format` to `"markdown"`:
 
 ```toml
 [dependencies]
-spider = { version = "2", features = ["spider_cloud"] }
+spider = { version = "2", features = ["spider_cloud", "sync"] }
 ```
 
 ```rust,no_run
 extern crate spider;
 
+use spider::configuration::{SpiderCloudConfig, SpiderCloudMode, SpiderCloudReturnFormat};
 use spider::website::Website;
 use spider::tokio;
 
 #[tokio::main]
 async fn main() {
-    let mut website = Website::new("https://example.com");
-    website.with_spider_cloud("your-api-key");
+    let config = SpiderCloudConfig::new("your-api-key")
+        .with_mode(SpiderCloudMode::Smart)
+        .with_return_format(SpiderCloudReturnFormat::Markdown);
+
+    let mut website = Website::new("https://example.com")
+        .with_limit(10)
+        .with_spider_cloud_config(config)
+        .build()
+        .unwrap();
+
+    let mut rx = website.subscribe(16);
+
+    tokio::spawn(async move {
+        while let Ok(page) = rx.recv().await {
+            let url = page.get_url();
+            let markdown = page.get_content();
+            let status = page.status_code;
+
+            println!("[{status}] {url}\n---\n{markdown}\n");
+        }
+    });
+
     website.crawl().await;
+    website.unsubscribe();
 }
 ```
 
-Modes: **Proxy** (default), **Api**, **Unblocker**, **Fallback**, **Smart** (proxy + auto-fallback on bot protection).
+Modes: `Proxy` (default), `Api`, `Unblocker`, `Fallback`, `Smart` (proxy + auto-fallback on bot protection).

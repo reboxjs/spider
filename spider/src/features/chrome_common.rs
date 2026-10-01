@@ -525,6 +525,21 @@ pub enum WebAutomation {
     Wait(u64),
     /// Waits for the next navigation event.
     WaitForNavigation,
+    /// Waits for the page `load` event (document.readyState === "complete").
+    WaitForLoad {
+        /// Timeout in milliseconds. Defaults to 15000.
+        timeout: u64,
+    },
+    /// Waits for zero in-flight network connections (CDP lifecycle networkIdle). Non-polling.
+    WaitForNetworkIdle {
+        /// Timeout in milliseconds. Defaults to 30000.
+        timeout: u64,
+    },
+    /// Waits for ≤2 in-flight network connections (CDP lifecycle networkAlmostIdle). Non-polling.
+    WaitForNetworkAlmostIdle {
+        /// Timeout in milliseconds. Defaults to 30000.
+        timeout: u64,
+    },
     /// Wait for dom updates to stop.
     WaitForDom {
         /// The selector of the element to wait for updates.
@@ -592,6 +607,9 @@ impl WebAutomation {
             ClickPoint { .. } => "ClickPoint",
             Wait(_) => "Wait",
             WaitForNavigation => "WaitForNavigation",
+            WaitForLoad { .. } => "WaitForLoad",
+            WaitForNetworkIdle { .. } => "WaitForNetworkIdle",
+            WaitForNetworkAlmostIdle { .. } => "WaitForNetworkAlmostIdle",
             WaitForDom { .. } => "WaitForDom",
             WaitFor(_) => "WaitFor",
             WaitForWithTimeout { .. } => "WaitForWithTimeout",
@@ -635,6 +653,11 @@ impl WebAutomation {
             ClickAllClickable() => "ClickAllClickable".into(),
             Wait(ms) => format!("Wait {}ms", ms),
             WaitForNavigation => "WaitForNavigation".into(),
+            WaitForLoad { timeout } => format!("WaitForLoad ({}ms)", timeout),
+            WaitForNetworkIdle { timeout } => format!("WaitForNetworkIdle ({}ms)", timeout),
+            WaitForNetworkAlmostIdle { timeout } => {
+                format!("WaitForNetworkAlmostIdle ({}ms)", timeout)
+            }
             ClickPoint { x, y } => {
                 format!("ClickPoint x:{} y:{}", x, y)
             }
@@ -672,7 +695,44 @@ impl core::fmt::Display for WebAutomation {
 }
 
 #[cfg(feature = "chrome")]
-/// Generate the wait for Dom function targeting the element. This defaults to using the body.
+/// Generate the wait-for-DOM script targeting an element (defaults to
+/// body). Resolves `true` as soon as a **signal stack** all aligns for
+/// `stable_frames` consecutive RAF frames; resolves `false` only on the
+/// outer `timeout_ms` deadline.
+///
+/// Signals checked per RAF tick:
+/// - `MutationObserver` reported no mutations since the previous tick
+///   (frame-cadence, not a quiet-period timer).
+/// - `document.readyState === "complete"` — load event has fired.
+/// - `document.fonts.status === "loaded"` — web fonts settled
+///   (prevents post-swap layout shift).
+/// - All `document.images` are `complete` (gated by
+///   `require_images_complete`).
+/// - Target element is visible (gated by `require_visible`).
+/// - **Hybrid quiet-period guard**: once *any* mutation has been
+///   observed, additionally require `quiet_ms` ms since the last
+///   mutation before the stable-frames counter may advance. This
+///   catches bursty SPA content-injection patterns (Intuit-class
+///   docs sites that inject in 5–10 mutation bursts with ~30–90ms
+///   gaps) without regressing the fast path: pages that never mutate
+///   bypass the guard entirely (`lastMutTs < 0`) and still settle in
+///   ~33 ms. Decorative CSS/Web Animations on otherwise-static
+///   elements don't trigger the MutationObserver, so they don't
+///   activate the guard either — pages with perpetual background
+///   animations (spider.cloud-class) still settle fast.
+///
+/// Note: `document.getAnimations()` is **deliberately not** part of
+/// the signal stack. Both strict-zero and count-stability variants
+/// were evaluated against real pages and both produce false positives
+/// — the API doesn't expose enough state to distinguish "decorative
+/// perpetual loop" from "loading-state spinner that hasn't unmounted
+/// yet." The MutationObserver + quiet-period guard already catches
+/// every load-state transition that matters without the false-positive
+/// risk.
+///
+/// On a truly idle page this still resolves in ~33 ms (2 RAF frames
+/// at 60fps). The hybrid guard only activates after a mutation has
+/// been seen, so it cannot regress the fast path.
 pub(crate) fn generate_wait_for_dom_js_v2(
     timeout_ms: u32,
     selector: &str,
@@ -682,8 +742,9 @@ pub(crate) fn generate_wait_for_dom_js_v2(
     require_images_complete: bool,
 ) -> String {
     let t = timeout_ms.min(crate::utils::FIVE_MINUTES);
-    let q = quiet_ms.max(50).min(t);
     let f = stable_frames.max(1).min(10);
+    // Cap quiet_ms at the outer timeout. Common values: 200–500ms.
+    let q = quiet_ms.min(timeout_ms);
     let s = if selector.is_empty() {
         "body"
     } else {
@@ -691,10 +752,10 @@ pub(crate) fn generate_wait_for_dom_js_v2(
     };
 
     format!(
-        r###"(()=>new Promise(R=>{{const S={s:?},T={t},Q={q},F={f},V={vis},I={img},P=["#__next","#__nuxt","#app","#root","main","body"],N=()=>performance.now(),W=e=>{{if(!e)return!1;const t=getComputedStyle(e);if("none"===t.display||"hidden"===t.visibility||"0"===t.opacity)return!1;const r=e.getBoundingClientRect();return r.width>0&&r.height>0}},M=e=>{{if(!e)return!1;const t=e.querySelectorAll("img");for(let e=0;e<t.length;e++){{const r=t[e];if(!r.complete)return!1;if(0===r.naturalWidth&&0===r.naturalHeight&&r.currentSrc)return!1}}return!0}},k=()=>{{let e=document.querySelector(S);if(e)return e;for(let t=0;t<P.length;t++){{if(e=document.querySelector(P[t]))return e}}return null}},s=N();let e=null,t=null,r=s,o=0;const a=n=>{{t&&t.disconnect(),t=new MutationObserver(()=>{{r=N(),o=0}}),t.observe(n,{{subtree:!0,childList:!0,attributes:!0,characterData:!0}})}},i=()=>{{const n=N();if(n-s>=T)return t&&t.disconnect(),void R(!1);(!e||!document.contains(e))&&(e=k())&&((r=n,o=0),a(e));e&&(V&&!W(e)?o=0:I&&!M(e)?o=0:n-r>=Q?(o++,o>=F&&(t&&t.disconnect(),R(!0))):o=0),requestAnimationFrame(i)}};i()}}))()"###,
+        r###"(()=>new Promise(R=>{{const S={s:?},T={t},F={f},Q={q},V={vis},I={img},P=["#__next","#__nuxt","#app","#root","main","body"],N=()=>performance.now(),W=e=>{{if(!e)return!1;const t=getComputedStyle(e);if("none"===t.display||"hidden"===t.visibility||"0"===t.opacity)return!1;const r=e.getBoundingClientRect();return r.width>0&&r.height>0}},M=()=>{{if(!I)return!0;const t=document.images;for(let i=0;i<t.length;i++){{const r=t[i];if(!r.complete)return!1;if(0===r.naturalWidth&&0===r.naturalHeight&&r.currentSrc)return!1}}return!0}},k=()=>{{let e=document.querySelector(S);if(e)return e;for(let t=0;t<P.length;t++){{if(e=document.querySelector(P[t]))return e}}return null}},s=N();let e=null,ob=null,dirty=!1,frames=0,lt=-1;const arm=el=>{{ob&&ob.disconnect();ob=new MutationObserver(()=>{{dirty=!0;lt=N()}});ob.observe(el,{{subtree:!0,childList:!0,attributes:!0,characterData:!0}})}};const begin=()=>{{e=k();if(!e){{requestAnimationFrame(begin);return}}arm(e);const tick=()=>{{const n=N();if(n-s>=T){{ob&&ob.disconnect();return R(!1)}}if(!document.contains(e)){{e=k();if(!e){{requestAnimationFrame(tick);return}}arm(e);frames=0;dirty=!1}}const wasMut=dirty;dirty=!1;if(wasMut){{frames=0;requestAnimationFrame(tick);return}}const docReady="complete"===document.readyState;const fontsReady=!document.fonts||"loaded"===document.fonts.status;const imagesReady=M();const vis=!V||W(e);const qOk=lt<0||(n-lt)>=Q;if(docReady&&fontsReady&&imagesReady&&vis&&qOk){{frames++;if(frames>=F){{ob.disconnect();return R(!0)}}}}else{{frames=0}}requestAnimationFrame(tick)}};requestAnimationFrame(tick)}};if("complete"===document.readyState)begin();else addEventListener("load",begin,{{once:!0}})}}))()"###,
         t = t,
-        q = q,
         f = f,
+        q = q,
         vis = if require_visible { "true" } else { "false" },
         img = if require_images_complete {
             "true"
@@ -769,7 +830,7 @@ impl WebAutomation {
             }
             WebAutomation::Click(selector) => {
                 if let Ok(ele) = page.find_element(selector).await {
-                    valid = ele.click().await.is_ok();
+                    valid = ele.click_smooth().await.is_ok();
                 }
             }
 
@@ -801,7 +862,7 @@ impl WebAutomation {
             WebAutomation::ClickAll(selector) => {
                 if let Ok(eles) = page.find_elements(selector).await {
                     for ele in eles {
-                        valid = ele.click().await.is_ok();
+                        valid = ele.click_smooth().await.is_ok();
                     }
                 }
             }
@@ -814,8 +875,11 @@ impl WebAutomation {
                         to_el.clickable_point().await,
                     ) {
                         valid = match modifier {
-                            Some(m) => page.click_and_drag_with_modifier(p1, p2, *m).await.is_ok(),
-                            None => page.click_and_drag(p1, p2).await.is_ok(),
+                            Some(m) => page
+                                .click_and_drag_smooth_with_modifier(p1, p2, *m)
+                                .await
+                                .is_ok(),
+                            None => page.click_and_drag_smooth(p1, p2).await.is_ok(),
                         };
                     }
                 }
@@ -835,20 +899,23 @@ impl WebAutomation {
                 let p2 = chromiumoxide::layout::Point { x: *to_x, y: *to_y };
 
                 valid = match modifier {
-                    Some(m) => page.click_and_drag_with_modifier(p1, p2, *m).await.is_ok(),
-                    None => page.click_and_drag(p1, p2).await.is_ok(),
+                    Some(m) => page
+                        .click_and_drag_smooth_with_modifier(p1, p2, *m)
+                        .await
+                        .is_ok(),
+                    None => page.click_and_drag_smooth(p1, p2).await.is_ok(),
                 };
             }
             WebAutomation::ClickAllClickable() => {
                 if let Ok(eles) = page.find_elements(CLICKABLE_SELECTOR).await {
                     for ele in eles {
-                        valid = ele.click().await.is_ok();
+                        valid = ele.click_smooth().await.is_ok();
                     }
                 }
             }
             WebAutomation::ClickPoint { x, y } => {
                 valid = page
-                    .click(chromiumoxide::layout::Point { x: *x, y: *y })
+                    .click_smooth(chromiumoxide::layout::Point { x: *x, y: *y })
                     .await
                     .is_ok();
             }
@@ -867,10 +934,28 @@ impl WebAutomation {
             WebAutomation::WaitForNavigation => {
                 valid = page.wait_for_navigation().await.is_ok();
             }
+            WebAutomation::WaitForLoad { timeout } => {
+                crate::utils::wait_for_event::<
+                    chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired,
+                >(page, Some(Duration::from_millis(*timeout)))
+                .await;
+                valid = true;
+            }
+            WebAutomation::WaitForNetworkIdle { timeout } => {
+                let dur = Duration::from_millis(*timeout);
+                valid = page.wait_for_network_idle_with_timeout(dur).await.is_ok();
+            }
+            WebAutomation::WaitForNetworkAlmostIdle { timeout } => {
+                let dur = Duration::from_millis(*timeout);
+                valid = page
+                    .wait_for_network_almost_idle_with_timeout(dur)
+                    .await
+                    .is_ok();
+            }
             WebAutomation::WaitForAndClick(selector) => {
                 valid = wait_for_selector(page, Some(Duration::from_secs(60)), selector).await;
                 if let Ok(ele) = page.find_element(selector).await {
-                    valid = ele.click().await.is_ok();
+                    valid = ele.click_smooth().await.is_ok();
                 }
             }
             WebAutomation::ScrollX(px) => {
@@ -887,7 +972,7 @@ impl WebAutomation {
             }
             WebAutomation::Fill { selector, value } => {
                 if let Ok(ele) = page.find_element(selector).await {
-                    if let Ok(el) = ele.click().await {
+                    if let Ok(el) = ele.click_smooth().await {
                         valid = el.type_str(value).await.is_ok();
                     }
                 }
@@ -943,7 +1028,7 @@ pub type ExecutionScripts = Trie<String>;
 /// Automation scripts to run on the page when using chrome by url.
 pub type AutomationScripts = Trie<Vec<WebAutomation>>;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 /// Chrome request interception configurations.
 pub struct RequestInterceptConfiguration {
@@ -959,12 +1044,54 @@ pub struct RequestInterceptConfiguration {
     pub block_analytics: bool,
     /// Block ads. Requires the `adblock` feature flag.
     pub block_ads: bool,
+    /// When `block_stylesheets` would skip a stylesheet, allow it through if
+    /// the request URL is first-party (registrable domain matches the page's
+    /// primary frame). Default `true` so SPAs that load their own CSS via
+    /// dynamic imports still hydrate. Set `false` for strict block-all-CSS.
+    pub allow_first_party_stylesheets: bool,
+    /// When a downstream blocker (intercept manager / adblock / blocklists)
+    /// would skip a script, allow it through if first-party. Default `true`.
+    pub allow_first_party_javascript: bool,
+    /// When `block_visuals` would skip an image/media/font, allow it through
+    /// if first-party. Default `true`. Set `false` for strict bandwidth-
+    /// minimal crawls that drop ALL visuals.
+    pub allow_first_party_visuals: bool,
     /// Intercept Manager
     pub intercept_manager: NetworkInterceptManager,
     /// Whitelist patterns.
     pub whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns.
     pub blacklist_patterns: Option<Vec<String>>,
+    /// Push the interception policy (these flags + the per-job
+    /// blacklist/whitelist + page url) to a capable remote rendering engine
+    /// once per navigation, so it resolves block/allow decisions locally
+    /// instead of round-tripping every paused request. Default `false`. Safe
+    /// against a normal Chrome target (the vendor method is ignored), so this
+    /// only changes behavior for engines that implement it.
+    pub remote_local_policy: bool,
+}
+
+impl Default for RequestInterceptConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            block_visuals: false,
+            block_stylesheets: false,
+            block_javascript: false,
+            block_analytics: false,
+            block_ads: false,
+            // Match chromey's NetworkManager defaults so first-party
+            // resources are not collateral damage from coarse "block all"
+            // bandwidth optimizations.
+            allow_first_party_stylesheets: true,
+            allow_first_party_javascript: true,
+            allow_first_party_visuals: true,
+            intercept_manager: NetworkInterceptManager::default(),
+            whitelist_patterns: None,
+            blacklist_patterns: None,
+            remote_local_policy: false,
+        }
+    }
 }
 
 impl RequestInterceptConfiguration {
@@ -1011,6 +1138,13 @@ impl RequestInterceptConfiguration {
         self.blacklist_patterns = blacklist_patterns;
     }
 
+    /// Push the interception policy to a capable remote rendering engine once
+    /// per navigation so it resolves block/allow locally (no per-request
+    /// round-trip). No-op against a normal Chrome target.
+    pub fn set_remote_local_policy(&mut self, enabled: bool) {
+        self.remote_local_policy = enabled;
+    }
+
     /// Block all request besides html and the important stuff.
     pub fn block_all(&mut self) -> &Self {
         self.block_javascript = true;
@@ -1018,6 +1152,51 @@ impl RequestInterceptConfiguration {
         self.block_stylesheets = true;
         self.block_visuals = true;
         self.block_ads = true;
+        self
+    }
+
+    /// Allow first-party stylesheets through when `block_stylesheets` is on.
+    /// Default `true`. Set `false` for strict block-all-CSS semantics.
+    pub fn set_allow_first_party_stylesheets(&mut self, allow: bool) -> &mut Self {
+        self.allow_first_party_stylesheets = allow;
+        self
+    }
+
+    /// Allow first-party scripts through downstream blockers (intercept
+    /// manager / adblock / blocklists). Default `true`.
+    pub fn set_allow_first_party_javascript(&mut self, allow: bool) -> &mut Self {
+        self.allow_first_party_javascript = allow;
+        self
+    }
+
+    /// Allow first-party images/media/fonts through when `block_visuals` is
+    /// on. Default `true`. Set `false` for strictly bandwidth-minimal crawls
+    /// that drop ALL visuals.
+    pub fn set_allow_first_party_visuals(&mut self, allow: bool) -> &mut Self {
+        self.allow_first_party_visuals = allow;
+        self
+    }
+
+    /// Set all three first-party allow flags at once.
+    pub fn set_allow_first_party(
+        &mut self,
+        stylesheets: bool,
+        javascript: bool,
+        visuals: bool,
+    ) -> &mut Self {
+        self.allow_first_party_stylesheets = stylesheets;
+        self.allow_first_party_javascript = javascript;
+        self.allow_first_party_visuals = visuals;
+        self
+    }
+
+    /// Strict mode: block ALL of every resource type, no first-party
+    /// rescue. Equivalent to setting all three flags to `false`. Useful
+    /// for strictly bandwidth-minimal HTML-only crawls.
+    pub fn deny_first_party_all(&mut self) -> &mut Self {
+        self.allow_first_party_stylesheets = false;
+        self.allow_first_party_javascript = false;
+        self.allow_first_party_visuals = false;
         self
     }
 }

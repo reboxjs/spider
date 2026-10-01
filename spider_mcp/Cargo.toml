@@ -1,6 +1,6 @@
 [package]
 name = "spider_mcp"
-version = "2.48.8"
+version = "2.53.9"
 authors = ["j-mendez <jeff@spider.cloud>"]
 description = "MCP (Model Context Protocol) server exposing Spider web crawler capabilities as tools."
 repository = "https://github.com/spider-rs/spider"
@@ -9,6 +9,7 @@ keywords = ["crawler", "spider", "mcp", "scraper"]
 categories = ["web-programming", "command-line-utilities"]
 license = "MIT"
 documentation = "https://docs.rs/spider_mcp"
+homepage = "https://spider.cloud/crates"
 include = ["src/*", "LICENSE", "README.md"]
 edition = "2021"
 resolver = "2"
@@ -25,7 +26,7 @@ dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
 
 [dependencies.spider]
-version = "2"
+version = "2.53.9"
 path = "../spider"
 features = ["tokio_io_std", "sync", "serde", "cookies"]
 

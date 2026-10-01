@@ -14,3 +14,9 @@ result-*
 example.png
 .idea
 scripts/
+# Local-only integration probes (network-map experiments, fixtures, etc.)
+spider/tests/_*.rs
+spider/tests/fixtures/
+
+# Local Claude Code tooling
+.claude/

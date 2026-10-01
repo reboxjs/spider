@@ -510,7 +510,9 @@ pub struct UsageStats {
     pub fetch_calls: AtomicU64,
     /// Total web browser calls made (Chrome/WebDriver combined).
     pub webbrowser_calls: AtomicU64,
-    /// Custom tool calls tracked by tool name (lock-free via DashMap).
+    /// Total custom-tool attempts, used for atomic admission across tool names.
+    pub custom_tool_calls_total: AtomicU64,
+    /// Custom tool calls tracked by tool name.
     pub custom_tool_calls: DashMap<String, AtomicU64>,
     /// Total tool calls made.
     pub tool_calls: AtomicU64,
@@ -526,6 +528,7 @@ impl Default for UsageStats {
             fetch_calls: AtomicU64::new(0),
             webbrowser_calls: AtomicU64::new(0),
             custom_tool_calls: DashMap::new(),
+            custom_tool_calls_total: AtomicU64::new(0),
             tool_calls: AtomicU64::new(0),
         }
     }
@@ -537,39 +540,113 @@ impl UsageStats {
         Self::default()
     }
 
+    // Reserve before starting work: a separate load and increment lets concurrent
+    // callers all pass the same limit. Failed attempts still consume a call.
+    fn reserve_call(
+        counter: &AtomicU64,
+        limit: Option<u64>,
+        exceeded: impl FnOnce(u64, u64) -> LimitType,
+    ) -> Result<(), LimitType> {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                if limit.is_some_and(|limit| used >= limit) {
+                    None
+                } else {
+                    Some(used.saturating_add(1))
+                }
+            })
+            .map(|_| ())
+            .map_err(|used| exceeded(used, limit.unwrap_or(u64::MAX)))
+    }
+
+    pub(crate) fn reserve_llm_call(&self, limits: &UsageLimits) -> Result<(), LimitType> {
+        Self::reserve_call(&self.llm_calls, limits.max_llm_calls, |used, limit| {
+            LimitType::LlmCalls { used, limit }
+        })
+    }
+
+    #[cfg(any(feature = "search", test))]
+    pub(crate) fn reserve_search_call(&self, limits: &UsageLimits) -> Result<(), LimitType> {
+        Self::reserve_call(
+            &self.search_calls,
+            limits.max_search_calls,
+            |used, limit| LimitType::SearchCalls { used, limit },
+        )
+    }
+
+    pub(crate) fn reserve_fetch_call(&self, limits: &UsageLimits) -> Result<(), LimitType> {
+        Self::reserve_call(&self.fetch_calls, limits.max_fetch_calls, |used, limit| {
+            LimitType::FetchCalls { used, limit }
+        })
+    }
+
+    #[cfg(any(feature = "chrome", test))]
+    pub(crate) fn reserve_webbrowser_call(&self, limits: &UsageLimits) -> Result<(), LimitType> {
+        Self::reserve_call(
+            &self.webbrowser_calls,
+            limits.max_webbrowser_calls,
+            |used, limit| LimitType::WebbrowserCalls { used, limit },
+        )
+    }
+
+    fn add_count(counter: &AtomicU64, amount: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            Some(used.saturating_add(amount))
+        });
+    }
+
     /// Add tokens from an LLM response.
     pub fn add_tokens(&self, prompt: u64, completion: u64) {
-        self.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
-        self.completion_tokens
-            .fetch_add(completion, Ordering::Relaxed);
+        Self::add_count(&self.prompt_tokens, prompt);
+        Self::add_count(&self.completion_tokens, completion);
     }
 
     /// Increment LLM call count.
     pub fn increment_llm_calls(&self) {
-        self.llm_calls.fetch_add(1, Ordering::Relaxed);
+        Self::add_count(&self.llm_calls, 1);
     }
 
     /// Increment search call count.
     pub fn increment_search_calls(&self) {
-        self.search_calls.fetch_add(1, Ordering::Relaxed);
+        Self::add_count(&self.search_calls, 1);
     }
 
     /// Increment fetch call count.
     pub fn increment_fetch_calls(&self) {
-        self.fetch_calls.fetch_add(1, Ordering::Relaxed);
+        Self::add_count(&self.fetch_calls, 1);
     }
 
     /// Increment web browser call count (Chrome/WebDriver).
     pub fn increment_webbrowser_calls(&self) {
-        self.webbrowser_calls.fetch_add(1, Ordering::Relaxed);
+        Self::add_count(&self.webbrowser_calls, 1);
     }
 
     /// Increment custom tool call count for a specific tool.
     pub fn increment_custom_tool_calls(&self, tool_name: &str) {
-        self.custom_tool_calls
+        Self::add_count(&self.custom_tool_calls_total, 1);
+        self.record_custom_tool_call(tool_name);
+    }
+
+    fn record_custom_tool_call(&self, tool_name: &str) {
+        let count = self
+            .custom_tool_calls
             .entry(tool_name.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+            .or_insert_with(|| AtomicU64::new(0));
+        Self::add_count(&count, 1);
+    }
+
+    pub(crate) fn reserve_custom_tool_call(
+        &self,
+        tool_name: &str,
+        limits: &UsageLimits,
+    ) -> Result<(), LimitType> {
+        Self::reserve_call(
+            &self.custom_tool_calls_total,
+            limits.max_custom_tool_calls,
+            |used, limit| LimitType::CustomToolCalls { used, limit },
+        )?;
+        self.record_custom_tool_call(tool_name);
+        Ok(())
     }
 
     /// Get custom tool call count for a specific tool.
@@ -585,17 +662,19 @@ impl UsageStats {
         self.custom_tool_calls
             .iter()
             .map(|entry| entry.value().load(Ordering::Relaxed))
-            .sum()
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Increment tool call count.
     pub fn increment_tool_calls(&self) {
-        self.tool_calls.fetch_add(1, Ordering::Relaxed);
+        Self::add_count(&self.tool_calls, 1);
     }
 
     /// Get total tokens used.
     pub fn total_tokens(&self) -> u64 {
-        self.prompt_tokens.load(Ordering::Relaxed) + self.completion_tokens.load(Ordering::Relaxed)
+        self.prompt_tokens
+            .load(Ordering::Relaxed)
+            .saturating_add(self.completion_tokens.load(Ordering::Relaxed))
     }
 
     /// Get a snapshot of all stats.
@@ -618,7 +697,7 @@ impl UsageStats {
         }
     }
 
-    /// Reset all counters.
+    /// Reset all counters. Call only when no operations are in flight.
     pub fn reset(&self) {
         self.prompt_tokens.store(0, Ordering::Relaxed);
         self.completion_tokens.store(0, Ordering::Relaxed);
@@ -627,6 +706,7 @@ impl UsageStats {
         self.fetch_calls.store(0, Ordering::Relaxed);
         self.webbrowser_calls.store(0, Ordering::Relaxed);
         self.custom_tool_calls.clear();
+        self.custom_tool_calls_total.store(0, Ordering::Relaxed);
         self.tool_calls.store(0, Ordering::Relaxed);
     }
 
@@ -679,7 +759,7 @@ impl UsageStats {
     /// Check if custom tool call limit would be exceeded (total across all tools).
     pub fn check_custom_tool_limit(&self, limits: &UsageLimits) -> Option<LimitType> {
         if let Some(limit) = limits.max_custom_tool_calls {
-            let used = self.total_custom_tool_calls();
+            let used = self.custom_tool_calls_total.load(Ordering::Relaxed);
             if used >= limit {
                 return Some(LimitType::CustomToolCalls { used, limit });
             }
@@ -702,7 +782,7 @@ impl UsageStats {
     pub fn check_token_limits(&self, limits: &UsageLimits) -> Option<LimitType> {
         let prompt = self.prompt_tokens.load(Ordering::Relaxed);
         let completion = self.completion_tokens.load(Ordering::Relaxed);
-        let total = prompt + completion;
+        let total = prompt.saturating_add(completion);
 
         if let Some(limit) = limits.max_total_tokens {
             if total >= limit {
@@ -756,12 +836,15 @@ pub struct UsageSnapshot {
 impl UsageSnapshot {
     /// Get total tokens.
     pub fn total_tokens(&self) -> u64 {
-        self.prompt_tokens + self.completion_tokens
+        self.prompt_tokens.saturating_add(self.completion_tokens)
     }
 
     /// Get total custom tool calls across all tools.
     pub fn total_custom_tool_calls(&self) -> u64 {
-        self.custom_tool_calls.values().sum()
+        self.custom_tool_calls
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Get call count for a specific custom tool.
@@ -773,6 +856,89 @@ impl UsageSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_saturates_without_panicking_or_reopening_limits() {
+        let stats = UsageStats::new();
+        stats.add_tokens(u64::MAX, u64::MAX);
+        stats.add_tokens(1, 1);
+        assert_eq!(stats.total_tokens(), u64::MAX);
+        assert_eq!(stats.snapshot().total_tokens(), u64::MAX);
+        assert!(stats
+            .check_token_limits(&UsageLimits::new().with_max_total_tokens(u64::MAX))
+            .is_some());
+        stats.llm_calls.store(u64::MAX, Ordering::Relaxed);
+        stats.increment_llm_calls();
+        assert!(stats
+            .reserve_llm_call(&UsageLimits::new().with_max_llm_calls(u64::MAX))
+            .is_err());
+        stats
+            .custom_tool_calls_total
+            .store(u64::MAX, Ordering::Relaxed);
+        stats
+            .custom_tool_calls
+            .insert("a".into(), AtomicU64::new(u64::MAX));
+        stats.increment_custom_tool_calls("a");
+        stats.increment_custom_tool_calls("b");
+        assert_eq!(stats.total_custom_tool_calls(), u64::MAX);
+        assert_eq!(stats.get_custom_tool_calls("a"), u64::MAX);
+        assert_eq!(stats.snapshot().total_custom_tool_calls(), u64::MAX);
+        assert!(stats
+            .reserve_custom_tool_call(
+                "c",
+                &UsageLimits::new().with_max_custom_tool_calls(u64::MAX)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_call_limits() {
+        let stats = UsageStats::new();
+        let limits = UsageLimits::new()
+            .with_max_llm_calls(17)
+            .with_max_search_calls(17)
+            .with_max_fetch_calls(17)
+            .with_max_webbrowser_calls(17)
+            .with_max_custom_tool_calls(17);
+        let barrier = &std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let stats = &stats;
+                let limits = &limits;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..100 {
+                        let _ = stats.reserve_llm_call(limits);
+                        let _ = stats.reserve_search_call(limits);
+                        let _ = stats.reserve_fetch_call(limits);
+                        let _ = stats.reserve_webbrowser_call(limits);
+                        let _ = stats.reserve_custom_tool_call(&format!("tool-{worker}"), limits);
+                    }
+                });
+            }
+        });
+        let usage = stats.snapshot();
+        assert_eq!(usage.total_custom_tool_calls(), 17);
+        assert_eq!(stats.custom_tool_calls_total.load(Ordering::Relaxed), 17);
+        assert_eq!(
+            (
+                usage.llm_calls,
+                usage.search_calls,
+                usage.fetch_calls,
+                usage.webbrowser_calls
+            ),
+            (17, 17, 17, 17)
+        );
+    }
+
+    #[test]
+    fn zero_call_limit_does_not_increment_usage() {
+        let stats = UsageStats::new();
+        assert!(stats
+            .reserve_fetch_call(&UsageLimits::new().with_max_fetch_calls(0))
+            .is_err());
+        assert_eq!(stats.snapshot().fetch_calls, 0);
+    }
 
     #[test]
     fn test_usage_limits_builder() {

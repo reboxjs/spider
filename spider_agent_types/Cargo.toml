@@ -1,6 +1,6 @@
 [package]
 name = "spider_agent_types"
-version = "2.48.8"
+version = "2.53.9"
 authors = ["j-mendez <jeff@spider.cloud>"]
 description = "Pure data types and constants for spider_agent automation. Zero heavy dependencies."
 repository = "https://github.com/spider-rs/spider"
@@ -9,6 +9,7 @@ keywords = ["agent", "llm", "automation", "web", "types"]
 categories = ["web-programming", "data-structures"]
 license = "MIT"
 documentation = "https://docs.rs/spider_agent_types"
+homepage = "https://spider.cloud/crates"
 edition = "2021"
 
 [badges]

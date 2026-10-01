@@ -1,34 +1,61 @@
-# Spider
+<p align="center">
+  <a href="https://spider.cloud?utm_source=github&utm_medium=readme&utm_campaign=spider_rs" target="_blank">
+    <img src="assets/spider-mark.png" alt="Spider" width="140" height="140">
+  </a>
+</p>
 
-[![Build Status](https://github.com/spider-rs/spider/actions/workflows/rust.yml/badge.svg)](https://github.com/spider-rs/spider/actions)
-[![Crates.io](https://img.shields.io/crates/v/spider.svg)](https://crates.io/crates/spider)
-[![Downloads](https://img.shields.io/crates/d/spider.svg)](https://crates.io/crates/spider)
-[![Documentation](https://docs.rs/spider/badge.svg)](https://docs.rs/spider)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Discord](https://img.shields.io/discord/1254585814021832755.svg?logo=discord&style=flat-square)](https://discord.spider.cloud)
+<h1 align="center">Spider</h1>
 
-[Website](https://spider.cloud) |
-[Guides](https://spider.cloud/guides) |
-[API Docs](https://docs.rs/spider/latest/spider) |
-[Examples](./examples/) |
-[Discord](https://discord.spider.cloud)
+<p align="center">The fastest web crawler and scraper for Rust.</p>
 
-A high-performance web crawler and scraper for Rust. [200-1000x faster](#benchmarks) than popular alternatives, with HTTP, headless Chrome, and WebDriver rendering in a single library.
+<p align="center">
+  <a href="https://crates.io/crates/spider"><img src="https://img.shields.io/crates/v/spider.svg" alt="Crates.io"></a>
+  <a href="https://crates.io/crates/spider"><img src="https://img.shields.io/crates/d/spider.svg?label=downloads" alt="Downloads"></a>
+  <a href="https://docs.rs/spider"><img src="https://docs.rs/spider/badge.svg" alt="Documentation"></a>
+  <a href="https://discord.spider.cloud"><img src="https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-informational" alt="License"></a>
+</p>
 
-- **Crawl 100k+ pages in minutes** on a single machine. [See benchmarks.](#benchmarks)
-- **HTTP, Chrome CDP, WebDriver, and [AI automation](./spider_agent/)** in one dependency.
-- **Production-ready** with caching, proxy rotation, anti-bot bypass, and [distributed crawling](./spider_worker/). [Feature-gated](https://doc.rust-lang.org/cargo/reference/features.html) so you only compile what you use.
+<h4 align="center">
+  <a href="https://spider.cloud?utm_source=github&utm_medium=readme&utm_campaign=spider_rs">spider.cloud</a> ·
+  <a href="https://spider.cloud/guides?utm_source=github&utm_medium=readme&utm_campaign=spider_rs">Guides</a> ·
+  <a href="https://docs.rs/spider">Docs</a> ·
+  <a href="./examples/">Examples</a> ·
+  <a href="https://discord.spider.cloud">Discord</a>
+</h4>
 
-## Quick Start
+---
 
-### Command Line
+Spider is a concurrency-first crawling engine written in Rust. It streams pages as they arrive, renders JavaScript only on pages that need it, and scales from a single script to a distributed fleet without changing your code. The same engine runs [Spider Cloud](https://spider.cloud?utm_source=github&utm_medium=readme&utm_campaign=spider_rs), so you can prototype locally and move to managed infrastructure with one config change.
 
-```bash
-cargo install spider_cli
-spider --url https://example.com
+## Start in the cloud
+
+The hardest part of crawling at scale isn't the code. It's the proxies, headless browsers, and constant anti-bot churn. Spider Cloud runs all of that for you behind the same API.
+
+[**Get a free API key →**](https://spider.cloud?utm_source=github&utm_medium=readme&utm_campaign=spider_rs) (no card required)
+
+```toml
+[dependencies]
+spider = { version = "2", features = ["spider_cloud"] }
 ```
 
-### Rust
+```rust
+use spider::configuration::{SpiderCloudConfig, SpiderCloudMode};
+use spider::website::Website;
+
+let cloud = SpiderCloudConfig::new("sk-...")
+    .with_mode(SpiderCloudMode::Smart); // proxy by default, auto-unblock when blocked
+
+let mut website = Website::new("https://example.com")
+    .with_spider_cloud_config(cloud)
+    .build()?;
+```
+
+`Smart` mode routes through proxies first and escalates to the unblocker only on pages that fight back, so you pay for bypass only where it's needed.
+
+## Or run it locally
+
+No key, no service. Just the crawler.
 
 ```toml
 [dependencies]
@@ -36,33 +63,16 @@ spider = "2"
 ```
 
 ```rust
-use spider::tokio;
-use spider::website::Website;
+use spider::{tokio, website::Website};
 
 #[tokio::main]
 async fn main() {
     let mut website = Website::new("https://example.com");
-    website.crawl().await;
-    println!("Pages found: {}", website.get_links().len());
-}
-```
-
-### Streaming
-
-Process each page the moment it's crawled, not after:
-
-```rust
-use spider::tokio;
-use spider::website::Website;
-
-#[tokio::main]
-async fn main() {
-    let mut website = Website::new("https://example.com");
-    let mut rx = website.subscribe(0).unwrap();
+    let mut rx = website.subscribe(16);
 
     tokio::spawn(async move {
         while let Ok(page) = rx.recv().await {
-            println!("- {}", page.get_url());
+            println!("{}  {}", page.status_code, page.get_url());
         }
     });
 
@@ -71,233 +81,64 @@ async fn main() {
 }
 ```
 
-### Headless Chrome
+Pages stream in as they're fetched. The crawler finds the links, stays inside the limits you set, and stops on its own.
 
-Add one feature flag to render JavaScript-heavy pages:
+## How it works
 
-```toml
-[dependencies]
-spider = { version = "2", features = ["chrome"] }
-```
+Spider runs HTTP-first and launches headless Chrome only when a page needs JavaScript. Both the HTTP and Chrome paths stream, so pages come back as they're fetched instead of batching at the end. The same API drives one async task or a distributed worker fleet, and the concurrency model doesn't change between them. Proxies, retries, rate limiting, and stealth are built in.
 
-```rust
-use spider::features::chrome_common::RequestInterceptConfiguration;
-use spider::website::Website;
+## Install
 
-#[tokio::main]
-async fn main() {
-    let mut website = Website::new("https://example.com")
-        .with_chrome_intercept(RequestInterceptConfiguration::new(true))
-        .with_stealth(true)
-        .build()
-        .unwrap();
+| You want… | Run |
+|---|---|
+| Rust library | `cargo add spider` |
+| Command-line tool | `cargo install spider_cli` |
+| Node.js package | `npm i @spider-rs/spider-rs` |
+| Python package | `pip install spider_rs` |
+| MCP server (Claude, Cursor, …) | `cargo install spider_mcp` |
+| Managed crawling | [spider.cloud](https://spider.cloud?utm_source=github&utm_medium=readme&utm_campaign=spider_rs) |
 
-    website.crawl().await;
-}
-```
+## Configuration
 
-> Also supports [WebDriver](./examples/webdriver.rs) (Selenium Grid, remote browsers) and [AI-driven automation](./spider_agent/). See [examples](./examples/) for more.
-
-## Benchmarks
-
-Crawling 185 pages ([source](./benches/BENCHMARKS.md), 10 samples averaged):
-
-**Apple M1 Max** (10-core, 64 GB RAM):
-
-| Crawler | Language | Time | vs Spider |
-|---------|----------|-----:|----------:|
-| **spider** | **Rust** | **73 ms** | **baseline** |
-| node-crawler | JavaScript | 15 s | 205x slower |
-| colly | Go | 32 s | 438x slower |
-| wget | C | 70 s | 959x slower |
-
-**Linux** (2-core, 7 GB RAM):
-
-| Crawler | Language | Time | vs Spider |
-|---------|----------|-----:|----------:|
-| **spider** | **Rust** | **50 ms** | **baseline** |
-| node-crawler | JavaScript | 3.4 s | 68x slower |
-| colly | Go | 30 s | 600x slower |
-| wget | C | 60 s | 1200x slower |
-
-The gap grows with site size. Spider handles 100k+ pages in minutes where other crawlers take hours. This comes from Rust's async runtime ([tokio](https://tokio.rs)), lock-free data structures, and optional [io_uring](https://en.wikipedia.org/wiki/Io_uring) on Linux. [Full details](./benches/BENCHMARKS.md)
-
-## Why Spider?
-
-Most crawlers force a choice between fast HTTP-only or slow-but-flexible browser automation. Spider supports both, and you can mix them in the same crawl.
-
-**Supports HTTP, Chrome, and WebDriver.** Switch rendering modes with a feature flag. Use HTTP for speed, Chrome CDP for JavaScript-heavy pages, and WebDriver for Selenium Grid or cross-browser testing.
-
-**Built for production.** Caching (memory, disk, hybrid), proxy rotation, anti-bot fingerprinting, ad blocking, depth budgets, cron scheduling, and distributed workers. All of this has been hardened through [Spider Cloud](https://spider.cloud).
-
-**AI automation included.** [spider_agent](./spider_agent/) adds multimodal LLM-driven automation: navigate pages, fill forms, solve challenges, and extract structured data with OpenAI or any compatible API.
-
-## Features
-
-<details>
-<summary><strong>Crawling</strong></summary>
-
-- Concurrent and streaming crawls with backpressure
-- [Decentralized crawling](./spider_worker/) for horizontal scaling
-- Caching: memory, disk (SQLite), or [hybrid Chrome cache](./examples/cache_chrome_hybrid.rs)
-- Proxy support with rotation
-- Cron job scheduling
-- Depth budgeting, blacklisting, whitelisting
-- Smart mode that auto-detects JS-rendered content and upgrades to Chrome
-
-</details>
-
-<details>
-<summary><strong>Browser Automation</strong></summary>
-
-- [Chrome DevTools Protocol](https://github.com/spider-rs/chromey): headless or headed, stealth mode, screenshots, request interception
-- [WebDriver](./examples/webdriver.rs): Selenium Grid, remote browsers, cross-browser testing
-- AI-powered challenge solving (deterministic + [Chrome built-in AI](https://developer.chrome.com/docs/ai/prompt-api))
-- [Anti-bot fingerprinting](https://github.com/spider-rs/spider_fingerprint), [ad blocking](https://github.com/spider-rs/spider_network_blocker), [firewall](https://github.com/spider-rs/spider_firewall)
-
-</details>
-
-<details>
-<summary><strong>Data Processing</strong></summary>
-
-- [HTML transformations](https://github.com/spider-rs/spider_transformations) (Markdown, text, structured extraction)
-- CSS/XPath scraping with [spider_utils](./spider_utils/README.md#CSS_Scraping)
-- [OpenAI](./examples/openai.rs) and [Gemini](./examples/gemini.rs) integration for content analysis
-
-</details>
-
-<details>
-<summary><strong>AI Agent</strong></summary>
-
-- [spider_agent](./spider_agent/): concurrent-safe multimodal web automation agent
-- Multiple LLM providers (OpenAI, any OpenAI-compatible API, Chrome built-in AI)
-- Web research with search providers (Serper, Brave, Bing, Tavily)
-- 110 built-in automation skills for web challenges
-
-</details>
-
-## Spider Cloud
-
-For managed proxy rotation, anti-bot bypass, and CAPTCHA handling, [Spider Cloud](https://spider.cloud) plugs in with one line:
+Every option has a sensible default, so set only what you need.
 
 ```rust
-let mut website = Website::new("https://protected-site.com")
-    .with_spider_cloud("your-api-key")  // enable with features = ["spider_cloud"]
-    .build()
-    .unwrap();
-```
-
-| Mode | Strategy | Best For |
-|------|----------|----------|
-| **Proxy** (default) | All traffic through Spider Cloud proxy | General crawling with IP rotation |
-| **Smart** (recommended) | Proxy + auto-fallback on bot detection | Production (speed + reliability) |
-| **Fallback** | Direct first, API on failure | Cost-efficient, most sites work without help |
-| **Unblocker** | All requests through unblocker | Aggressive bot protection |
-
-> Free credits on signup. [Get started at spider.cloud](https://spider.cloud)
-
-### Spider Browser Cloud
-
-Connect to a remote Rust-based browser via CDP over WebSocket for automation, scraping, and AI extraction:
-
-```rust
-use spider::configuration::SpiderBrowserConfig;
-
-// Simple — just an API key
 let mut website = Website::new("https://example.com")
-    .with_spider_browser("your-api-key")  // features = ["spider_cloud", "chrome"]
-    .build()
-    .unwrap();
-
-// Full config — stealth, country targeting, custom options
-let browser_cfg = SpiderBrowserConfig::new("your-api-key")
+    .with_limit(50)                    // concurrent requests
+    .with_depth(10)                    // how deep to follow links
+    .with_delay(500)                   // pause between requests (ms)
+    .with_respect_robots_txt(true)
+    .with_subdomains(true)
+    .with_user_agent(Some("MyBot/1.0"))
     .with_stealth(true)
-    .with_country("us");
-
-let mut website = Website::new("https://example.com")
-    .with_spider_browser_config(browser_cfg)
     .build()
     .unwrap();
 ```
 
-WebSocket endpoint: `wss://browser.spider.cloud/v1/browser` — supports CDP and WebDriver BiDi protocols.
+Full reference in the [`Configuration` docs](https://docs.rs/spider/latest/spider/configuration/struct.Configuration.html).
 
-### Parallel Backends (LightPanda / Servo)
+For JavaScript-heavy sites, enable `features = ["chrome"]` and call `crawl_smart()`. Spider tries HTTP first and only launches Chrome on pages that need it.
 
-Race alternative browser engines alongside the primary crawl. The best HTML response wins — higher reliability and coverage for JS-heavy pages.
+## Use cases
 
-```rust
-use spider::configuration::{BackendEndpoint, BackendEngine, ParallelBackendsConfig};
+Teams use Spider to feed the open web into vector stores for LLM and RAG pipelines, monitor sites for SEO and price changes, export pages as Markdown, JSON, or WARC, and drive headless Chrome for AI browsing agents. There are [50+ runnable examples](./examples/) to start from.
 
-let mut website = Website::new("https://example.com");
+## Learn more
 
-// Race a remote LightPanda instance alongside the primary crawl.
-website.configuration.parallel_backends = Some(ParallelBackendsConfig {
-    backends: vec![BackendEndpoint {
-        engine: BackendEngine::LightPanda,
-        endpoint: Some("ws://127.0.0.1:9222".to_string()),
-        binary_path: None,
-        protocol: None,
-        proxy: None, // inherits from website proxies config
-    }],
-    grace_period_ms: 500,       // wait up to 500ms for a better result
-    fast_accept_threshold: 80,  // accept immediately if quality >= 80
-    ..Default::default()
-});
-
-website.crawl().await;
-```
-
-Features: `lightpanda` (LightPanda via CDP), `servo` (Servo via WebDriver), `parallel_backends_full` (both).
-
-Lock-free, zero overhead when disabled, automatic backend health tracking with auto-disable after consecutive failures.
-
-## Get Spider
-
-| Package | Language | Install |
-|---------|----------|---------|
-| [spider](https://crates.io/crates/spider) | Rust | `cargo add spider` |
-| [spider_cli](./spider_cli/) | CLI | `cargo install spider_cli` |
-| [spider-nodejs](https://github.com/spider-rs/spider-nodejs) | Node.js | `npm i @spider-rs/spider-rs` |
-| [spider-py](https://github.com/spider-rs/spider-py) | Python | `pip install spider_rs` |
-| [spider_agent](./spider_agent/) | Rust | `cargo add spider --features agent` |
-| [spider_mcp](./spider_mcp/) | MCP | `cargo install spider_mcp` |
-
-### MCP Server
-
-Use Spider as tools in Claude Code, Claude Desktop, or any MCP client:
-
-```bash
-cargo install spider_mcp
-```
-
-```json
-{ "mcpServers": { "spider": { "command": "spider-mcp" } } }
-```
-
-Then ask: *"Scrape https://example.com as markdown"* or *"Crawl https://example.com up to 5 pages"*
-
-### Cloud and Remote
-
-| Package | Description |
-|---------|-------------|
-| [Spider Cloud](https://spider.cloud) | Managed crawling infrastructure, no setup needed |
-| [spider-clients](https://github.com/spider-rs/spider-clients) | SDKs for Spider Cloud in multiple languages |
-| [spider-browser](https://github.com/spider-rs/spider-browser) | Remote access to Spider's Rust browser |
-
-## Resources
-
-- [64 examples](./examples/) covering crawling, Chrome, WebDriver, AI, caching, and more
-- [API documentation](https://docs.rs/spider/latest/spider)
-- [Benchmarks](./benches/BENCHMARKS.md)
-- [Changelog](CHANGELOG.md)
+- [Guides](https://spider.cloud/guides?utm_source=github&utm_medium=readme&utm_campaign=spider_rs) for recipes and integrations
+- [API docs](https://docs.rs/spider) for every option and method
+- [Discord](https://discord.spider.cloud) for questions and ideas
+- [Issues](https://github.com/spider-rs/spider/issues) for bugs and feature requests
 
 ## Contributing
 
-Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and guidelines.
+PRs welcome. See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
-Spider has been actively developed for the past 4 years. Join the [Discord](https://discord.spider.cloud) for questions and discussion.
+```bash
+cargo test -p spider                  # unit tests
+RUN_LIVE_TESTS=1 cargo test           # live network tests
+```
 
 ## License
 
-[MIT](LICENSE)
+[MIT](./LICENSE).

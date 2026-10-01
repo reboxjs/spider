@@ -1,7 +1,6 @@
 lazy_static! {
-    /// Apache server forbidden.
-    pub static ref APACHE_FORBIDDEN: &'static [u8; 317] = br#"<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
-<html><head>
+    /// Apache server forbidden — DOCTYPE-agnostic suffix shared by all Apache 403 variants.
+    pub static ref APACHE_FORBIDDEN_SUFFIX: &'static [u8; 266] = br#"<html><head>
 <title>403 Forbidden</title>
 </head><body>
 <h1>Forbidden</h1>
